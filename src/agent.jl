@@ -74,7 +74,7 @@ function evaluate!(f::Function, agent::Agent, input::Union{String,Result}, apike
 
             # core agent loop; continue until no more tool calls or we have pending tool calls that need to be resolved
             while true
-                OpenAIResponses.stream(model, input, apikey; tools, previous_response_id, kw...) do (http_stream, event)
+                OpenAIResponses.stream(model, input, apikey; tools, previous_response_id, kw...) do http_stream, event
                     if event isa OpenAIResponses.StreamResponseCreatedEvent
                         previous_response_id = event.response.id
                     elseif event isa OpenAIResponses.StreamDeltaEvent

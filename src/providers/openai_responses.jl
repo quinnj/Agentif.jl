@@ -866,6 +866,7 @@ end
 
 abstract type StreamEvent end
 abstract type StreamDeltaEvent <: StreamEvent end
+abstract type StreamDoneEvent <: StreamEvent end
 
 @omit_null @kwarg struct StreamResponseCreatedEvent <: StreamEvent
     type::String = "response.created"
@@ -879,21 +880,21 @@ end
     sequence_number::Union{Nothing,Int} = nothing
 end
 
-@omit_null @kwarg struct StreamResponseCompletedEvent <: StreamEvent
+@omit_null @kwarg struct StreamResponseCompletedEvent <: StreamDoneEvent
     type::String = "response.completed"
     response::Response
     sequence_number::Union{Nothing,Int} = nothing
 end
 
 # failed
-@omit_null @kwarg struct StreamResponseFailedEvent <: StreamEvent
+@omit_null @kwarg struct StreamResponseFailedEvent <: StreamDoneEvent
     type::String = "response.failed"
     response::Response
     sequence_number::Union{Nothing,Int} = nothing
 end
 
 # incomplete
-@omit_null @kwarg struct StreamResponseIncompleteEvent <: StreamEvent
+@omit_null @kwarg struct StreamResponseIncompleteEvent <: StreamDoneEvent
     type::String = "response.incomplete"
     response::Response
     sequence_number::Union{Nothing,Int} = nothing
