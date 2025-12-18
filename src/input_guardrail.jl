@@ -39,14 +39,14 @@ ALLOW only if:
 - AND it can be handled safely under the agent's tool permissions.
 
 OUTPUT FORMAT
-Requested output format is: `{"invalid_user_input": [whether user input is invliad as boolean]}`
+Requested output format is: `{"valid_user_input": [whether user input is valid as boolean]}`
 """
 
-struct InvalidUserInput
-    invalid_user_input::Bool
+struct ValidUserInput
+    valid_user_input::Bool
 end
 
-const INPUT_GUARDRAIL_OUTPUT_FORMAT = OpenAIResponses.Text(; format=OpenAIResponses.TextFormatJSONSchema(; name="invalid_user_input", strict=true, schema=JSON.schema(InvalidUserInput; all_fields_required=true, additionalProperties=false)))
+const INPUT_GUARDRAIL_OUTPUT_FORMAT = OpenAIResponses.Text(; format=OpenAIResponses.TextFormatJSONSchema(; name="valid_user_input", strict=true, schema=JSON.schema(ValidUserInput; all_fields_required=true, additionalProperties=false)))
 
 function default_input_guardrail(classifier_model::Model)
     function check(agent_prompt, input, apikey)
@@ -65,7 +65,7 @@ function default_input_guardrail(classifier_model::Model)
                 include=nothing,
                 reasoning=OpenAIResponses.Reasoning(; effort="minimal")
             )
-            return JSON.parse(resp.output[end].content[1].text, InvalidUserInput).invalid_user_input
+            return JSON.parse(resp.output[end].content[1].text, ValidUserInput).valid_user_input
         else
             throw(ArgumentError("$(classifier_model.api) api type currently unsupported"))
         end

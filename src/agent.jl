@@ -5,6 +5,10 @@
     tools::Vector{AgentTool} = AgentTool[]
 end
 
+struct InvalidInputError <: Exception
+    input::String
+end
+
 @kwarg mutable struct PendingToolCall
     const tool::AgentTool
     const tool_call::OpenAIResponses.FunctionToolCall
@@ -66,19 +70,27 @@ function evaluate!(f::Function, agent::Agent, input::Union{String,Result}, apike
             tools = [OpenAIResponses.FunctionTool(t) for t in agent.tools]
             tool_call_results = Future{OpenAIResponses.FunctionToolCallOutput}[]
             pending_tool_calls = []
-            input_check = Future{Bool}(() -> (agent.input_guardrail === nothing || !(input isa String)) ? false : agent.input_guardrail(agent.prompt, input, apikey))
+            input_valid = Future{Bool}(() -> (agent.input_guardrail === nothing || !(input isa String)) ? true : agent.input_guardrail(agent.prompt, input, apikey))
 
             # core agent loop; continue until no more tool calls or we have pending tool calls that need to be resolved
             while true
-                OpenAIResponses.stream(model, input, apikey; tools, previous_response_id, kw...) do event
+                OpenAIResponses.stream(model, input, apikey; tools, previous_response_id, kw...) do (http_stream, event)
                     if event isa OpenAIResponses.StreamResponseCreatedEvent
                         previous_response_id = event.response.id
                     elseif event isa OpenAIResponses.StreamDeltaEvent
-                        wait(input_check) && return
+                        if !wait(input_valid)
+                            close(http_stream)
+                            f(InvalidInputError(input))
+                            return
+                        end
                     elseif event isa OpenAIResponses.StreamOutputItemDoneEvent
                         item_type = event.item.type
                         if item_type == "function_call"
-                            wait(input_check) && return
+                            if !wait(input_valid)
+                                close(http_stream)
+                                f(InvalidInputError(input))
+                                return
+                            end
                             tool = findtool(agent.tools, event.item.name)
                             if tool.requiresApproval
                                 push!(pending_tool_calls, PendingToolCall(; tool, tool_call=event.item))
@@ -89,7 +101,7 @@ function evaluate!(f::Function, agent::Agent, input::Union{String,Result}, apike
                     end
                     f(event)
                 end
-                if wait(input_check)
+                if !wait(input_valid)
                     throw(ArgumentError("input_guardrail check failed for input: `$input`"))
                 elseif isempty(tool_call_results) || !isempty(pending_tool_calls)
                     return Result(; previous_response_id, tool_call_results, pending_tool_calls)
