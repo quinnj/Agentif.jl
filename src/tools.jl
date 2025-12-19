@@ -8,6 +8,34 @@ end
 
 parameters(::AgentTool{F,T}) where {F,T} = T
 
+@kwarg mutable struct PendingToolCall
+    const call_id::String
+    const name::String
+    const arguments::String
+    approved::Union{Nothing,Bool} = nothing
+    rejected_reason::Union{Nothing,String} = nothing
+end
+
+approve!(pending_tool_call::PendingToolCall) = pending_tool_call.approved = true
+function reject!(pending_tool_call::PendingToolCall, reason::String="the user has explicitly rejected the tool call request with arguments: $(pending_tool_call.tool_call.arguments); don't attempt to call this tool again")
+    pending_tool_call.approved = false
+    pending_tool_call.rejected_reason = reason
+end
+
+function findtool(tools, name)
+    for tool in tools
+        tool.name == name && return tool
+    end
+    throw(ArgumentError("invalid tool for agent: `$name`"))
+end
+
+function findpendingtool(pending_tool_calls::Vector{PendingToolCall}, call_id::String)
+    for ptc in pending_tool_calls
+        ptc.call_id == call_id && return ptc
+    end
+    throw(ArgumentError("invalid call_id for pending tool calls: $call_id"))
+end
+
 function extract_function_args(func_expr::Expr)
     args = Symbol[]
     types = Any[]

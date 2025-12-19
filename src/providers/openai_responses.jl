@@ -2,7 +2,7 @@ module OpenAIResponses
 
 using StructUtils, JSON, HTTP, InteractiveUtils
 
-import ..Model, ..Future, ..AgentTool, ..parameters
+import ..Model, ..Future, ..AgentTool, ..parameters, ..ToolResultMessage
 
 schema(::Type{T}) where {T} = JSON.schema(T; all_fields_required=true, additionalProperties=false)
 
@@ -108,6 +108,8 @@ end
     id::Union{Nothing,String} = nothing
     status::Union{Nothing,String} = nothing # "in_progress", "completed", "incomplete"
 end
+
+FunctionToolCallOutput(trm::ToolResultMessage) = FunctionToolCallOutput(; call_id=trm.call_id, output=trm.output)
 
 const Item = Union{Message,FunctionToolCallOutput} # TODO: add other item types here: Function tool call, Function tool call output, etc.
 
@@ -867,6 +869,7 @@ end
 abstract type StreamEvent end
 abstract type StreamDeltaEvent <: StreamEvent end
 abstract type StreamDoneEvent <: StreamEvent end
+abstract type StreamOutputDoneEvent <: StreamEvent end
 
 @omit_null @kwarg struct StreamResponseCreatedEvent <: StreamEvent
     type::String = "response.created"
@@ -948,7 +951,7 @@ end
 end
 
 # output_text.done
-@omit_null @kwarg struct StreamOutputTextDoneEvent <: StreamEvent
+@omit_null @kwarg struct StreamOutputTextDoneEvent <: StreamOutputDoneEvent
     type::String = "response.output_text.done"
     sequence_number::Union{Nothing,Int} = nothing
     content_index::Union{Nothing,Int} = nothing
@@ -969,7 +972,7 @@ end
 end
 
 # refusal.done
-@omit_null @kwarg struct StreamRefusalDoneEvent <: StreamEvent
+@omit_null @kwarg struct StreamRefusalDoneEvent <: StreamOutputDoneEvent
     type::String = "response.refusal.done"
     sequence_number::Union{Nothing,Int} = nothing
     content_index::Union{Nothing,Int} = nothing
@@ -1020,7 +1023,7 @@ end
 end
 
 # response.reasoning_summary_text.done
-@omit_null @kwarg struct StreamReasoningSummaryTextDoneEvent <: StreamEvent
+@omit_null @kwarg struct StreamReasoningSummaryTextDoneEvent <: StreamOutputDoneEvent
     type::String = "response.reasoning_summary_text.done"
     sequence_number::Union{Nothing,Int} = nothing
     summary_index::Union{Nothing,Int} = nothing
@@ -1040,7 +1043,7 @@ end
 end
 
 # response.reasoning_text.done
-@omit_null @kwarg struct StreamReasoningTextDoneEvent <: StreamEvent
+@omit_null @kwarg struct StreamReasoningTextDoneEvent <: StreamOutputDoneEvent
     type::String = "response.reasoning_text.done"
     sequence_number::Union{Nothing,Int} = nothing
     content_index::Union{Nothing,Int} = nothing
@@ -1059,7 +1062,7 @@ end
 end
 
 # response.function_call_arguments.done
-@omit_null @kwarg struct StreamFunctionCallArgumentsDoneEvent <: StreamEvent
+@omit_null @kwarg struct StreamFunctionCallArgumentsDoneEvent <: StreamOutputDoneEvent
     type::String = "response.function_call_arguments.done"
     sequence_number::Union{Nothing,Int} = nothing
     item_id::Union{Nothing,String} = nothing
@@ -1126,7 +1129,7 @@ end
 end
 
 # response.mcp_call_arguments.done
-@omit_null @kwarg struct StreamMCPCallArgumentsDoneEvent <: StreamEvent
+@omit_null @kwarg struct StreamMCPCallArgumentsDoneEvent <: StreamOutputDoneEvent
     type::String = "response.mcp_call_arguments.done"
     sequence_number::Union{Nothing,Int} = nothing
     item_id::Union{Nothing,String} = nothing
@@ -1216,7 +1219,7 @@ end
 end
 
 # response.code_interpreter_call_code.done
-@omit_null @kwarg struct StreamCodeInterpreterCallCodeDoneEvent <: StreamEvent
+@omit_null @kwarg struct StreamCodeInterpreterCallCodeDoneEvent <: StreamOutputDoneEvent
     type::String = "response.code_interpreter_call_code.done"
     sequence_number::Union{Nothing,Int} = nothing
     item_id::Union{Nothing,String} = nothing
@@ -1266,7 +1269,7 @@ end
 end
 
 # response.audio.done
-@omit_null @kwarg struct StreamAudioDoneEvent <: StreamEvent
+@omit_null @kwarg struct StreamAudioDoneEvent <: StreamOutputDoneEvent
     type::String = "response.audio.done"
     sequence_number::Union{Nothing,Int} = nothing
 end
@@ -1279,7 +1282,7 @@ end
 end
 
 # response.audio.transcript.done
-@omit_null @kwarg struct StreamAudioTranscriptDoneEvent <: StreamEvent
+@omit_null @kwarg struct StreamAudioTranscriptDoneEvent <: StreamOutputDoneEvent
     type::String = "response.audio.transcript.done"
     sequence_number::Union{Nothing,Int} = nothing
 end
@@ -1294,7 +1297,7 @@ end
 end
 
 # response.custom_tool_call_input.done
-@omit_null @kwarg struct StreamCustomToolCallInputDoneEvent <: StreamEvent
+@omit_null @kwarg struct StreamCustomToolCallInputDoneEvent <: StreamOutputDoneEvent
     type::String = "response.custom_tool_call_input.done"
     sequence_number::Union{Nothing,Int} = nothing
     item_id::Union{Nothing,String} = nothing
@@ -1458,5 +1461,15 @@ function request(model::Model, input::Union{String,Vector{InputItem}}, apikey::S
     url = joinpath(model.baseUrl, "responses")
     return JSON.parse(HTTP.post(url, headers; body=JSON.json(req), http_kw...).body, Response)
 end  
+
+function get_response(model::Model, response_id::String, apikey::String; http_kw=(;))
+    headers = Dict(
+        "Authorization" => "Bearer $apikey",
+        "Content-Type" => "application/json",
+    )
+    model.headers !== nothing && merge!(headers, model.headers)
+    url = joinpath(model.baseUrl, "responses", response_id)
+    return JSON.parse(HTTP.get(url, headers; http_kw...).body, Response)
+end
 
 end # module OpenAIResponses
