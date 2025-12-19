@@ -3,7 +3,7 @@
     description::Union{Nothing,String} = nothing
     strict::Bool = true
     func::F
-    requiresApproval::Bool = false
+    requires_approval::Bool = false
 end
 
 parameters(::AgentTool{F,T}) where {F,T} = T
@@ -168,7 +168,7 @@ macro tool_requires_approval(description::String, func_expr::Expr)
             name=string($(Meta.quot(func_name))),
             description=$(description),
             func=$(esc(func_name)),
-            requiresApproval=true
+            requires_approval=true
         )
     end
 end

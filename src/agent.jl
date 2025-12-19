@@ -49,7 +49,7 @@ function evaluate!(f::Function, agent::Agent, input::Union{String,Vector{Pending
                         tc = PendingToolCall(; call_id=item.call_id, name=item.name, arguments=item.arguments)
                         tool = findtool(agent.tools, tc.name)
                         f(ToolExecutionStartEvent(tc))
-                        if tool.requiresApproval
+                        if tool.requires_approval
                             pending = findpendingtool(input, tc.call_id)
                             @assert pending !== nothing "Missing tool call requiring approval: $(tc.name)"
                             if pending.approved
@@ -126,7 +126,10 @@ function evaluate!(f::Function, agent::Agent, input::Union{String,Vector{Pending
                     elseif event isa OpenAIResponses.StreamOutputItemDoneEvent
                         item_type = event.item.type
                         if item_type == "function_call"
-                            push!(pending_tool_calls, PendingToolCall(; call_id=event.item.call_id, name=event.item.name, arguments=event.item.arguments))
+                            ptc = PendingToolCall(; call_id=event.item.call_id, name=event.item.name, arguments=event.item.arguments)
+                            push!(pending_tool_calls, ptc)
+                            at = findtool(agent.tools, ptc.name)
+                            f(ToolCallRequestEvent(ptc, at.requires_approval))
                         end
                     elseif event isa OpenAIResponses.StreamDoneEvent
                         if assistant_started && !assistant_ended
@@ -146,8 +149,8 @@ function evaluate!(f::Function, agent::Agent, input::Union{String,Vector{Pending
                 end
                 if !wait(input_valid)
                     throw(ArgumentError("input_guardrail check failed for input: `$input`"))
-                elseif isempty(pending_tool_calls) || any(ptc -> findtool(agent.tools, ptc.name).requiresApproval, pending_tool_calls)
-                    result = Result(; previous_response_id, pending_tool_calls=filter!(x -> findtool(agent.tools, x.name).requiresApproval, pending_tool_calls))
+                elseif isempty(pending_tool_calls) || any(ptc -> findtool(agent.tools, ptc.name).requires_approval, pending_tool_calls)
+                    result = Result(; previous_response_id, pending_tool_calls=filter!(x -> findtool(agent.tools, x.name).requires_approval, pending_tool_calls))
                     f(AgentEvaluateEndEvent(result))
                     return result
                 end
