@@ -192,5 +192,5 @@ end
 function reject_function_tool!(f, tc::PendingToolCall, pending::PendingToolCall)
     trm = ToolResultMessage(; output=pending.rejected_reason, is_error=true, call_id=tc.call_id, name=tc.name, arguments=tc.arguments)
     f(ToolExecutionEndEvent(tc, trm))
-    return trm
+    return Future{ToolResultMessage}(() -> trm)
 end
