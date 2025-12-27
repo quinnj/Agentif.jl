@@ -26,6 +26,70 @@ function run_agent(agent, input, apikey; kw...)
     return result, events
 end
 
+@testset "OpenAI Completions Compatible (requires OPENAI_COMPAT_API_KEY)" begin
+    apikey = get(() -> nothing, ENV, "OPENAI_COMPAT_API_KEY")
+    provider = get(() -> nothing, ENV, "OPENAI_COMPAT_PROVIDER")
+    model_id = get(() -> nothing, ENV, "OPENAI_COMPAT_MODEL")
+    if apikey === nothing || provider === nothing || model_id === nothing
+        @info "Skipping OpenAI Completions compatible test; set OPENAI_COMPAT_API_KEY, OPENAI_COMPAT_PROVIDER, OPENAI_COMPAT_MODEL"
+        return
+    end
+    model = Agentif.getModel(provider, model_id)
+    model === nothing && error("unknown model: provider=$(repr(provider)) model_id=$(repr(model_id))")
+    compat_agent = Agentif.Agent(;
+        prompt="You are a test assistant.",
+        model,
+        input_guardrail=nothing,
+        tools=Agentif.AgentTool[]
+    )
+    result, events = run_agent(compat_agent, "Say hello in one short sentence.", apikey)
+    @test result isa Agentif.Result
+    @test !isempty(result.previous_response_id)
+    @test any(e -> e isa Agentif.MessageEndEvent, events)
+end
+
+@testset "Anthropic Messages (requires ANTHROPIC_API_KEY)" begin
+    apikey = get(() -> nothing, ENV, "ANTHROPIC_API_KEY")
+    if apikey === nothing
+        @info "Skipping Anthropic test; set ANTHROPIC_API_KEY"
+        return
+    end
+    model_id = get(() -> "claude-sonnet-4-5", ENV, "ANTHROPIC_MODEL_ID")
+    model = Agentif.getModel("anthropic", model_id)
+    model === nothing && error("unknown anthropic model: $(repr(model_id))")
+    anthropic_agent = Agentif.Agent(;
+        prompt="You are a test assistant.",
+        model,
+        input_guardrail=nothing,
+        tools=Agentif.AgentTool[]
+    )
+    result, events = run_agent(anthropic_agent, "Say hello in one short sentence.", apikey)
+    @test result isa Agentif.Result
+    @test !isempty(result.previous_response_id)
+    @test any(e -> e isa Agentif.MessageEndEvent, events)
+end
+
+@testset "Google Generative AI (requires GOOGLE_API_KEY)" begin
+    apikey = get(() -> nothing, ENV, "GOOGLE_API_KEY")
+    if apikey === nothing
+        @info "Skipping Google Generative AI test; set GOOGLE_API_KEY"
+        return
+    end
+    model_id = get(() -> "gemini-2.5-flash", ENV, "GOOGLE_MODEL_ID")
+    model = Agentif.getModel("google", model_id)
+    model === nothing && error("unknown google model: $(repr(model_id))")
+    google_agent = Agentif.Agent(;
+        prompt="You are a test assistant.",
+        model,
+        input_guardrail=nothing,
+        tools=Agentif.AgentTool[]
+    )
+    result, events = run_agent(google_agent, "Say hello in one short sentence.", apikey)
+    @test result isa Agentif.Result
+    @test !isempty(result.previous_response_id)
+    @test any(e -> e isa Agentif.MessageEndEvent, events)
+end
+
 @testset "Agentif Tests" begin
 
     @testset "Basic Tool Execution (No Approval)" begin
