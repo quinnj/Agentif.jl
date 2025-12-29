@@ -273,7 +273,7 @@ function create_read_tool(base_dir::AbstractString)
         read(path::String, offset::Union{Nothing,Int}, limit::Union{Nothing,Int}) = begin
             resolved = resolve_relative_path(base, path)
             isfile(resolved) || throw(ArgumentError("file not found: $path"))
-            content = read(resolved, String)
+            content = Base.read(resolved, String)
             lines = split(content, "\n"; keepempty=true)
             total_lines = length(lines)
             start_line = offset === nothing ? 1 : max(1, offset)
@@ -312,7 +312,7 @@ function create_write_tool(base_dir::AbstractString)
             resolved = resolve_relative_path(base, path)
             mkpath(dirname(resolved))
             open(resolved, "w") do io
-                write(io, content)
+                Base.write(io, content)
             end
             return "Successfully wrote $(ncodeunits(content)) bytes to $(path)"
         end,

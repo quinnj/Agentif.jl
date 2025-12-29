@@ -689,7 +689,12 @@ function evaluate_google_generative_ai!(f::Function, agent::Agent, input::Union{
                                 end
                                 assistant_message.text *= part.text
                                 if !isempty(assistant_parts) && assistant_parts[end].text !== nothing
-                                    assistant_parts[end].text *= part.text
+                                    last_part = assistant_parts[end]
+                                    assistant_parts[end] = GoogleGenerativeAI.Part(;
+                                        text=last_part.text * part.text,
+                                        functionCall=last_part.functionCall,
+                                        functionResponse=last_part.functionResponse,
+                                    )
                                 else
                                     push!(assistant_parts, GoogleGenerativeAI.Part(; text=part.text))
                                 end
@@ -750,7 +755,12 @@ function evaluate_google_generative_ai!(f::Function, agent::Agent, input::Union{
                                 end
                                 assistant_message.text *= part.text
                                 if !isempty(assistant_parts) && assistant_parts[end].text !== nothing
-                                    assistant_parts[end].text *= part.text
+                                    last_part = assistant_parts[end]
+                                    assistant_parts[end] = GoogleGenerativeAI.Part(;
+                                        text=last_part.text * part.text,
+                                        functionCall=last_part.functionCall,
+                                        functionResponse=last_part.functionResponse,
+                                    )
                                 else
                                     push!(assistant_parts, GoogleGenerativeAI.Part(; text=part.text))
                                 end
@@ -916,7 +926,14 @@ function evaluate_google_gemini_cli!(f::Function, agent::Agent, input::Union{Str
                                     assistant_message.reasoning *= part.text
                                     f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, part.text, nothing))
                                     if !isempty(assistant_parts) && assistant_parts[end].thought === true
-                                        assistant_parts[end].text *= part.text
+                                        last_part = assistant_parts[end]
+                                        assistant_parts[end] = GoogleGeminiCli.Part(;
+                                            text=(last_part.text === nothing ? "" : last_part.text) * part.text,
+                                            thought=true,
+                                            thoughtSignature=last_part.thoughtSignature,
+                                            functionCall=last_part.functionCall,
+                                            functionResponse=last_part.functionResponse,
+                                        )
                                     else
                                         push!(assistant_parts, GoogleGeminiCli.Part(; text=part.text, thought=true, thoughtSignature=part.thoughtSignature))
                                     end
@@ -924,7 +941,14 @@ function evaluate_google_gemini_cli!(f::Function, agent::Agent, input::Union{Str
                                     assistant_message.text *= part.text
                                     f(MessageUpdateEvent(:assistant, assistant_message, :text, part.text, nothing))
                                     if !isempty(assistant_parts) && assistant_parts[end].text !== nothing && assistant_parts[end].thought !== true
-                                        assistant_parts[end].text *= part.text
+                                        last_part = assistant_parts[end]
+                                        assistant_parts[end] = GoogleGeminiCli.Part(;
+                                            text=(last_part.text === nothing ? "" : last_part.text) * part.text,
+                                            thought=last_part.thought,
+                                            thoughtSignature=last_part.thoughtSignature,
+                                            functionCall=last_part.functionCall,
+                                            functionResponse=last_part.functionResponse,
+                                        )
                                     else
                                         push!(assistant_parts, GoogleGeminiCli.Part(; text=part.text))
                                     end
@@ -988,7 +1012,14 @@ function evaluate_google_gemini_cli!(f::Function, agent::Agent, input::Union{Str
                                     assistant_message.reasoning *= part.text
                                     f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, part.text, nothing))
                                     if !isempty(assistant_parts) && assistant_parts[end].thought === true
-                                        assistant_parts[end].text *= part.text
+                                        last_part = assistant_parts[end]
+                                        assistant_parts[end] = GoogleGeminiCli.Part(;
+                                            text=(last_part.text === nothing ? "" : last_part.text) * part.text,
+                                            thought=true,
+                                            thoughtSignature=last_part.thoughtSignature,
+                                            functionCall=last_part.functionCall,
+                                            functionResponse=last_part.functionResponse,
+                                        )
                                     else
                                         push!(assistant_parts, GoogleGeminiCli.Part(; text=part.text, thought=true, thoughtSignature=part.thoughtSignature))
                                     end
@@ -996,7 +1027,14 @@ function evaluate_google_gemini_cli!(f::Function, agent::Agent, input::Union{Str
                                     assistant_message.text *= part.text
                                     f(MessageUpdateEvent(:assistant, assistant_message, :text, part.text, nothing))
                                     if !isempty(assistant_parts) && assistant_parts[end].text !== nothing && assistant_parts[end].thought !== true
-                                        assistant_parts[end].text *= part.text
+                                        last_part = assistant_parts[end]
+                                        assistant_parts[end] = GoogleGeminiCli.Part(;
+                                            text=(last_part.text === nothing ? "" : last_part.text) * part.text,
+                                            thought=last_part.thought,
+                                            thoughtSignature=last_part.thoughtSignature,
+                                            functionCall=last_part.functionCall,
+                                            functionResponse=last_part.functionResponse,
+                                        )
                                     else
                                         push!(assistant_parts, GoogleGeminiCli.Part(; text=part.text))
                                     end

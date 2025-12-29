@@ -16,6 +16,7 @@ include("providers/google_gemini_cli.jl"); using .GoogleGeminiCli
 include("agent.jl")
 include("input_guardrail.jl")
 
+export Agent, evaluate, evaluate!
 export Model, getModel, getProviders, getModels, calculateCost
 export OpenAIResponses, OpenAICompletions, AnthropicMessages, GoogleGenerativeAI, GoogleGeminiCli
 export @tool, tool_name, AgentTool
