@@ -5,6 +5,7 @@ using StructUtils, JSON, Logging, UUIDs
 include("util.jl")
 include("models.jl")
 include("tools.jl")
+include("predefined_tools.jl")
 include("cache.jl")
 include("events.jl")
 include("providers/openai_responses.jl"); using .OpenAIResponses
@@ -17,6 +18,9 @@ include("input_guardrail.jl")
 export Model, getModel, getProviders, getModels, calculateCost
 export OpenAIResponses, OpenAICompletions, AnthropicMessages, GoogleGenerativeAI
 export @tool, tool_name, AgentTool
+export create_bash_tool, create_read_tool, create_write_tool, create_edit_tool
+export create_grep_tool, create_find_tool, create_ls_tool
+export coding_tools, read_only_tools, all_tools
 export AgentEvent
 export AgentEvaluateStartEvent, AgentEvaluateEndEvent, AgentErrorEvent
 export TurnStartEvent, TurnEndEvent

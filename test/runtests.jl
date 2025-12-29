@@ -22,8 +22,34 @@ function run_agent(agent, input, apikey; kw...)
     events = Any[]
     f = (event) -> push!(events, event)
     # evaluate! returns a Future, we wait on it to get the Result
-    result = wait(Agentif.evaluate!(f, agent, input, apikey; kw...))
+    result = Agentif.evaluate(f, agent, input, apikey; kw...)
     return result, events
+end
+
+@testset "Predefined Tools" begin
+    base_dir = mktempdir()
+
+    write_tool = Agentif.create_write_tool(base_dir)
+    read_tool = Agentif.create_read_tool(base_dir)
+    ls_tool = Agentif.create_ls_tool(base_dir)
+
+    write_result = write_tool.func("notes/hello.txt", "hi")
+    @test contains(write_result, "Successfully wrote")
+
+    read_result = read_tool.func("notes/hello.txt", nothing, nothing)
+    @test read_result == "hi"
+
+    ls_result = ls_tool.func("notes", nothing)
+    @test contains(ls_result, "hello.txt")
+
+    @test_throws ArgumentError write_tool.func(joinpath(base_dir, "abs.txt"), "nope")
+    @test_throws ArgumentError read_tool.func("../outside.txt", nothing, nothing)
+
+    tool_names = [tool.name for tool in Agentif.coding_tools(base_dir)]
+    @test tool_names == ["read", "bash", "edit", "write"]
+
+    read_only_names = [tool.name for tool in Agentif.read_only_tools(base_dir)]
+    @test read_only_names == ["read", "grep", "find", "ls"]
 end
 
 @testset "OpenAI Completions Compatible (requires OPENAI_COMPAT_API_KEY)" begin

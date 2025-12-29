@@ -48,6 +48,7 @@ end
 
 ensure_response_id(response_id::Union{Nothing,String}) = (response_id === nothing || isempty(response_id)) ? string(UUIDs.uuid4()) : response_id
 new_call_id(prefix::String) = string(prefix, "-", UUIDs.uuid4())
+supports_completions_reasoning_effort(model::Model) = model.api != "openai-completions" ? true : !occursin("api.x.ai", model.baseUrl)
 
 function evaluate_openai_responses!(f::Function, agent::Agent, input::Union{String,Vector{PendingToolCall}}, apikey::String; model::Model, previous_response_id::Union{Nothing, String} = nothing, http_kw=(;), kw...)
     return Future{Result}() do
@@ -227,9 +228,20 @@ function evaluate_openai_completions!(f::Function, agent::Agent, input::Union{St
             assistant_message = AssistantTextMessage(; response_id=previous_response_id)
             assistant_started = false
             assistant_ended = false
+            reasoning_signature = nothing
             empty!(pending_tool_calls)
             tool_call_accumulators = Dict{Int,ToolCallAccumulator}()
             stream_kw = haskey(kw, :instructions) ? Base.structdiff(kw, (; instructions=nothing)) : kw
+            if haskey(stream_kw, :reasoning)
+                reasoning_effort = stream_kw[:reasoning]
+                stream_kw = Base.structdiff(stream_kw, (; reasoning=nothing))
+                if !haskey(stream_kw, :reasoning_effort)
+                    stream_kw = (; stream_kw..., reasoning_effort=reasoning_effort)
+                end
+            end
+            if haskey(stream_kw, :reasoning_effort) && !supports_completions_reasoning_effort(model)
+                stream_kw = Base.structdiff(stream_kw, (; reasoning_effort=nothing))
+            end
             OpenAICompletions.stream(model, messages, apikey; tools, http_kw, stream_kw...) do http_stream, event
                 if !wait(input_valid)
                     close(http_stream)
@@ -251,6 +263,18 @@ function evaluate_openai_completions!(f::Function, agent::Agent, input::Union{St
                         end
                         assistant_message.text *= delta.content
                         f(MessageUpdateEvent(:assistant, assistant_message, :text, delta.content, nothing))
+                    end
+                    for field in (:reasoning_content, :reasoning, :reasoning_text)
+                        value = getfield(delta, field)
+                        if value !== nothing && !isempty(value)
+                            if !assistant_started
+                                assistant_started = true
+                                f(MessageStartEvent(:assistant, assistant_message))
+                            end
+                            assistant_message.reasoning *= value
+                            f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, value, nothing))
+                            reasoning_signature === nothing && (reasoning_signature = field)
+                        end
                     end
                     if delta.tool_calls !== nothing
                         if !assistant_started
@@ -296,7 +320,7 @@ function evaluate_openai_completions!(f::Function, agent::Agent, input::Union{St
                 acc.name === nothing && throw(ArgumentError("tool call missing name for index $(idx)"))
                 call_id = acc.id === nothing ? new_call_id("openai") : acc.id
                 args = isempty(acc.arguments) ? "{}" : acc.arguments
-                push!(tool_calls, OpenAICompletions.ToolCall(; id=call_id, function=OpenAICompletions.ToolCallFunction(; name=acc.name, arguments=args)))
+                push!(tool_calls, OpenAICompletions.ToolCall(; id=call_id, var"function"=OpenAICompletions.ToolCallFunction(; name=acc.name, arguments=args)))
                 ptc = PendingToolCall(; call_id=call_id, name=acc.name, arguments=args)
                 push!(pending_tool_calls, ptc)
                 tool = findtool(agent.tools, ptc.name)
@@ -304,7 +328,18 @@ function evaluate_openai_completions!(f::Function, agent::Agent, input::Union{St
             end
             assistant_content = isempty(assistant_message.text) ? nothing : assistant_message.text
             assistant_tool_calls = isempty(tool_calls) ? nothing : tool_calls
-            push!(messages, OpenAICompletions.Message(; role="assistant", content=assistant_content, tool_calls=assistant_tool_calls))
+            assistant_reasoning = isempty(assistant_message.reasoning) ? nothing : assistant_message.reasoning
+            msg_kwargs = (; role="assistant", content=assistant_content, tool_calls=assistant_tool_calls)
+            if assistant_reasoning !== nothing
+                if reasoning_signature === :reasoning_content
+                    msg_kwargs = (; msg_kwargs..., reasoning_content=assistant_reasoning)
+                elseif reasoning_signature === :reasoning_text
+                    msg_kwargs = (; msg_kwargs..., reasoning_text=assistant_reasoning)
+                else
+                    msg_kwargs = (; msg_kwargs..., reasoning=assistant_reasoning)
+                end
+            end
+            push!(messages, OpenAICompletions.Message(; msg_kwargs...))
             requires_approval = PendingToolCall[]
             for ptc in pending_tool_calls
                 tool = findtool(agent.tools, ptc.name)
@@ -802,11 +837,12 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
         args = JSON.parse(tc.arguments, parameters(tool))
         is_error = false
         output = ""
-        try
-            output = string(tool.func(args...))
-        catch
-            is_error = true
-        end
+    try
+        output = string(tool.func(args...))
+    catch e
+        is_error = true
+        output = sprint(showerror, e)
+    end
         trm = ToolResultMessage(; output, is_error, call_id=tc.call_id, name=tc.name, arguments=tc.arguments)
         f(ToolExecutionEndEvent(tc, trm))
         return trm

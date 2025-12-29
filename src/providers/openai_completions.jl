@@ -15,14 +15,14 @@ end
 
 @omit_null @kwarg struct FunctionTool{T}
     type::String = "function"
-    function::ToolFunction{T}
+    var"function"::ToolFunction{T}
 end
 
 const Tool = Union{FunctionTool}
 
 function FunctionTool(tool::AgentTool)
     return FunctionTool(
-        function=ToolFunction(
+        var"function"=ToolFunction(
             name=tool.name,
             description=tool.description,
             parameters=schema(parameters(tool)),
@@ -39,12 +39,15 @@ end
 @omit_null @kwarg struct ToolCall
     id::String
     type::String = "function"
-    function::ToolCallFunction
+    var"function"::ToolCallFunction
 end
 
 @omit_null @kwarg struct Message
     role::String
     content::Union{Nothing,String} = nothing
+    reasoning_content::Union{Nothing,String} = nothing
+    reasoning::Union{Nothing,String} = nothing
+    reasoning_text::Union{Nothing,String} = nothing
     tool_calls::Union{Nothing,Vector{ToolCall}} = nothing
     tool_call_id::Union{Nothing,String} = nothing
     name::Union{Nothing,String} = nothing
@@ -77,12 +80,15 @@ end
     index::Int
     id::Union{Nothing,String} = nothing
     type::String = "function"
-    function::StreamToolCallFunctionDelta
+    var"function"::StreamToolCallFunctionDelta
 end
 
 @omit_null @kwarg struct StreamDelta
     role::Union{Nothing,String} = nothing
     content::Union{Nothing,String} = nothing
+    reasoning_content::Union{Nothing,String} = nothing
+    reasoning::Union{Nothing,String} = nothing
+    reasoning_text::Union{Nothing,String} = nothing
     tool_calls::Union{Nothing,Vector{StreamToolCallDelta}} = nothing
 end
 
@@ -110,6 +116,7 @@ end
     stream::Bool
     tools::Union{Nothing,Vector{Tool}} = nothing
     tool_choice::Union{Nothing,Any} = nothing
+    reasoning_effort::Union{Nothing,String} = nothing
     max_tokens::Union{Nothing,Int} = nothing
     temperature::Union{Nothing,Float64} = nothing
     top_p::Union{Nothing,Float64} = nothing
