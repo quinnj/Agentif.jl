@@ -86,4 +86,4 @@ end
 
 # Load generated models
 include("models_generated.jl")
-
+include("models_custom.jl")

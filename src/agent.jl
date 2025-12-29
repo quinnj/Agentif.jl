@@ -35,6 +35,8 @@ function evaluate!(f::Function, agent::Agent, input::Union{String,Vector{Pending
         return evaluate_anthropic_messages!(f, agent, input, apikey; model, previous_response_id, http_kw, kw...)
     elseif model.api == "google-generative-ai"
         return evaluate_google_generative_ai!(f, agent, input, apikey; model, previous_response_id, http_kw, kw...)
+    elseif model.api == "google-gemini-cli"
+        return evaluate_google_gemini_cli!(f, agent, input, apikey; model, previous_response_id, http_kw, kw...)
     else
         throw(ArgumentError("$(model.name) using $(model.api) api currently unsupported"))
     end
@@ -823,6 +825,253 @@ function evaluate_google_generative_ai!(f::Function, agent::Agent, input::Union{
                 push!(response_parts, GoogleGenerativeAI.Part(; functionResponse=GoogleGenerativeAI.FunctionResponse(; name=result.name, response=response_payload)))
             end
             push!(contents, GoogleGenerativeAI.Content(; role="user", parts=response_parts))
+            f(TurnEndEvent(turn, assistant_started ? assistant_message : nothing, pending_tool_calls))
+            turn += 1
+            f(TurnStartEvent(turn))
+        end
+    end
+end
+
+function evaluate_google_gemini_cli!(f::Function, agent::Agent, input::Union{String,Vector{PendingToolCall}}, apikey::String; model::Model, previous_response_id::Union{Nothing, String} = nothing, http_kw=(;), kw...)
+    return Future{Result}() do
+        tools = isempty(agent.tools) ? nothing : [GoogleGeminiCli.Tool(agent.tools)]
+        input_valid = Future{Bool}(() -> (agent.input_guardrail === nothing || !(input isa String)) ? true : agent.input_guardrail(agent.prompt, input, apikey))
+        f(AgentEvaluateStartEvent())
+        turn = 1
+        f(TurnStartEvent(turn))
+        if haskey(kw, :systemInstruction)
+            system_instruction = kw[:systemInstruction]
+            system_instruction isa String && (system_instruction = GoogleGeminiCli.Content(; parts=[GoogleGeminiCli.Part(; text=system_instruction)]))
+        else
+            system_instruction = GoogleGeminiCli.Content(; parts=[GoogleGeminiCli.Part(; text=agent.prompt)])
+        end
+        local contents
+        if input isa Vector{PendingToolCall}
+            resolved_calls, context = resolve_cached_tool_calls!(input)
+            context.provider != model.api && throw(ArgumentError("pending tool calls are cached for $(context.provider), not $(model.api)"))
+            previous_response_id = context.response_id
+            state = context.state
+            state === nothing && throw(ArgumentError("missing cached state for google-gemini-cli"))
+            system_instruction = state.system_instruction
+            contents = state.contents
+            tool_results = Future{ToolResultMessage}[]
+            for tc in resolved_calls
+                tool = findtool(agent.tools, tc.name)
+                f(ToolExecutionStartEvent(tc))
+                if tc.approved
+                    push!(tool_results, call_function_tool!(f, tool, tc))
+                else
+                    push!(tool_results, reject_function_tool!(f, tc, tc))
+                end
+            end
+            clear_cached_tool_calls!([tc.call_id for tc in resolved_calls])
+            response_parts = GoogleGeminiCli.Part[]
+            for trm in tool_results
+                result = wait(trm)
+                response_payload = result.is_error ? Dict("error" => result.output) : Dict("output" => result.output)
+                push!(response_parts, GoogleGeminiCli.Part(; functionResponse=GoogleGeminiCli.FunctionResponse(; id=result.call_id, name=result.name, response=response_payload)))
+            end
+            if !isempty(response_parts)
+                push!(contents, GoogleGeminiCli.Content(; role="user", parts=response_parts))
+            end
+        else
+            contents = GoogleGeminiCli.Content[]
+            push!(contents, GoogleGeminiCli.Content(; role="user", parts=[GoogleGeminiCli.Part(; text=input)]))
+        end
+        pending_tool_calls = PendingToolCall[]
+        while true
+            assistant_message = AssistantTextMessage(; response_id=previous_response_id)
+            assistant_started = false
+            assistant_ended = false
+            empty!(pending_tool_calls)
+            assistant_parts = GoogleGeminiCli.Part[]
+            seen_call_ids = Set{String}()
+            stream_kw = haskey(kw, :instructions) ? Base.structdiff(kw, (; instructions=nothing)) : kw
+            if haskey(stream_kw, :systemInstruction)
+                GoogleGeminiCli.stream(model, contents, apikey; tools, http_kw, stream_kw...) do http_stream, event
+                    if !wait(input_valid)
+                        close(http_stream)
+                        f(AgentErrorEvent(InvalidInputError(input isa String ? input : "<non-string input>")))
+                        return
+                    end
+                    if event isa GoogleGeminiCli.StreamChunk
+                        if event.response !== nothing && event.response.responseId !== nothing
+                            previous_response_id = event.response.responseId
+                            assistant_message.response_id = previous_response_id
+                        end
+                        response = event.response
+                        response === nothing && return
+                        response.candidates === nothing && return
+                        isempty(response.candidates) && return
+                        candidate = response.candidates[1]
+                        candidate.content === nothing && return
+                        candidate.content.parts === nothing && return
+                        for part in candidate.content.parts
+                            if part.text !== nothing
+                                if !assistant_started
+                                    assistant_started = true
+                                    f(MessageStartEvent(:assistant, assistant_message))
+                                end
+                                if part.thought === true
+                                    assistant_message.reasoning *= part.text
+                                    f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, part.text, nothing))
+                                    if !isempty(assistant_parts) && assistant_parts[end].thought === true
+                                        assistant_parts[end].text *= part.text
+                                    else
+                                        push!(assistant_parts, GoogleGeminiCli.Part(; text=part.text, thought=true, thoughtSignature=part.thoughtSignature))
+                                    end
+                                else
+                                    assistant_message.text *= part.text
+                                    f(MessageUpdateEvent(:assistant, assistant_message, :text, part.text, nothing))
+                                    if !isempty(assistant_parts) && assistant_parts[end].text !== nothing && assistant_parts[end].thought !== true
+                                        assistant_parts[end].text *= part.text
+                                    else
+                                        push!(assistant_parts, GoogleGeminiCli.Part(; text=part.text))
+                                    end
+                                end
+                            elseif part.functionCall !== nothing
+                                if !assistant_started
+                                    assistant_started = true
+                                    f(MessageStartEvent(:assistant, assistant_message))
+                                end
+                                fc = part.functionCall
+                                fc.name === nothing && throw(ArgumentError("function call missing name"))
+                                call_id = fc.id === nothing || fc.id in seen_call_ids ? new_call_id("gemini-cli") : fc.id
+                                push!(seen_call_ids, call_id)
+                                args_json = fc.args === nothing ? "{}" : JSON.json(fc.args)
+                                ptc = PendingToolCall(; call_id=call_id, name=fc.name, arguments=args_json)
+                                push!(pending_tool_calls, ptc)
+                                tool = findtool(agent.tools, ptc.name)
+                                f(ToolCallRequestEvent(ptc, tool.requires_approval))
+                                push!(assistant_parts, GoogleGeminiCli.Part(; functionCall=GoogleGeminiCli.FunctionCall(; id=call_id, name=fc.name, args=fc.args), thoughtSignature=part.thoughtSignature))
+                            end
+                        end
+                    elseif event isa GoogleGeminiCli.StreamDoneEvent
+                        if assistant_started && !assistant_ended
+                            assistant_ended = true
+                            f(MessageEndEvent(:assistant, assistant_message))
+                        end
+                    elseif event isa GoogleGeminiCli.StreamErrorEvent
+                        if assistant_started && !assistant_ended
+                            assistant_ended = true
+                            f(MessageEndEvent(:assistant, assistant_message))
+                        end
+                        f(AgentErrorEvent(ErrorException(event.message)))
+                    end
+                end
+            else
+                GoogleGeminiCli.stream(model, contents, apikey; tools, systemInstruction=system_instruction, http_kw, stream_kw...) do http_stream, event
+                    if !wait(input_valid)
+                        close(http_stream)
+                        f(AgentErrorEvent(InvalidInputError(input isa String ? input : "<non-string input>")))
+                        return
+                    end
+                    if event isa GoogleGeminiCli.StreamChunk
+                        if event.response !== nothing && event.response.responseId !== nothing
+                            previous_response_id = event.response.responseId
+                            assistant_message.response_id = previous_response_id
+                        end
+                        response = event.response
+                        response === nothing && return
+                        response.candidates === nothing && return
+                        isempty(response.candidates) && return
+                        candidate = response.candidates[1]
+                        candidate.content === nothing && return
+                        candidate.content.parts === nothing && return
+                        for part in candidate.content.parts
+                            if part.text !== nothing
+                                if !assistant_started
+                                    assistant_started = true
+                                    f(MessageStartEvent(:assistant, assistant_message))
+                                end
+                                if part.thought === true
+                                    assistant_message.reasoning *= part.text
+                                    f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, part.text, nothing))
+                                    if !isempty(assistant_parts) && assistant_parts[end].thought === true
+                                        assistant_parts[end].text *= part.text
+                                    else
+                                        push!(assistant_parts, GoogleGeminiCli.Part(; text=part.text, thought=true, thoughtSignature=part.thoughtSignature))
+                                    end
+                                else
+                                    assistant_message.text *= part.text
+                                    f(MessageUpdateEvent(:assistant, assistant_message, :text, part.text, nothing))
+                                    if !isempty(assistant_parts) && assistant_parts[end].text !== nothing && assistant_parts[end].thought !== true
+                                        assistant_parts[end].text *= part.text
+                                    else
+                                        push!(assistant_parts, GoogleGeminiCli.Part(; text=part.text))
+                                    end
+                                end
+                            elseif part.functionCall !== nothing
+                                if !assistant_started
+                                    assistant_started = true
+                                    f(MessageStartEvent(:assistant, assistant_message))
+                                end
+                                fc = part.functionCall
+                                fc.name === nothing && throw(ArgumentError("function call missing name"))
+                                call_id = fc.id === nothing || fc.id in seen_call_ids ? new_call_id("gemini-cli") : fc.id
+                                push!(seen_call_ids, call_id)
+                                args_json = fc.args === nothing ? "{}" : JSON.json(fc.args)
+                                ptc = PendingToolCall(; call_id=call_id, name=fc.name, arguments=args_json)
+                                push!(pending_tool_calls, ptc)
+                                tool = findtool(agent.tools, ptc.name)
+                                f(ToolCallRequestEvent(ptc, tool.requires_approval))
+                                push!(assistant_parts, GoogleGeminiCli.Part(; functionCall=GoogleGeminiCli.FunctionCall(; id=call_id, name=fc.name, args=fc.args), thoughtSignature=part.thoughtSignature))
+                            end
+                        end
+                    elseif event isa GoogleGeminiCli.StreamDoneEvent
+                        if assistant_started && !assistant_ended
+                            assistant_ended = true
+                            f(MessageEndEvent(:assistant, assistant_message))
+                        end
+                    elseif event isa GoogleGeminiCli.StreamErrorEvent
+                        if assistant_started && !assistant_ended
+                            assistant_ended = true
+                            f(MessageEndEvent(:assistant, assistant_message))
+                        end
+                        f(AgentErrorEvent(ErrorException(event.message)))
+                    end
+                end
+            end
+            if assistant_started && !assistant_ended
+                f(MessageEndEvent(:assistant, assistant_message))
+            end
+            if !wait(input_valid)
+                throw(ArgumentError("input_guardrail check failed for input: `$input`"))
+            end
+            if !isempty(assistant_parts)
+                push!(contents, GoogleGeminiCli.Content(; role="model", parts=assistant_parts))
+            end
+            requires_approval = PendingToolCall[]
+            for ptc in pending_tool_calls
+                tool = findtool(agent.tools, ptc.name)
+                if tool.requires_approval
+                    push!(requires_approval, ptc)
+                end
+            end
+            if isempty(pending_tool_calls) || !isempty(requires_approval)
+                response_id = ensure_response_id(previous_response_id)
+                if !isempty(requires_approval)
+                    cache_tool_calls!(requires_approval, CachedToolCallContext(model.api, response_id, (; system_instruction=system_instruction, contents=copy(contents))))
+                end
+                result = Result(; previous_response_id=response_id, pending_tool_calls=requires_approval)
+                f(AgentEvaluateEndEvent(result))
+                return result
+            end
+            tool_results = Future{ToolResultMessage}[]
+            for tc in pending_tool_calls
+                tool = findtool(agent.tools, tc.name)
+                f(ToolExecutionStartEvent(tc))
+                push!(tool_results, call_function_tool!(f, tool, tc))
+            end
+            response_parts = GoogleGeminiCli.Part[]
+            for trm in tool_results
+                result = wait(trm)
+                response_payload = result.is_error ? Dict("error" => result.output) : Dict("output" => result.output)
+                push!(response_parts, GoogleGeminiCli.Part(; functionResponse=GoogleGeminiCli.FunctionResponse(; id=result.call_id, name=result.name, response=response_payload)))
+            end
+            if !isempty(response_parts)
+                push!(contents, GoogleGeminiCli.Content(; role="user", parts=response_parts))
+            end
             f(TurnEndEvent(turn, assistant_started ? assistant_message : nothing, pending_tool_calls))
             turn += 1
             f(TurnStartEvent(turn))
