@@ -1,8 +1,8 @@
 module AnthropicMessages
 
-using StructUtils, JSON, HTTP
+using StructUtils, JSON
 
-import ..Model, ..AgentTool, ..parameters, ..ToolResultMessage
+import ..Model
 
 schema(::Type{T}) where {T} = JSON.schema(T; all_fields_required=true, additionalProperties=false)
 
@@ -51,13 +51,6 @@ end
     input_schema::JSON.Schema{T}
 end
 
-function Tool(tool::AgentTool)
-    return Tool(
-        name=tool.name,
-        description=tool.description,
-        input_schema=schema(parameters(tool))
-    )
-end
 
 @omit_null @kwarg struct Usage
     input_tokens::Union{Nothing,Int} = nothing
@@ -188,44 +181,6 @@ end
     temperature::Union{Nothing,Float64} = nothing
     top_p::Union{Nothing,Float64} = nothing
     stop_sequences::Union{Nothing,Vector{String}} = nothing
-end
-
-function get_sse_callback(f)
-    function sse_callback(stream, event::HTTP.SSEEvent)
-        try
-            f(stream, JSON.parse(event.data, StreamEvent))
-        catch e
-            f(stream, StreamErrorEvent(; error=Dict("message" => sprint(showerror, e))))
-        end
-    end
-end
-
-function stream(f::Function, model::Model, messages::Vector{Message}, apikey::String; http_kw=(;), kw...)
-    max_tokens = haskey(kw, :max_tokens) ? kw[:max_tokens] : model.maxTokens
-    kw_no_max_tokens = haskey(kw, :max_tokens) ? Base.structdiff(kw, (; max_tokens=0)) : kw
-    req = Request(; model=model.id, messages, max_tokens, stream=true, model.kw..., kw_no_max_tokens...)
-    headers = Dict(
-        "x-api-key" => apikey,
-        "anthropic-version" => "2023-06-01",
-        "Content-Type" => "application/json",
-    )
-    model.headers !== nothing && merge!(headers, model.headers)
-    url = joinpath(model.baseUrl, "v1", "messages")
-    HTTP.post(url, headers; body=JSON.json(req), sse_callback=get_sse_callback(f), http_kw...)
-end
-
-function request(model::Model, messages::Vector{Message}, apikey::String; http_kw=(;), kw...)
-    max_tokens = haskey(kw, :max_tokens) ? kw[:max_tokens] : model.maxTokens
-    kw_no_max_tokens = haskey(kw, :max_tokens) ? Base.structdiff(kw, (; max_tokens=0)) : kw
-    req = Request(; model=model.id, messages, max_tokens, stream=false, model.kw..., kw_no_max_tokens...)
-    headers = Dict(
-        "x-api-key" => apikey,
-        "anthropic-version" => "2023-06-01",
-        "Content-Type" => "application/json",
-    )
-    model.headers !== nothing && merge!(headers, model.headers)
-    url = joinpath(model.baseUrl, "v1", "messages")
-    return JSON.parse(HTTP.post(url, headers; body=JSON.json(req), http_kw...).body, Response)
 end
 
 end # module AnthropicMessages

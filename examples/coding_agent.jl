@@ -1,9 +1,14 @@
 #!/usr/bin/env julia
 using Agentif
 using Dates
+using JSON
 
 const DEFAULT_PROVIDER = "openai"
 const DEFAULT_MODEL = "gpt-4.1-mini"
+const USE_COLOR = get(ENV, "NO_COLOR", "") == "" && (stdout isa Base.TTY)
+const ANSI_DIM = "\e[90m"
+const ANSI_ITALIC = "\e[3m"
+const ANSI_RESET = "\e[0m"
 const TOOL_DESCRIPTIONS = Dict(
     "read" => "Read file contents",
     "bash" => "Execute bash commands (ls, grep, find, etc.)",
@@ -13,6 +18,86 @@ const TOOL_DESCRIPTIONS = Dict(
     "find" => "Find files by glob pattern (respects .gitignore)",
     "ls" => "List directory contents",
 )
+
+function style_thinking(text::String)
+    USE_COLOR || return text
+    return string(ANSI_DIM, ANSI_ITALIC, text, ANSI_RESET)
+end
+
+function style_tool(text::String)
+    USE_COLOR || return text
+    return string(ANSI_DIM, text, ANSI_RESET)
+end
+
+function shorten_string(text::AbstractString; max_len::Int = 60)
+    length(text) <= max_len && return text
+    return first(text, max_len) * "..."
+end
+
+function format_value(value; max_len::Int = 60)
+    if value === nothing
+        return "null"
+    elseif value isa Bool || value isa Number
+        return string(value)
+    elseif value isa AbstractString
+        sanitized = replace(value, "\n" => "\\n")
+        return shorten_string(sanitized; max_len)
+    elseif value isa AbstractVector
+        return "[$(length(value)) items]"
+    elseif value isa AbstractDict
+        return "{...}"
+    end
+    return shorten_string(string(value); max_len)
+end
+
+function summarize_tool_args(name::String, args_json::String)
+    parsed = try
+        JSON.parse(args_json)
+    catch
+        return shorten_string(args_json; max_len=80)
+    end
+    parsed isa AbstractDict || return shorten_string(args_json; max_len=80)
+    keys_list = collect(keys(parsed))
+    ordered = String[]
+    if "path" in keys_list
+        push!(ordered, "path")
+    end
+    for key in sort(String.(keys_list))
+        key == "path" && continue
+        push!(ordered, key)
+    end
+    parts = String[]
+    for key in ordered
+        value = parsed[key]
+        if key in ("content", "oldText", "newText")
+            if value isa AbstractString
+                push!(parts, "$(key)=<$(ncodeunits(value)) bytes>")
+            else
+                push!(parts, "$(key)=<...>")
+            end
+        else
+            push!(parts, "$(key)=$(format_value(value))")
+        end
+    end
+    return join(parts, " ")
+end
+
+function summarize_tool_output(name::String, output::String, is_error::Bool)
+    text = strip(output)
+    isempty(text) && return is_error ? "error" : "ok"
+    if is_error
+        return shorten_string(text; max_len=200)
+    end
+    if name in ("write", "edit")
+        return shorten_string(text; max_len=160)
+    end
+    lines = count(==('\n'), text) + 1
+    bytes = ncodeunits(text)
+    if lines == 1 && length(text) <= 120
+        return text
+    end
+    return "$(lines) lines, $(bytes) bytes"
+end
 
 function load_context_files(cwd::AbstractString = pwd())
     root = abspath("/")
@@ -110,22 +195,47 @@ Documentation:
     return prompt
 end
 
-function handle_event(event)
-    if event isa Agentif.MessageUpdateEvent
-        if event.role == :assistant && event.kind == :text
-            print(event.delta)
-            flush(stdout)
+function make_event_handler()
+    tool_started = Dict{String, Float64}()
+    assistant_in_progress = false
+    function handle_event(event)
+        if event isa Agentif.MessageStartEvent
+            if event.role == :assistant
+                assistant_in_progress = true
+            end
+        elseif event isa Agentif.MessageUpdateEvent
+            if event.role == :assistant && event.kind == :text
+                print(event.delta)
+                flush(stdout)
+            elseif event.role == :assistant && event.kind == :reasoning
+                print(style_thinking(event.delta))
+                flush(stdout)
+            end
+        elseif event isa Agentif.MessageEndEvent
+            if event.role == :assistant
+                assistant_in_progress = false
+                println()
+            end
+        elseif event isa Agentif.ToolExecutionStartEvent
+            assistant_in_progress && println()
+            tool_started[event.tool_call.call_id] = time()
+            args_summary = summarize_tool_args(event.tool_call.name, event.tool_call.arguments)
+            suffix = isempty(args_summary) ? "" : " " * args_summary
+            println(style_tool("[tool] $(event.tool_call.name)$(suffix)"))
+        elseif event isa Agentif.ToolExecutionEndEvent
+            assistant_in_progress && println()
+            started = get(() -> nothing, tool_started, event.tool_call.call_id)
+            started !== nothing && delete!(tool_started, event.tool_call.call_id)
+            elapsed = started === nothing ? "" : " ($(round(time() - started; digits=2))s)"
+            summary = summarize_tool_output(event.tool_call.name, event.result.output, event.result.is_error)
+            status = event.result.is_error ? "error" : "done"
+            println(style_tool("[tool] $(event.tool_call.name) $(status)$(elapsed): $(summary)"))
+        elseif event isa Agentif.AgentErrorEvent
+            assistant_in_progress && println()
+            println("[error] $(event.error)")
         end
-    elseif event isa Agentif.MessageEndEvent
-        event.role == :assistant && println()
-    elseif event isa Agentif.ToolExecutionStartEvent
-        println("\n[tool start] $(event.tool_call.name) $(event.tool_call.arguments)")
-    elseif event isa Agentif.ToolExecutionEndEvent
-        println("\n[tool done] $(event.tool_call.name)")
-        println(event.result.output)
-    elseif event isa Agentif.AgentErrorEvent
-        println("\n[error] $(event.error)")
     end
+    return handle_event
 end
 
 function main()
@@ -154,6 +264,9 @@ function main()
         tools,
     )
 
+    handle_event = make_event_handler()
+    session = Agentif.AgentSession(agent)
+
     println("Agentif coding agent ready. Type 'exit' to quit.")
     while true
         print("> ")
@@ -162,12 +275,12 @@ function main()
         isempty(input) && continue
         input in ("exit", "quit") && break
 
-        result = Agentif.evaluate(handle_event, agent, input, apikey)
+        result = Agentif.evaluate(handle_event, session, input, apikey)
         if !isempty(result.pending_tool_calls)
             for ptc in result.pending_tool_calls
                 Agentif.approve!(ptc)
             end
-            Agentif.evaluate(handle_event, agent, result.pending_tool_calls, apikey; previous_response_id=result.previous_response_id)
+            Agentif.evaluate(handle_event, session, result.pending_tool_calls, apikey)
         end
     end
 end

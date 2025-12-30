@@ -1,8 +1,8 @@
 module GoogleGenerativeAI
 
-using StructUtils, JSON, HTTP
+using StructUtils, JSON
 
-import ..Model, ..AgentTool, ..parameters, ..ToolResultMessage
+import ..Model
 
 function sanitize_schema(schema::Any)
     if schema isa AbstractDict
@@ -65,13 +65,6 @@ end
     functionDeclarations::Vector{FunctionDeclaration}
 end
 
-function Tool(tools::Vector{AgentTool})
-    decls = FunctionDeclaration[]
-    for tool in tools
-        push!(decls, FunctionDeclaration(; name=tool.name, description=tool.description, parameters=schema(parameters(tool))))
-    end
-    return Tool(; functionDeclarations=decls)
-end
 
 @omit_null @kwarg struct FunctionCall
     id::Union{Nothing,String} = nothing
@@ -117,49 +110,6 @@ end
     tools::Union{Nothing,Vector{Tool}} = nothing
     systemInstruction::Union{Nothing,Content} = nothing
     toolConfig::Union{Nothing,Any} = nothing
-end
-
-struct StreamDoneEvent end
-
-@omit_null @kwarg struct StreamErrorEvent
-    message::String
-end
-
-function get_sse_callback(f)
-    function sse_callback(stream, event::HTTP.SSEEvent)
-        data = String(event.data)
-        if data == "[DONE]"
-            f(stream, StreamDoneEvent())
-            return
-        end
-        try
-            f(stream, JSON.parse(data, GenerateContentResponse))
-        catch e
-            f(stream, StreamErrorEvent(; message=sprint(showerror, e)))
-        end
-    end
-end
-
-function stream(f::Function, model::Model, contents::Vector{Content}, apikey::String; http_kw=(;), kw...)
-    req = Request(; contents, model.kw..., kw...)
-    headers = Dict(
-        "x-goog-api-key" => apikey,
-        "Content-Type" => "application/json",
-    )
-    model.headers !== nothing && merge!(headers, model.headers)
-    url = joinpath(model.baseUrl, "models", "$(model.id):streamGenerateContent")
-    HTTP.post(url * "?alt=sse", headers; body=JSON.json(req), sse_callback=get_sse_callback(f), http_kw...)
-end
-
-function request(model::Model, contents::Vector{Content}, apikey::String; http_kw=(;), kw...)
-    req = Request(; contents, model.kw..., kw...)
-    headers = Dict(
-        "x-goog-api-key" => apikey,
-        "Content-Type" => "application/json",
-    )
-    model.headers !== nothing && merge!(headers, model.headers)
-    url = joinpath(model.baseUrl, "models", "$(model.id):generateContent")
-    return JSON.parse(HTTP.post(url, headers; body=JSON.json(req), http_kw...).body, GenerateContentResponse)
 end
 
 end # module GoogleGenerativeAI

@@ -17,7 +17,7 @@ parameters(::AgentTool{F,T}) where {F,T} = T
 end
 
 approve!(pending_tool_call::PendingToolCall) = pending_tool_call.approved = true
-function reject!(pending_tool_call::PendingToolCall, reason::String="the user has explicitly rejected the tool call request with arguments: $(pending_tool_call.tool_call.arguments); don't attempt to call this tool again")
+function reject!(pending_tool_call::PendingToolCall, reason::String="the user has explicitly rejected the tool call request with arguments: $(pending_tool_call.arguments); don't attempt to call this tool again")
     pending_tool_call.approved = false
     pending_tool_call.rejected_reason = reason
 end
@@ -172,4 +172,3 @@ macro tool_requires_approval(description::String, func_expr::Expr)
         )
     end
 end
-

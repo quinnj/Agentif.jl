@@ -18,12 +18,11 @@ agent = Agentif.Agent(;
 )
 
 # Helper to run agent and capture events
-function run_agent(agent, input, apikey; kw...)
+function run_agent(agent, input, apikey; state=Agentif.AgentState(), kw...)
     events = Any[]
     f = (event) -> push!(events, event)
-    # evaluate! returns a Future, we wait on it to get the Result
-    result = Agentif.evaluate(f, agent, input, apikey; kw...)
-    return result, events
+    result = Agentif.evaluate(f, agent, input, apikey; state, kw...)
+    return result, events, state
 end
 
 @testset "Predefined Tools" begin
@@ -68,9 +67,8 @@ end
         input_guardrail=nothing,
         tools=Agentif.AgentTool[]
     )
-    result, events = run_agent(compat_agent, "Say hello in one short sentence.", apikey)
-    @test result isa Agentif.Result
-    @test !isempty(result.previous_response_id)
+    result, events, _ = run_agent(compat_agent, "Say hello in one short sentence.", apikey)
+    @test result isa Agentif.AgentResult
     @test any(e -> e isa Agentif.MessageEndEvent, events)
 end
 
@@ -89,9 +87,8 @@ end
         input_guardrail=nothing,
         tools=Agentif.AgentTool[]
     )
-    result, events = run_agent(anthropic_agent, "Say hello in one short sentence.", apikey)
-    @test result isa Agentif.Result
-    @test !isempty(result.previous_response_id)
+    result, events, _ = run_agent(anthropic_agent, "Say hello in one short sentence.", apikey)
+    @test result isa Agentif.AgentResult
     @test any(e -> e isa Agentif.MessageEndEvent, events)
 end
 
@@ -110,9 +107,8 @@ end
         input_guardrail=nothing,
         tools=Agentif.AgentTool[]
     )
-    result, events = run_agent(google_agent, "Say hello in one short sentence.", apikey)
-    @test result isa Agentif.Result
-    @test !isempty(result.previous_response_id)
+    result, events, _ = run_agent(google_agent, "Say hello in one short sentence.", apikey)
+    @test result isa Agentif.AgentResult
     @test any(e -> e isa Agentif.MessageEndEvent, events)
 end
 
@@ -120,7 +116,8 @@ end
 
     @testset "Basic Tool Execution (No Approval)" begin
         input = "What is 10 + 20?"
-        result, events = run_agent(agent, input, apikey)
+        state = Agentif.AgentState()
+        result, events, state = run_agent(agent, input, apikey; state)
 
         # Should finish without pending tools
         @test isempty(result.pending_tool_calls)
@@ -140,14 +137,15 @@ end
             final_msgs = filter(e -> e isa Agentif.MessageEndEvent, events)
             @test !isempty(final_msgs)
             last_msg = final_msgs[end].message
-            @test last_msg isa Agentif.AssistantTextMessage
+            @test last_msg isa Agentif.AssistantMessage
             @test contains(last_msg.text, "30")
         end
     end
 
     @testset "Tool Approval Workflow" begin
         input = "Calculate 3 * 4 using the multiply tool."
-        result, events = run_agent(agent, input, apikey)
+        state = Agentif.AgentState()
+        result, events, state = run_agent(agent, input, apikey; state)
 
         # Should have pending tool call for multiply
         @test !isempty(result.pending_tool_calls)
@@ -162,7 +160,7 @@ end
         Agentif.approve!(ptc)
         
         # Continue execution
-        result_2, events_2 = run_agent(agent, result.pending_tool_calls, apikey; previous_response_id=result.previous_response_id)
+        result_2, events_2, _ = run_agent(agent, result.pending_tool_calls, apikey; state)
         
         # Should now be finished
         @test isempty(result_2.pending_tool_calls)
@@ -181,7 +179,8 @@ end
 
     @testset "Tool Rejection Workflow" begin
         input = "Calculate 10 * 10 using the multiply tool."
-        result, events = run_agent(agent, input, apikey)
+        state = Agentif.AgentState()
+        result, events, state = run_agent(agent, input, apikey; state)
 
         @test !isempty(result.pending_tool_calls)
         ptc = result.pending_tool_calls[1]
@@ -191,7 +190,7 @@ end
         Agentif.reject!(ptc, "User denied this operation.")
 
         # Continue execution
-        result_2, events_2 = run_agent(agent, result.pending_tool_calls, apikey; previous_response_id=result.previous_response_id)
+        result_2, events_2, _ = run_agent(agent, result.pending_tool_calls, apikey; state)
         
         # Check that it handled the rejection (failed tool execution or specific output)
         tool_execs = filter(e -> e isa Agentif.ToolExecutionEndEvent, events_2)

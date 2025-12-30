@@ -1,28 +1,5 @@
 abstract type AgentEvent end
 
-abstract type AgentMessage end
-
-struct UserTextMessage <: AgentMessage
-    text::String
-end
-
-mutable struct AssistantTextMessage <: AgentMessage
-    response_id::Union{Nothing,String}
-    text::String
-    refusal::String
-    reasoning::String
-end
-
-AssistantTextMessage(; response_id::Union{Nothing,String}=nothing) = AssistantTextMessage(response_id, "", "", "")
-
-@kwarg struct ToolResultMessage <: AgentMessage
-    call_id::String
-    name::String
-    arguments::String
-    output::String
-    is_error::Bool
-end
-
 struct AgentEvaluateStartEvent <: AgentEvent end
 
 struct AgentEvaluateEndEvent <: AgentEvent
@@ -35,7 +12,7 @@ end
 
 struct TurnEndEvent <: AgentEvent
     turn::Int
-    assistant_message::Union{Nothing,AssistantTextMessage}
+    assistant_message::Union{Nothing,AssistantMessage}
     pending_tool_calls::Vector{PendingToolCall}
 end
 

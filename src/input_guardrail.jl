@@ -1,3 +1,5 @@
+using HTTP
+
 const INPUT_GUARDRAIL_PROMPT = """
 SYSTEM (InputGuard v1)
 
@@ -48,6 +50,17 @@ end
 
 const INPUT_GUARDRAIL_OUTPUT_FORMAT = OpenAIResponses.Text(; format=OpenAIResponses.TextFormatJSONSchema(; name="valid_user_input", strict=true, schema=JSON.schema(ValidUserInput; all_fields_required=true, additionalProperties=false)))
 
+function openai_responses_request(model::Model, input::String, apikey::String; http_kw=(;), kw...)
+    req = OpenAIResponses.Request(; model=model.id, input=input, stream=false, model.kw..., kw...)
+    headers = Dict(
+        "Authorization" => "Bearer $apikey",
+        "Content-Type" => "application/json",
+    )
+    model.headers !== nothing && merge!(headers, model.headers)
+    url = joinpath(model.baseUrl, "responses")
+    return JSON.parse(HTTP.post(url, headers; body=JSON.json(req), http_kw...).body, OpenAIResponses.Response)
+end
+
 function default_input_guardrail(classifier_model::Model)
     function check(agent_prompt, input, apikey)
         classifier_input = """
@@ -56,7 +69,7 @@ function default_input_guardrail(classifier_model::Model)
             USER_INPUT: `$input`
         """
         if classifier_model.api == "openai-responses"
-            resp = OpenAIResponses.request(
+            resp = openai_responses_request(
                 classifier_model,
                 classifier_input,
                 apikey;

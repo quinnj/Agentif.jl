@@ -1,8 +1,8 @@
 module OpenAIResponses
 
-using StructUtils, JSON, HTTP, InteractiveUtils
+using StructUtils, JSON
 
-import ..Model, ..Future, ..AgentTool, ..parameters, ..ToolResultMessage
+import ..Model
 
 schema(::Type{T}) where {T} = JSON.schema(T; all_fields_required=true, additionalProperties=false)
 
@@ -109,7 +109,6 @@ end
     status::Union{Nothing,String} = nothing # "in_progress", "completed", "incomplete"
 end
 
-FunctionToolCallOutput(trm::ToolResultMessage) = FunctionToolCallOutput(; call_id=trm.call_id, output=trm.output)
 
 const Item = Union{Message,FunctionToolCallOutput} # TODO: add other item types here: Function tool call, Function tool call output, etc.
 
@@ -179,14 +178,6 @@ end
     parameters::JSON.Schema{T}
 end
 
-function FunctionTool(tool::AgentTool)
-    return FunctionTool(
-        name=tool.name,
-        description=tool.description,
-        strict=tool.strict,
-        parameters=schema(parameters(tool))
-    )
-end
 
 @omit_null @kwarg struct WebSearchFilters
     allowed_domains::Union{Nothing,Vector{String}} = nothing
@@ -1432,44 +1423,6 @@ JSON.@choosetype StreamEvent x -> begin
     else
         return error("Invalid stream event type: $type")
     end
-end
-
-function get_sse_callback(f)
-    function sse_callback(stream, event::HTTP.SSEEvent)
-        f(stream, JSON.parse(event.data, StreamEvent))
-    end
-end
-
-function stream(f::Function, model::Model, input::Union{String,Vector{InputItem}}, apikey::String; http_kw=(;), kw...)
-    req = Request(; model=model.id, input=input, stream=true, model.kw..., kw...)
-    headers = Dict(
-        "Authorization" => "Bearer $apikey",
-        "Content-Type" => "application/json",
-    )
-    model.headers !== nothing && merge!(headers, model.headers)
-    url = joinpath(model.baseUrl, "responses")
-    HTTP.post(url, headers; body=JSON.json(req), sse_callback=get_sse_callback(f), http_kw...)
-end
-
-function request(model::Model, input::Union{String,Vector{InputItem}}, apikey::String; http_kw=(;), kw...)
-    req = Request(; model=model.id, input=input, stream=false, model.kw..., kw...)
-    headers = Dict(
-        "Authorization" => "Bearer $apikey",
-        "Content-Type" => "application/json",
-    )
-    model.headers !== nothing && merge!(headers, model.headers)
-    url = joinpath(model.baseUrl, "responses")
-    return JSON.parse(HTTP.post(url, headers; body=JSON.json(req), http_kw...).body, Response)
-end  
-
-function get_response(model::Model, response_id::String, apikey::String; http_kw=(;))
-    headers = Dict(
-        "Authorization" => "Bearer $apikey",
-        "Content-Type" => "application/json",
-    )
-    model.headers !== nothing && merge!(headers, model.headers)
-    url = joinpath(model.baseUrl, "responses", response_id)
-    return JSON.parse(HTTP.get(url, headers; http_kw...).body, Response)
 end
 
 end # module OpenAIResponses

@@ -1,8 +1,8 @@
 module GoogleGeminiCli
 
-using StructUtils, JSON, HTTP, UUIDs
+using StructUtils, JSON, UUIDs
 
-import ..Model, ..AgentTool, ..parameters
+import ..Model
 
 function sanitize_schema(schema::Any)
     if schema isa AbstractDict
@@ -65,13 +65,6 @@ end
     functionDeclarations::Vector{FunctionDeclaration}
 end
 
-function Tool(tools::Vector{AgentTool})
-    decls = FunctionDeclaration[]
-    for tool in tools
-        push!(decls, FunctionDeclaration(; name = tool.name, description = tool.description, parameters = schema(parameters(tool))))
-    end
-    return Tool(; functionDeclarations = decls)
-end
 
 @omit_null @kwarg struct FunctionCall
     id::Union{Nothing, String} = nothing
@@ -190,11 +183,6 @@ const ANTIGRAVITY_HEADERS = Dict(
     ),
 )
 
-function emit_stream_error(f, http_stream, err)
-    message = err isa Exception ? sprint(showerror, err) : string(err)
-    return f(http_stream, StreamErrorEvent(; message))
-end
-
 function map_tool_choice(choice::String)
     if choice == "auto"
         return "AUTO"
@@ -274,91 +262,6 @@ function parse_oauth_credentials(apikey::String)
     token = get(() -> nothing, parsed, "token")
     project_id = get(() -> nothing, parsed, "projectId")
     return token, project_id
-end
-
-function stream(f::Function, model::Model, contents::Vector{Content}, apikey::String; http_kw = (;), kw...)
-    token, project_id = parse_oauth_credentials(apikey)
-    token === nothing && throw(ArgumentError("Missing `token` in google-gemini-cli credentials JSON"))
-    project_id === nothing && throw(ArgumentError("Missing `projectId` in google-gemini-cli credentials JSON"))
-
-    system_instruction = haskey(kw, :systemInstruction) ? kw[:systemInstruction] : nothing
-    tools = haskey(kw, :tools) ? kw[:tools] : nothing
-    tool_choice = haskey(kw, :toolChoice) ? kw[:toolChoice] : nothing
-    max_tokens = haskey(kw, :maxTokens) ? kw[:maxTokens] : nothing
-    temperature = haskey(kw, :temperature) ? kw[:temperature] : nothing
-    thinking = haskey(kw, :thinking) ? kw[:thinking] : nothing
-
-    req = build_request(
-        model,
-        contents,
-        project_id;
-        systemInstruction = system_instruction,
-        tools = tools,
-        toolChoice = tool_choice,
-        maxTokens = max_tokens,
-        temperature = temperature,
-        thinking = thinking,
-    )
-
-    endpoint = isempty(model.baseUrl) ? DEFAULT_ENDPOINT : model.baseUrl
-    url = string(endpoint, "/v1internal:streamGenerateContent?alt=sse")
-    headers = occursin("sandbox.googleapis.com", endpoint) ? copy(ANTIGRAVITY_HEADERS) : copy(GEMINI_CLI_HEADERS)
-    headers["Authorization"] = "Bearer $token"
-    headers["Content-Type"] = "application/json"
-    headers["Accept"] = "text/event-stream"
-    model.headers !== nothing && merge!(headers, model.headers)
-
-    debug_stream = haskey(kw, :debug_stream) ? kw[:debug_stream] : false
-
-    return HTTP.open("POST", url, headers; http_kw...) do http
-        write(http, JSON.json(req))
-        HTTP.closewrite(http)
-        response = HTTP.startread(http)
-        if response.status < 200 || response.status >= 300
-            error_text = try
-                String(read(http))
-            catch
-                ""
-            end
-            emit_stream_error(f, http, "Cloud Code Assist API error ($(response.status)): $(error_text)")
-            return response
-        end
-
-        buffer = ""
-        try
-            while !eof(http)
-                data = String(readavailable(http))
-                isempty(data) && continue
-                buffer *= data
-                while true
-                    newline = findfirst('\n', buffer)
-                    newline === nothing && break
-                    line = buffer[1:prevind(buffer, newline)]
-                    buffer = buffer[nextind(buffer, newline):end]
-                    line = strip(line)
-                    isempty(line) && continue
-                    startswith(line, "data:") || continue
-                    payload = strip(line[6:end])
-                    isempty(payload) && continue
-                    debug_stream && @info "gemini-cli stream line" length=length(payload)
-                    if payload == "[DONE]"
-                        f(http, StreamDoneEvent())
-                        return response
-                    end
-                    try
-                        f(http, JSON.parse(payload, StreamChunk))
-                    catch e
-                        emit_stream_error(f, http, e)
-                    end
-                end
-            end
-            f(http, StreamDoneEvent())
-        catch e
-            emit_stream_error(f, http, e)
-        end
-
-        return response
-    end
 end
 
 end # module GoogleGeminiCli
