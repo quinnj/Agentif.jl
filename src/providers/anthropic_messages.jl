@@ -4,7 +4,13 @@ using StructUtils, JSON
 
 import ..Model
 
-schema(::Type{T}) where {T} = JSON.schema(T; all_fields_required=true, additionalProperties=false)
+schema(::Type{T}) where {T} = JSON.schema(
+    T;
+    draft="https://json-schema.org/draft/2020-12/schema",
+    refs=:defs,
+    all_fields_required=true,
+    additionalProperties=false,
+)
 
 @omit_null @kwarg mutable struct TextBlock
     type::String = "text"

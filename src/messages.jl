@@ -26,6 +26,29 @@ end
     is_error::Bool
 end
 
+const AGENT_MESSAGE_TYPE_USER = "user"
+const AGENT_MESSAGE_TYPE_ASSISTANT = "assistant"
+
+JSON.lower(x::UserMessage) = (; type=AGENT_MESSAGE_TYPE_USER, text=x.text)
+JSON.lower(x::AssistantMessage) = (;
+    type=AGENT_MESSAGE_TYPE_ASSISTANT,
+    response_id=x.response_id,
+    text=x.text,
+    reasoning=x.reasoning,
+    refusal=x.refusal,
+    tool_calls=x.tool_calls,
+)
+
+JSON.@choosetype AgentMessage x -> begin
+    msg_type = x.type[]
+    if msg_type == AGENT_MESSAGE_TYPE_USER
+        return UserMessage
+    elseif msg_type == AGENT_MESSAGE_TYPE_ASSISTANT
+        return AssistantMessage
+    end
+    throw(ArgumentError("Unknown agent message type: $(msg_type)"))
+end
+
 const AgentTurnInput = Union{String,Vector{ToolResultMessage}}
 
 @kwarg mutable struct Usage
