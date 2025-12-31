@@ -1,37 +1,35 @@
-@kwarg struct Agent{F}
+abstract type AgentContext end
+
+# we need to be able to get the agent from any context
+function get_agent end
+
+@kwarg struct Agent{F} <: AgentContext
     prompt::String
-    model::Union{Nothing, Model} = nothing
+    model::Model
+    apikey::String
+    state::AgentState = AgentState()
     input_guardrail::F = nothing
     tools::Vector{AgentTool} = AgentTool[]
+    stream_output::Bool = false
+end
+
+get_agent(x::Agent) = x
+
+function handle_event(agent::Agent, event)
+    if event isa MessageUpdateEvent && agent.stream_output
+        print(event.delta)
+    elseif event isa MessageEndEvent && agent.stream_output
+        println()
+    end
 end
 
 struct InvalidInputError <: Exception
     input::String
 end
 
-function evaluate!(agent::Agent, input::Union{String,Vector{PendingToolCall}}, apikey::String;
-        model::Union{Nothing, Model} = nothing, state::AgentState = AgentState(),
-        stream_output::Bool = isinteractive(), stream_reasoning::Bool = true, kw...)
-    return evaluate!(agent, input, apikey; model, state, kw...) do event
-        if event isa MessageUpdateEvent
-            if event.kind == :text || (stream_reasoning && event.kind == :reasoning)
-                if stream_output
-                    print(event.delta)
-                    flush(stdout)
-                end
-            end
-        elseif event isa MessageEndEvent
-            if stream_output
-                println()
-                flush(stdout)
-            end
-        end
-    end
-end
-
-function validate_guardrail(agent::Agent, input::AgentTurnInput, apikey::String)
+function validate_guardrail(agent::Agent, input::AgentTurnInput)
     if input isa String && agent.input_guardrail !== nothing
-        return agent.input_guardrail(agent.prompt, input, apikey)
+        return agent.input_guardrail(agent.prompt, input, agent.apikey)
     end
     return true
 end
@@ -52,7 +50,7 @@ end
 
 function merge_pending_tool_calls!(state::AgentState, approvals::Vector{PendingToolCall})
     isempty(state.pending_tool_calls) && throw(ArgumentError("no pending tool calls in state"))
-    by_id = Dict{String,PendingToolCall}()
+    by_id = Dict{String, PendingToolCall}()
     for ptc in state.pending_tool_calls
         by_id[ptc.call_id] = ptc
     end
@@ -80,12 +78,21 @@ function append_state!(state::AgentState, input::AgentTurnInput, message::Assist
     return state
 end
 
-function evaluate!(f::Function, agent::Agent, input::Union{String,Vector{PendingToolCall}}, apikey::String;
-        model::Union{Nothing, Model} = nothing, state::AgentState = AgentState(),
-        http_kw=(;), kw...)
+evaluate(args...; kw...) = wait(evaluate!(args...; kw...))
+
+evaluate!(ctx::AgentContext, input; kw...) = evaluate!(identity, ctx, input; kw...)
+
+function evaluate!(f::Function, ctx::AgentContext, input::Union{String, Vector{PendingToolCall}}; kw...)
+    agent = get_agent(ctx)
+    return _evaluate!(agent, input; kw...) do event
+        handle_event(ctx, event)
+        f(event)
+    end
+end
+
+function _evaluate!(f::Function, agent::Agent, input::Union{String, Vector{PendingToolCall}}; kw...)
     return Future{AgentResult}() do
-        model = model === nothing ? agent.model : model
-        model === nothing && throw(ArgumentError("no model specified with which agent can evaluate input"))
+        state = agent.state
         f(AgentEvaluateStartEvent())
         turn = 1
         f(TurnStartEvent(turn))
@@ -99,20 +106,20 @@ function evaluate!(f::Function, agent::Agent, input::Union{String,Vector{Pending
         else
             current_input = input
         end
-        validate_guardrail(agent, current_input, apikey) || begin
+        validate_guardrail(agent, current_input) || begin
             f(AgentErrorEvent(InvalidInputError(input isa String ? input : "<non-string input>")))
             throw(ArgumentError("input_guardrail check failed for input: `$input`"))
         end
 
         usage = Usage()
         while true
-            response = stream(f, agent, state, current_input, apikey; model, http_kw, kw...)
+            response = stream(f, agent, state, current_input, agent.apikey; agent.model, kw...)
             add_usage!(usage, response.usage)
             append_state!(state, current_input, response.message, response.usage)
 
             pending_tool_calls = PendingToolCall[]
             for call in response.message.tool_calls
-                push!(pending_tool_calls, PendingToolCall(; call_id=call.call_id, name=call.name, arguments=call.arguments))
+                push!(pending_tool_calls, PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments))
             end
             f(TurnEndEvent(turn, response.message, pending_tool_calls))
 
@@ -127,10 +134,10 @@ function evaluate!(f::Function, agent::Agent, input::Union{String,Vector{Pending
             if isempty(pending_tool_calls) || !isempty(requires_approval)
                 state.pending_tool_calls = requires_approval
                 result = AgentResult(
-                    ; message=response.message,
+                    ; message = response.message,
                     usage,
-                    pending_tool_calls=requires_approval,
-                    stop_reason=response.stop_reason,
+                    pending_tool_calls = requires_approval,
+                    stop_reason = response.stop_reason,
                 )
                 f(AgentEvaluateEndEvent(result))
                 return result
@@ -155,7 +162,7 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
             is_error = true
             output = sprint(showerror, e)
         end
-        trm = ToolResultMessage(; output, is_error, call_id=tc.call_id, name=tc.name, arguments=tc.arguments)
+        trm = ToolResultMessage(; output, is_error, call_id = tc.call_id, name = tc.name, arguments = tc.arguments)
         f(ToolExecutionEndEvent(tc, trm))
         return trm
     end
@@ -163,7 +170,7 @@ end
 
 function reject_function_tool!(f, tc::PendingToolCall)
     reason = tc.rejected_reason === nothing ? "tool call rejected by user" : tc.rejected_reason
-    trm = ToolResultMessage(; output=reason, is_error=true, call_id=tc.call_id, name=tc.name, arguments=tc.arguments)
+    trm = ToolResultMessage(; output = reason, is_error = true, call_id = tc.call_id, name = tc.name, arguments = tc.arguments)
     f(ToolExecutionEndEvent(tc, trm))
     return Future{ToolResultMessage}(() -> trm)
 end

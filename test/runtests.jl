@@ -1,8 +1,11 @@
 using Test, Agentif
 
-apikey = "***REDACTED_OPENAI_KEY***"
-
-model = Agentif.getModel("openai", "gpt-5-nano")
+# model = Agentif.getModel("openai", "gpt-5-nano")
+# apikey = "***REDACTED_OPENAI_KEY***"
+model = Agentif.getModel("openrouter", "minimax/minimax-m2.1")
+apikey = "***REDACTED_OPENROUTER_KEY***"
+model = Agentif.getModel("xai", "grok-4-1-fast")
+apikey = "***REDACTED_XAI_KEY***"
 
 # Define tools
 tools = Agentif.AgentTool[
@@ -13,6 +16,7 @@ tools = Agentif.AgentTool[
 agent = Agentif.Agent(;
     prompt="You are a math assistant solely purposed to help with math questions",
     model,
+    apikey,
     input_guardrail=(args...) -> true, # Permissive guardrail for logic tests
     tools
 )
@@ -116,7 +120,6 @@ end
 
     @testset "Basic Tool Execution (No Approval)" begin
         input = "What is 10 + 20?"
-        state = Agentif.AgentState()
         result, events, state = run_agent(agent, input, apikey; state)
 
         # Should finish without pending tools

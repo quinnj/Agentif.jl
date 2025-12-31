@@ -2,7 +2,7 @@ using UUIDs
 
 abstract type SessionStore end
 
-mutable struct InMemorySessionStore <: SessionStore
+struct InMemorySessionStore <: SessionStore
     sessions::Dict{String,AgentState}
 end
 
@@ -19,7 +19,7 @@ function save_session!(store::InMemorySessionStore, session_id::String, state::A
     return nothing
 end
 
-mutable struct AgentSession{S<:SessionStore}
+mutable struct AgentSession{S<:SessionStore} <: AgentContext
     agent::Agent
     store::S
     session_id::String
@@ -30,34 +30,14 @@ function AgentSession(agent::Agent; store::SessionStore=InMemorySessionStore(), 
     return AgentSession{typeof(store)}(agent, store, sid)
 end
 
-function evaluate!(agent_session::AgentSession, input::Union{String,Vector{PendingToolCall}}, apikey::String;
-        model::Union{Nothing, Model} = nothing, stream_output::Bool = isinteractive(),
-        stream_reasoning::Bool = true, kw...)
-    return evaluate!(agent_session, input, apikey; model, kw...) do event
-        if event isa MessageUpdateEvent
-            if event.kind == :text || (stream_reasoning && event.kind == :reasoning)
-                if stream_output
-                    print(event.delta)
-                    flush(stdout)
-                end
-            end
-        elseif event isa MessageEndEvent
-            if stream_output
-                println()
-                flush(stdout)
-            end
-        end
-    end
+function get_agent(x::AgentSession)
+    agent = x.agent
+    set!(agent.state, load_session(x.store, x.session_id))
+    return agent
 end
 
-function evaluate!(f::Function, agent_session::AgentSession, input::Union{String,Vector{PendingToolCall}}, apikey::String;
-        model::Union{Nothing, Model} = nothing, http_kw=(;), kw...)
-    return Future{AgentResult}() do
-        state = load_session(agent_session.store, agent_session.session_id)
-        result = evaluate(f, agent_session.agent, input, apikey; model, state, http_kw, kw...)
-        save_session!(agent_session.store, agent_session.session_id, state)
-        return result
+function handle_event(session::AgentSession, event)
+    if event isa AgentEvaluateEndEvent
+        save_session!(session.store, session.session_id, session.agent.state)
     end
 end
-
-evaluate(args...; kw...) = wait(evaluate!(args...; kw...))

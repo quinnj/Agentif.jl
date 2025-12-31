@@ -52,6 +52,14 @@ end
     pending_tool_calls::Vector{PendingToolCall} = PendingToolCall[]
 end
 
+function set!(dest::AgentState, source::AgentState)
+    dest.messages = source.messages
+    dest.response_id = source.response_id
+    dest.usage = source.usage
+    dest.pending_tool_calls = source.pending_tool_calls
+    return
+end
+
 @kwarg struct AgentResponse
     message::AssistantMessage
     usage::Usage

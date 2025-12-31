@@ -1816,6 +1816,32 @@ function _init_model_registry!()
             maxTokens=131072,
             headers=nothing
         ),
+        "minimax/minimax-m2.1" => Model(
+            id="MiniMax-M2.1",
+            name="MiniMax: MiniMax M2.1",
+            api="openai-completions",
+            provider="minimax",
+            baseUrl="https://api.minimax.io/v1",
+            reasoning=true,
+            input=["text"],
+            cost=Dict("input"=>0.3, "output"=>2.4, "cacheRead"=>0.03, "cacheWrite"=>0.375),
+            contextWindow=204800,
+            maxTokens=131072,
+            headers=nothing
+        ),
+        "minimax/minimax-m2.1-lightning" => Model(
+            id="MiniMax-M2.1-lightning",
+            name="MiniMax: MiniMax M2.1 Lightning",
+            api="openai-completions",
+            provider="minimax",
+            baseUrl="https://api.minimax.io/v1",
+            reasoning=true,
+            input=["text"],
+            cost=Dict("input"=>0.3, "output"=>1.2, "cacheRead"=>0.03, "cacheWrite"=>0.375),
+            contextWindow=204800,
+            maxTokens=131072,
+            headers=nothing
+        ),
         "deepcogito/cogito-v2-preview-llama-405b" => Model(
             id="deepcogito/cogito-v2-preview-llama-405b",
             name="Deep Cogito: Cogito V2 Preview Llama 405B",
