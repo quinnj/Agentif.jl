@@ -613,6 +613,81 @@ function create_sandboxed_ls_tool(container::AbstractString, base_dir::AbstractS
     )
 end
 
+function create_codex_tool()
+    return @tool(
+        "Run Codex CLI in exec mode on a directory. Research the package, evaluate the prompt, use the GitHub CLI tool to make code changes, commit to a branch, and push the branch (without opening a PR). Returns session_id, summary of work done, and branch name if created.",
+        codex(prompt::String, directory::String, timeout::Union{Nothing,Int}) = begin
+            isempty(prompt) && throw(ArgumentError("prompt is required"))
+            isempty(directory) && throw(ArgumentError("directory is required"))
+            isdir(directory) || throw(ArgumentError("directory not found: $(directory)"))
+
+            cmd_str = "codex exec --json --cd $(directory) --full-auto --skip-git-repo-check $(prompt)"
+            cmd = Cmd(`bash -lc $cmd_str`, ignorestatus=true)
+            stderr_buf = IOBuffer()
+            process = open(pipeline(cmd, stderr=stderr_buf))
+            output_task = @async read(process, String)
+            timed_out = false
+            if timeout !== nothing && timeout > 0
+                status = timedwait(() -> istaskdone(output_task), timeout)
+                status == :timed_out && (timed_out = true; try
+                    Base.kill(process)
+                catch
+                end)
+            end
+            stdout_text = fetch(output_task)
+            close(process)
+            stderr_text = String(take!(stderr_buf))
+            timed_out && error("Codex timed out after $(timeout) seconds")
+
+            session_id = nothing
+            agent_messages = String[]
+            branch_name = nothing
+            errors = String[]
+
+            for line in split(stdout_text, "\n"; keepempty=false)
+                try
+                    parsed = JSON.parse(line)
+                    event_type = get(() -> nothing, parsed, "type")
+                    if event_type == "thread.started"
+                        session_id = get(() -> nothing, parsed, "thread_id")
+                        session_id !== nothing && (session_id = String(session_id))
+                    elseif event_type == "item.completed"
+                        item = get(() -> nothing, parsed, "item")
+                        item isa AbstractDict || continue
+                        item_type = get(() -> nothing, item, "type")
+                        if item_type == "agent_message"
+                            msg = get(() -> nothing, item, "text")
+                            msg !== nothing && push!(agent_messages, String(msg))
+                        elseif item_type == "command_execution"
+                            cmd = get(() -> nothing, item, "command")
+                            output = get(() -> "", item, "aggregated_output")
+                            exit_code = get(() -> nothing, item, "exit_code")
+                            if exit_code !== nothing && exit_code != 0
+                                err = "Command failed: $(cmd)\nExit code: $(exit_code)\nOutput: $(output)"
+                                push!(errors, err)
+                            end
+                        end
+                    end
+                catch
+                end
+            end
+
+            !isempty(stderr_text) && push!(errors, "Codex stderr: $(stderr_text)")
+
+            summary = join(agent_messages, "\n\n")
+            result = Dict{String,Any}(
+                "session_id" => session_id,
+                "directory" => directory,
+                "summary" => summary,
+                "branch" => branch_name,
+                "success" => isempty(errors),
+            )
+            !isempty(errors) && (result["errors"] = errors)
+            return result
+        end,
+    )
+end
+
 function create_find_tool(base_dir::AbstractString)
     base = ensure_base_dir(base_dir)
     return @tool(
