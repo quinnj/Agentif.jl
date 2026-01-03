@@ -26,6 +26,7 @@ export @tool, tool_name, AgentTool
 export create_bash_tool, create_read_tool, create_write_tool, create_edit_tool
 export create_grep_tool, create_find_tool, create_ls_tool
 export create_codex_tool
+export create_subagent_tool
 export create_sandboxed_bash_tool, create_sandboxed_read_tool, create_sandboxed_write_tool, create_sandboxed_edit_tool
 export create_sandboxed_grep_tool, create_sandboxed_find_tool, create_sandboxed_ls_tool
 export coding_tools, read_only_tools, all_tools

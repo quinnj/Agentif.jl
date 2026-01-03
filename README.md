@@ -51,6 +51,12 @@ end
 push!(agent.tools, AgentTool(add))
 ```
 
+Add a subagent tool for delegation and nesting:
+```julia
+other_tools = coding_tools()
+agent.tools = [create_subagent_tool(agent), other_tools...]
+```
+
 ## Models &amp; Providers
 ```julia
 getProviders()  # [:openai, :anthropic, ...]

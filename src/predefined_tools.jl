@@ -621,13 +621,15 @@ function create_codex_tool()
             isempty(directory) && throw(ArgumentError("directory is required"))
             isdir(directory) || throw(ArgumentError("directory not found: $(directory)"))
 
-            cmd_str = "codex exec --json --cd $(directory) --full-auto --skip-git-repo-check $(prompt)"
+            cmd_str = "codex exec --json --enable skills --yolo --cd $(shell_escape(directory)) --skip-git-repo-check $(shell_escape(prompt))"
             cmd = Cmd(`bash -lc $cmd_str`, ignorestatus=true)
             stderr_buf = IOBuffer()
             process = open(pipeline(cmd, stderr=stderr_buf))
             output_task = @async read(process, String)
             timed_out = false
-            if timeout !== nothing && timeout > 0
+            prompt_lower = lowercase(String(prompt))
+            apply_timeout = timeout !== nothing && timeout > 0 && (occursin("timeout", prompt_lower) || occursin("time limit", prompt_lower) || occursin("time-limit", prompt_lower))
+            if apply_timeout
                 status = timedwait(() -> istaskdone(output_task), timeout)
                 status == :timed_out && (timed_out = true; try
                     Base.kill(process)
@@ -684,6 +686,40 @@ function create_codex_tool()
             )
             !isempty(errors) && (result["errors"] = errors)
             return result
+        end,
+    )
+end
+
+function subagent_evaluate(parent::AgentContext, child::Agent, input_message::String)
+    return evaluate(child, input_message)
+end
+
+function create_subagent_tool(parent::AgentContext)
+    return @tool(
+        "Create and run a nested subagent with its own system prompt and input. Returns the subagent's response text.",
+        subagent(system_prompt::String, input_message::String) = begin
+            parent_agent = get_agent(parent)
+            child = Agent(
+                ; prompt=system_prompt,
+                model=parent_agent.model,
+                apikey=parent_agent.apikey,
+                state=AgentState(),
+                input_guardrail=parent_agent.input_guardrail,
+                tools=AgentTool[],
+                stream_output=false,
+            )
+            child_tools = AgentTool[]
+            for tool in parent_agent.tools
+                tool.name == "subagent" && continue
+                push!(child_tools, tool)
+            end
+            push!(child_tools, create_subagent_tool(child))
+            child.tools = child_tools
+
+            result = subagent_evaluate(parent, child, input_message)
+            message = result.message
+            message === nothing && return ""
+            return message.text |> string
         end,
     )
 end
