@@ -6,9 +6,9 @@ include("util.jl")
 include("models.jl")
 include("tools.jl")
 include("messages.jl")
-include("predefined_tools.jl")
 include("events.jl")
 include("agent.jl")
+include("predefined_tools.jl")
 include("providers/openai_responses.jl"); using .OpenAIResponses
 include("providers/openai_completions.jl"); using .OpenAICompletions
 include("providers/anthropic_messages.jl"); using .AnthropicMessages
