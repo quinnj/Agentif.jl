@@ -81,9 +81,18 @@ function get_agent(x::AgentSession)
     return agent
 end
 
+function session_agent(session::AgentSession)
+    ctx = session.ctx
+    while ctx isa AgentSession
+        ctx = ctx.ctx
+    end
+    return get_agent(ctx)
+end
+
 function handle_event(session::AgentSession, event)
     if event isa AgentEvaluateEndEvent
-        agent = get_agent(session)
+        agent = session_agent(session)
         save_session!(session.store, session.session_id, agent.state)
     end
+    return
 end

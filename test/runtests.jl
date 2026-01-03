@@ -46,6 +46,27 @@ using Test, Agentif
         end
     end
 
+    @testset "AgentSession Persistence" begin
+        providers = Agentif.getProviders()
+        @test !isempty(providers)
+        provider = providers[1]
+        models = Agentif.getModels(provider)
+        @test !isempty(models)
+        model = models[1]
+        base_dir = mktempdir()
+        store = FileSessionStore(base_dir)
+        agent = Agentif.Agent(; prompt="test", model, apikey="test", tools=Agentif.AgentTool[])
+        session = Agentif.AgentSession(agent; store, session_id="session-1")
+        Agentif.get_agent(session)
+        push!(agent.state.messages, UserMessage("hello"))
+        Agentif.handle_event(session, Agentif.AgentEvaluateEndEvent(nothing))
+        loaded = load_session(store, "session-1")
+        @test length(loaded.messages) == 1
+        msg = loaded.messages[1]
+        @test msg isa UserMessage
+        @test msg.text == "hello"
+    end
+
     @testset "Predefined Tools" begin
         base_dir = mktempdir()
 
