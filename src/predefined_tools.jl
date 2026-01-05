@@ -615,13 +615,21 @@ end
 
 function create_codex_tool()
     return @tool(
-        "Run Codex CLI in exec mode on a directory. Research the package, evaluate the prompt, use the GitHub CLI tool to make code changes, commit to a branch, and push the branch (without opening a PR). Returns session_id, summary of work done, and branch name if created.",
+        "Run Codex CLI in exec mode on a directory. Prepends worktree requirements (default-branch checkout, create `/worktrees/<branch>`, work there, push, remove worktree). Research the package, evaluate the prompt, use the GitHub CLI tool to make code changes, commit to a branch, and push the branch (without opening a PR). Returns session_id, summary of work done, and branch name if created.",
         codex(prompt::String, directory::String, timeout::Union{Nothing,Int}) = begin
             isempty(prompt) && throw(ArgumentError("prompt is required"))
             isempty(directory) && throw(ArgumentError("directory is required"))
             isdir(directory) || throw(ArgumentError("directory not found: $(directory)"))
-
-            cmd_str = "codex exec --json --enable skills --yolo --cd $(shell_escape(directory)) --skip-git-repo-check $(shell_escape(prompt))"
+            codex_preamble = join((
+                "Workflow requirements:",
+                "1) Identify the repo default branch (main/master) via `git symbolic-ref --short refs/remotes/origin/HEAD` (strip `origin/`; fallback to `git remote show origin`).",
+                "2) Check out the default branch in the main repo.",
+                "3) Create `/worktrees` if needed and add a worktree named after the new branch: `git worktree add -b <branch> /worktrees/<branch> <default-branch>`.",
+                "4) Do all work inside `/worktrees/<branch>`.",
+                "5) Push the branch to the remote, then remove the worktree: `git worktree remove /worktrees/<branch>`.",
+            ), "\n")
+            full_prompt = codex_preamble * "\n\n" * prompt
+            cmd_str = "codex exec --json --enable skills --yolo --cd $(shell_escape(directory)) --skip-git-repo-check $(shell_escape(full_prompt))"
             cmd = Cmd(`bash -lc $cmd_str`, ignorestatus=true)
             stderr_buf = IOBuffer()
             process = open(pipeline(cmd, stderr=stderr_buf))
