@@ -280,7 +280,7 @@ function create_bash_tool(base_dir::AbstractString)
     base = ensure_base_dir(base_dir)
     return @tool(
         "Execute a bash command in the base directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). Optionally provide a timeout in seconds.",
-        bash(command::String, timeout::Union{Nothing,Int}) = begin
+        bash(command::String, timeout::Union{Nothing,Int} = nothing) = begin
             command_has_absolute_path(command) && throw(ArgumentError("absolute paths are not allowed in bash commands"))
             cmd = Cmd(`bash -lc $command`, dir=base, ignorestatus=true)
             stderr_buf = IOBuffer()
@@ -337,7 +337,7 @@ function create_sandboxed_bash_tool(container::AbstractString, base_dir::Abstrac
     base = ensure_container_base_dir(base_dir)
     return @tool(
         "Execute a bash command in the container base directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). Optionally provide a timeout in seconds.",
-        bash(command::String, timeout::Union{Nothing,Int}) = begin
+        bash(command::String, timeout::Union{Nothing,Int} = nothing) = begin
             command_has_absolute_path(command) && throw(ArgumentError("absolute paths are not allowed in bash commands"))
             result = docker_exec_in_dir(container_name, base, command; timeout)
             combined = result.stdout
@@ -376,7 +376,7 @@ function create_read_tool(base_dir::AbstractString)
     base = ensure_base_dir(base_dir)
     return @tool(
         "Read the contents of a file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset and limit for large files.",
-        read(path::String, offset::Union{Nothing,Int}, limit::Union{Nothing,Int}) = begin
+        read(path::String, offset::Union{Nothing,Int} = nothing, limit::Union{Nothing,Int} = nothing) = begin
             resolved = resolve_relative_path(base, path)
             isfile(resolved) || throw(ArgumentError("file not found: $path"))
             content = Base.read(resolved, String)
@@ -415,7 +415,7 @@ function create_sandboxed_read_tool(container::AbstractString, base_dir::Abstrac
     base = ensure_container_base_dir(base_dir)
     return @tool(
         "Read the contents of a file in the container. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset and limit for large files.",
-        read(path::String, offset::Union{Nothing,Int}, limit::Union{Nothing,Int}) = begin
+        read(path::String, offset::Union{Nothing,Int} = nothing, limit::Union{Nothing,Int} = nothing) = begin
             resolved = resolve_relative_path(base, path)
             container_is_file(container_name, resolved) || throw(ArgumentError("file not found: $path"))
             count_result = docker_exec(container_name, "wc -l < $(shell_escape(resolved))")
@@ -543,7 +543,7 @@ function create_ls_tool(base_dir::AbstractString)
     base = ensure_base_dir(base_dir)
     return @tool(
         "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).",
-        ls(path::Union{Nothing,String}, limit::Union{Nothing,Int}) = begin
+        ls(path::Union{Nothing,String}, limit::Union{Nothing,Int} = nothing) = begin
             dir_path = resolve_search_path(base, path)
             isdir(dir_path) || throw(ArgumentError("not a directory: $(path === nothing ? "." : path)"))
             entries = readdir(dir_path)
@@ -580,7 +580,7 @@ function create_sandboxed_ls_tool(container::AbstractString, base_dir::AbstractS
     base = ensure_container_base_dir(base_dir)
     return @tool(
         "List directory contents in the container. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).",
-        ls(path::Union{Nothing,String}, limit::Union{Nothing,Int}) = begin
+        ls(path::Union{Nothing,String}, limit::Union{Nothing,Int} = nothing) = begin
             dir_path = resolve_search_path(base, path)
             container_is_dir(container_name, dir_path) || throw(ArgumentError("not a directory: $(path === nothing ? "." : path)"))
             result = docker_exec(container_name, "ls -ap $(shell_escape(dir_path))")
@@ -616,7 +616,7 @@ end
 function create_codex_tool()
     return @tool(
         "Run Codex CLI in exec mode on a directory. Prepends worktree requirements (default-branch checkout, create `/worktrees/<branch>`, work there, push, remove worktree). Research the package, evaluate the prompt, use the GitHub CLI tool to make code changes, commit to a branch, and push the branch (without opening a PR). Returns session_id, summary of work done, and branch name if created.",
-        codex(prompt::String, directory::String, timeout::Union{Nothing,Int}) = begin
+        codex(prompt::String, directory::String, timeout::Union{Nothing,Int} = nothing) = begin
             isempty(prompt) && throw(ArgumentError("prompt is required"))
             isempty(directory) && throw(ArgumentError("directory is required"))
             isdir(directory) || throw(ArgumentError("directory not found: $(directory)"))
@@ -736,7 +736,7 @@ function create_find_tool(base_dir::AbstractString)
     base = ensure_base_dir(base_dir)
     return @tool(
         "Search for files by glob pattern. Returns matching file paths relative to the search directory. Output is truncated to 1000 results or 50KB (whichever is hit first).",
-        find(pattern::String, path::Union{Nothing,String}, limit::Union{Nothing,Int}) = begin
+        find(pattern::String, path::Union{Nothing,String} = nothing, limit::Union{Nothing,Int} = nothing) = begin
             isempty(pattern) && throw(ArgumentError("pattern is required"))
             search_dir = resolve_search_path(base, path)
             isdir(search_dir) || throw(ArgumentError("not a directory: $(path === nothing ? "." : path)"))
@@ -790,7 +790,7 @@ function create_sandboxed_find_tool(container::AbstractString, base_dir::Abstrac
     base = ensure_container_base_dir(base_dir)
     return @tool(
         "Search for files by glob pattern in the container. Returns matching file paths relative to the search directory. Output is truncated to 1000 results or 50KB (whichever is hit first).",
-        find(pattern::String, path::Union{Nothing,String}, limit::Union{Nothing,Int}) = begin
+        find(pattern::String, path::Union{Nothing,String} = nothing, limit::Union{Nothing,Int} = nothing) = begin
             isempty(pattern) && throw(ArgumentError("pattern is required"))
             search_dir = resolve_search_path(base, path)
             container_is_dir(container_name, search_dir) || throw(ArgumentError("not a directory: $(path === nothing ? "." : path)"))
@@ -845,12 +845,12 @@ function create_grep_tool(base_dir::AbstractString)
         "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars.",
         grep(
             pattern::String,
-            path::Union{Nothing,String},
-            glob::Union{Nothing,String},
-            ignoreCase::Union{Nothing,Bool},
-            literal::Union{Nothing,Bool},
-            context::Union{Nothing,Int},
-            limit::Union{Nothing,Int},
+            path::Union{Nothing,String} = nothing,
+            glob::Union{Nothing,String} = nothing,
+            ignoreCase::Union{Nothing,Bool} = nothing,
+            literal::Union{Nothing,Bool} = nothing,
+            context::Union{Nothing,Int} = nothing,
+            limit::Union{Nothing,Int} = nothing,
         ) = begin
             isempty(pattern) && throw(ArgumentError("pattern is required"))
             search_path = resolve_search_path(base, path)
@@ -951,12 +951,12 @@ function create_sandboxed_grep_tool(container::AbstractString, base_dir::Abstrac
         "Search file contents for a pattern in the container. Returns matching lines with file paths and line numbers. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars.",
         grep(
             pattern::String,
-            path::Union{Nothing,String},
-            glob::Union{Nothing,String},
-            ignoreCase::Union{Nothing,Bool},
-            literal::Union{Nothing,Bool},
-            context::Union{Nothing,Int},
-            limit::Union{Nothing,Int},
+            path::Union{Nothing,String} = nothing,
+            glob::Union{Nothing,String} = nothing,
+            ignoreCase::Union{Nothing,Bool} = nothing,
+            literal::Union{Nothing,Bool} = nothing,
+            context::Union{Nothing,Int} = nothing,
+            limit::Union{Nothing,Int} = nothing,
         ) = begin
             isempty(pattern) && throw(ArgumentError("pattern is required"))
             search_path = resolve_search_path(base, path)
