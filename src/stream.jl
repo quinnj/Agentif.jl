@@ -121,9 +121,8 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
     messages = OpenAICompletions.Message[]
     push!(messages, OpenAICompletions.Message(; role="system", content=agent.prompt))
     for msg in state.messages
-        if msg isa UserMessage || msg isa AssistantMessage
-            push!(messages, openai_completions_message_from_agent(msg))
-        end
+        include_in_context(msg) || continue
+        push!(messages, openai_completions_message_from_agent(msg))
     end
     if input isa String
         push!(messages, OpenAICompletions.Message(; role="user", content=input))
@@ -273,9 +272,8 @@ end
 function anthropic_build_messages(agent::Agent, state::AgentState, input::AgentTurnInput)
     messages = AnthropicMessages.Message[]
     for msg in state.messages
-        if msg isa UserMessage || msg isa AssistantMessage
-            push!(messages, anthropic_message_from_agent(msg))
-        end
+        include_in_context(msg) || continue
+        push!(messages, anthropic_message_from_agent(msg))
     end
     if input isa String
         push!(messages, AnthropicMessages.Message(; role="user", content=input))
@@ -438,9 +436,8 @@ end
 function google_generative_build_contents(agent::Agent, state::AgentState, input::AgentTurnInput)
     contents = GoogleGenerativeAI.Content[]
     for msg in state.messages
-        if msg isa UserMessage || msg isa AssistantMessage
-            push!(contents, google_generative_message_from_agent(msg))
-        end
+        include_in_context(msg) || continue
+        push!(contents, google_generative_message_from_agent(msg))
     end
     if input isa String
         push!(contents, GoogleGenerativeAI.Content(; role="user", parts=[GoogleGenerativeAI.Part(; text=input)]))
@@ -587,9 +584,8 @@ end
 function google_gemini_cli_build_contents(agent::Agent, state::AgentState, input::AgentTurnInput)
     contents = GoogleGeminiCli.Content[]
     for msg in state.messages
-        if msg isa UserMessage || msg isa AssistantMessage
-            push!(contents, google_gemini_cli_message_from_agent(msg))
-        end
+        include_in_context(msg) || continue
+        push!(contents, google_gemini_cli_message_from_agent(msg))
     end
     if input isa String
         push!(contents, GoogleGeminiCli.Content(; role="user", parts=[GoogleGeminiCli.Part(; text=input)]))

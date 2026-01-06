@@ -16,6 +16,7 @@ end
     reasoning::String = ""
     refusal::String = ""
     tool_calls::Vector{AgentToolCall} = AgentToolCall[]
+    kind::String = "text"
 end
 
 @kwarg struct ToolResultMessage
@@ -37,6 +38,7 @@ JSON.lower(x::AssistantMessage) = (;
     reasoning=x.reasoning,
     refusal=x.refusal,
     tool_calls=x.tool_calls,
+    kind=x.kind,
 )
 
 JSON.@choosetype AgentMessage x -> begin
@@ -50,6 +52,15 @@ JSON.@choosetype AgentMessage x -> begin
 end
 
 const AgentTurnInput = Union{String,Vector{ToolResultMessage}}
+
+function include_in_context(msg::AgentMessage)
+    if msg isa UserMessage
+        return true
+    elseif msg isa AssistantMessage
+        return msg.kind != "tool"
+    end
+    return false
+end
 
 @kwarg mutable struct Usage
     input::Int = 0

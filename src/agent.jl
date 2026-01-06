@@ -66,8 +66,8 @@ function merge_pending_tool_calls!(state::AgentState, approvals::Vector{PendingT
     return state.pending_tool_calls
 end
 
-function append_state!(state::AgentState, input::AgentTurnInput, message::AssistantMessage, usage::Usage)
-    if input isa String
+function append_state!(state::AgentState, input::AgentTurnInput, message::AssistantMessage, usage::Usage; append_input::Bool=true)
+    if append_input && input isa String
         push!(state.messages, UserMessage(input))
     end
     push!(state.messages, message)
@@ -82,15 +82,15 @@ evaluate(args...; kw...) = wait(evaluate!(args...; kw...))
 
 evaluate!(ctx::AgentContext, input; kw...) = evaluate!(identity, ctx, input; kw...)
 
-function evaluate!(f::Function, ctx::AgentContext, input::Union{String, Vector{PendingToolCall}}; kw...)
+function evaluate!(f::Function, ctx::AgentContext, input::Union{String, Vector{PendingToolCall}}; append_input::Bool=true, kw...)
     agent = get_agent(ctx)
-    return _evaluate!(agent, input; kw...) do event
+    return _evaluate!(agent, input; append_input=append_input, kw...) do event
         handle_event(ctx, event)
         f(event)
     end
 end
 
-function _evaluate!(f::Function, agent::Agent, input::Union{String, Vector{PendingToolCall}}; kw...)
+function _evaluate!(f::Function, agent::Agent, input::Union{String, Vector{PendingToolCall}}; append_input::Bool=true, kw...)
     return Future{AgentResult}() do
         state = agent.state
         f(AgentEvaluateStartEvent())
@@ -115,7 +115,7 @@ function _evaluate!(f::Function, agent::Agent, input::Union{String, Vector{Pendi
         while true
             response = stream(f, agent, state, current_input, agent.apikey; agent.model, kw...)
             add_usage!(usage, response.usage)
-            append_state!(state, current_input, response.message, response.usage)
+            append_state!(state, current_input, response.message, response.usage; append_input=append_input)
 
             pending_tool_calls = PendingToolCall[]
             for call in response.message.tool_calls
@@ -153,6 +153,7 @@ end
 
 function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
     return Future{ToolResultMessage}() do
+        start_ns = time_ns()
         args = JSON.parse(tc.arguments, parameters(tool))
         is_error = false
         output = ""
@@ -163,7 +164,8 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
             output = sprint(showerror, e)
         end
         trm = ToolResultMessage(; output, is_error, call_id = tc.call_id, name = tc.name, arguments = tc.arguments)
-        f(ToolExecutionEndEvent(tc, trm))
+        duration_ms = Int64(div(time_ns() - start_ns, 1_000_000))
+        f(ToolExecutionEndEvent(tc, trm, duration_ms))
         return trm
     end
 end
@@ -171,6 +173,6 @@ end
 function reject_function_tool!(f, tc::PendingToolCall)
     reason = tc.rejected_reason === nothing ? "tool call rejected by user" : tc.rejected_reason
     trm = ToolResultMessage(; output = reason, is_error = true, call_id = tc.call_id, name = tc.name, arguments = tc.arguments)
-    f(ToolExecutionEndEvent(tc, trm))
+    f(ToolExecutionEndEvent(tc, trm, Int64(0)))
     return Future{ToolResultMessage}(() -> trm)
 end
