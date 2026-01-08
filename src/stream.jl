@@ -2,6 +2,13 @@ using HTTP
 using JSON
 using UUIDs
 
+# Default HTTP.jl kwargs for retry behavior
+const DEFAULT_HTTP_KW = (;
+    retry = true,
+    retries = 5,
+    retry_non_idempotent = true,  # Retry POST requests
+)
+
 mutable struct ToolCallAccumulator
     id::Union{Nothing,String}
     name::Union{Nothing,String}
@@ -113,6 +120,13 @@ function openai_completions_message_from_agent(msg::AgentMessage)
             kwargs = (; kwargs..., reasoning=msg.reasoning)
         end
         return OpenAICompletions.Message(; kwargs...)
+    elseif msg isa ToolResultMessage
+        return OpenAICompletions.Message(;
+            role="tool",
+            content=msg.output,
+            tool_call_id=msg.call_id,
+            name=msg.name,
+        )
     end
     throw(ArgumentError("unsupported message: $(typeof(msg))"))
 end
@@ -265,6 +279,13 @@ function anthropic_message_from_agent(msg::AgentMessage)
             push!(blocks, AnthropicMessages.ToolUseBlock(; id=call.call_id, name=call.name, input=args))
         end
         return AnthropicMessages.Message(; role="assistant", content=blocks)
+    elseif msg isa ToolResultMessage
+        block = AnthropicMessages.ToolResultBlock(;
+            tool_use_id=msg.call_id,
+            content=msg.output,
+            is_error=msg.is_error,
+        )
+        return AnthropicMessages.Message(; role="user", content=AnthropicMessages.ContentBlock[block])
     end
     throw(ArgumentError("unsupported message: $(typeof(msg))"))
 end
@@ -429,6 +450,12 @@ function google_generative_message_from_agent(msg::AgentMessage)
             ))
         end
         return GoogleGenerativeAI.Content(; role="model", parts)
+    elseif msg isa ToolResultMessage
+        response_payload = msg.is_error ? Dict("error" => msg.output) : Dict("result" => msg.output)
+        part = GoogleGenerativeAI.Part(;
+            functionResponse=GoogleGenerativeAI.FunctionResponse(; name=msg.name, response=response_payload),
+        )
+        return GoogleGenerativeAI.Content(; role="user", parts=[part])
     end
     throw(ArgumentError("unsupported message: $(typeof(msg))"))
 end
@@ -577,6 +604,16 @@ function google_gemini_cli_message_from_agent(msg::AgentMessage)
             ))
         end
         return GoogleGeminiCli.Content(; role="model", parts)
+    elseif msg isa ToolResultMessage
+        response_payload = msg.is_error ? Dict("error" => msg.output) : Dict("output" => msg.output)
+        part = GoogleGeminiCli.Part(;
+            functionResponse=GoogleGeminiCli.FunctionResponse(;
+                id=msg.call_id,
+                name=msg.name,
+                response=response_payload,
+            ),
+        )
+        return GoogleGeminiCli.Content(; role="user", parts=[part])
     end
     throw(ArgumentError("unsupported message: $(typeof(msg))"))
 end
@@ -713,6 +750,9 @@ function stream(f::Function, agent::Agent, state::AgentState, input::AgentTurnIn
     model = model === nothing ? agent.model : model
     model === nothing && throw(ArgumentError("no model specified with which agent can evaluate input"))
 
+    # Merge HTTP kwargs: defaults < agent.http_kw < per-call http_kw
+    merged_http_kw = merge(DEFAULT_HTTP_KW, NamedTuple(agent.http_kw), NamedTuple(http_kw))
+
     if model.api == "openai-responses"
         tools = openai_responses_build_tools(agent.tools)
         current_input = openai_responses_build_input(input)
@@ -753,7 +793,7 @@ function stream(f::Function, agent::Agent, state::AgentState, input::AgentTurnIn
                 response_usage,
                 response_status,
             ),
-            http_kw...,
+            merged_http_kw...,
         )
 
         if started[] && !ended[]
@@ -813,7 +853,7 @@ function stream(f::Function, agent::Agent, state::AgentState, input::AgentTurnIn
                 latest_finish,
                 tool_call_accumulators,
             ),
-            http_kw...,
+            merged_http_kw...,
         )
 
         if started[] && !ended[]
@@ -882,7 +922,7 @@ function stream(f::Function, agent::Agent, state::AgentState, input::AgentTurnIn
                 blocks_by_index,
                 partial_json_by_index,
             ),
-            http_kw...,
+            merged_http_kw...,
         )
 
         if started[] && !ended[]
@@ -931,7 +971,7 @@ function stream(f::Function, agent::Agent, state::AgentState, input::AgentTurnIn
                 latest_finish,
                 seen_call_ids,
             ),
-            http_kw...,
+            merged_http_kw...,
         )
 
         if started[] && !ended[]
@@ -998,7 +1038,7 @@ function stream(f::Function, agent::Agent, state::AgentState, input::AgentTurnIn
                 seen_call_ids,
                 debug_stream,
             ),
-            http_kw...,
+            merged_http_kw...,
         )
 
         if started[] && !ended[]

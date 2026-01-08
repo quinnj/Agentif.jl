@@ -11,6 +11,7 @@ function get_agent end
     input_guardrail::F = nothing
     tools::Vector{AgentTool} = AgentTool[]
     stream_output::Bool = false
+    http_kw::Any = (;)  # HTTP.jl kwargs (retries, retry_delays, etc.)
 end
 
 get_agent(x::Agent) = x
@@ -67,8 +68,12 @@ function merge_pending_tool_calls!(state::AgentState, approvals::Vector{PendingT
 end
 
 function append_state!(state::AgentState, input::AgentTurnInput, message::AssistantMessage, usage::Usage; append_input::Bool=true)
-    if append_input && input isa String
-        push!(state.messages, UserMessage(input))
+    if input isa String
+        append_input && push!(state.messages, UserMessage(input))
+    elseif input isa Vector{ToolResultMessage}
+        for result in input
+            push!(state.messages, result)
+        end
     end
     push!(state.messages, message)
     if message.response_id !== nothing
@@ -93,60 +98,78 @@ end
 function _evaluate!(f::Function, agent::Agent, input::Union{String, Vector{PendingToolCall}}; append_input::Bool=true, kw...)
     return Future{AgentResult}() do
         state = agent.state
-        f(AgentEvaluateStartEvent())
+        evaluate_id = UID8()
+        f(AgentEvaluateStartEvent(evaluate_id))
         turn = 1
-        f(TurnStartEvent(turn))
-        local current_input
-        if input isa Vector{PendingToolCall}
-            isempty(state.messages) && state.response_id === nothing && throw(ArgumentError("tool result input requires prior state"))
-            pending = isempty(state.pending_tool_calls) ? input : merge_pending_tool_calls!(state, input)
-            tool_results = resolve_tool_results!(f, agent, pending)
-            state.pending_tool_calls = PendingToolCall[]
-            current_input = tool_results
-        else
-            current_input = input
-        end
-        validate_guardrail(agent, current_input) || begin
-            f(AgentErrorEvent(InvalidInputError(input isa String ? input : "<non-string input>")))
-            throw(ArgumentError("input_guardrail check failed for input: `$input`"))
-        end
-
+        turn_id = UID8()
         usage = Usage()
-        while true
-            response = stream(f, agent, state, current_input, agent.apikey; agent.model, kw...)
-            add_usage!(usage, response.usage)
-            append_state!(state, current_input, response.message, response.usage; append_input=append_input)
+        result::Union{Nothing, AgentResult} = nothing
+        try
+            f(TurnStartEvent(turn_id, turn))
+            turn_ended = false
+            try
+                local current_input
+                if input isa Vector{PendingToolCall}
+                    isempty(state.messages) && state.response_id === nothing && throw(ArgumentError("tool result input requires prior state"))
+                    pending = isempty(state.pending_tool_calls) ? input : merge_pending_tool_calls!(state, input)
+                    tool_results = resolve_tool_results!(f, agent, pending)
+                    state.pending_tool_calls = PendingToolCall[]
+                    current_input = tool_results
+                else
+                    current_input = input
+                end
+                validate_guardrail(agent, current_input) || begin
+                    f(AgentErrorEvent(InvalidInputError(input isa String ? input : "<non-string input>")))
+                    throw(ArgumentError("input_guardrail check failed for input: `$input`"))
+                end
 
-            pending_tool_calls = PendingToolCall[]
-            for call in response.message.tool_calls
-                push!(pending_tool_calls, PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments))
-            end
-            f(TurnEndEvent(turn, response.message, pending_tool_calls))
+                while true
+                    response = stream(f, agent, state, current_input, agent.apikey; agent.model, kw...)
+                    add_usage!(usage, response.usage)
+                    append_state!(state, current_input, response.message, response.usage; append_input=append_input)
 
-            requires_approval = PendingToolCall[]
-            for ptc in pending_tool_calls
-                tool = findtool(agent.tools, ptc.name)
-                if tool.requires_approval
-                    push!(requires_approval, ptc)
+                    pending_tool_calls = PendingToolCall[]
+                    for call in response.message.tool_calls
+                        push!(pending_tool_calls, PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments))
+                    end
+                    f(TurnEndEvent(turn_id, turn, response.message, pending_tool_calls))
+                    turn_ended = true
+
+                    requires_approval = PendingToolCall[]
+                    for ptc in pending_tool_calls
+                        tool = findtool(agent.tools, ptc.name)
+                        if tool.requires_approval
+                            push!(requires_approval, ptc)
+                        end
+                    end
+
+                    if isempty(pending_tool_calls) || !isempty(requires_approval)
+                        state.pending_tool_calls = requires_approval
+                        result = AgentResult(
+                            ; message = response.message,
+                            usage,
+                            pending_tool_calls = requires_approval,
+                            stop_reason = response.stop_reason,
+                        )
+                        return result
+                    end
+
+                    state.pending_tool_calls = PendingToolCall[]
+                    current_input = resolve_tool_results!(f, agent, pending_tool_calls)
+                    turn += 1
+                    turn_id = UID8()
+                    f(TurnStartEvent(turn_id, turn))
+                    turn_ended = false
+                end
+            finally
+                if !turn_ended
+                    f(TurnEndEvent(turn_id, turn, nothing, PendingToolCall[]))
                 end
             end
-
-            if isempty(pending_tool_calls) || !isempty(requires_approval)
-                state.pending_tool_calls = requires_approval
-                result = AgentResult(
-                    ; message = response.message,
-                    usage,
-                    pending_tool_calls = requires_approval,
-                    stop_reason = response.stop_reason,
-                )
-                f(AgentEvaluateEndEvent(result))
-                return result
-            end
-
-            state.pending_tool_calls = PendingToolCall[]
-            current_input = resolve_tool_results!(f, agent, pending_tool_calls)
-            turn += 1
-            f(TurnStartEvent(turn))
+        catch e
+            rethrow(e)
+        finally
+            f(AgentEvaluateEndEvent(evaluate_id, result))
         end
     end
 end
