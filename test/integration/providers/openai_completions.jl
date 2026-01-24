@@ -18,7 +18,7 @@ using Test, Agentif
         model,
         apikey;
         tools,
-        prompt="You are a math assistant. Always use the add tool for additions.",
+        prompt = "You are a math assistant. Always use the add tool for additions.",
     )
 
     kwargs = tool_choice_kwargs(model)
@@ -30,7 +30,7 @@ using Test, Agentif
         kwargs...,
     )
 
-    assert_stream_response(response, events; expect_tool=true)
+    assert_stream_response(response, events; expect_tool = true)
     sum = tool_call_sum(response.message.tool_calls[1])
     @test sum == 5
 end

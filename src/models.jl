@@ -10,31 +10,33 @@
     baseUrl::String
     reasoning::Bool
     input::Vector{String}  # ["text"], ["text", "image"], etc.
-    cost::Dict{String,Float64}  # input, output, cacheRead, cacheWrite (per million tokens)
+    cost::Dict{String, Float64}  # input, output, cacheRead, cacheWrite (per million tokens)
     contextWindow::Int
     maxTokens::Int
-    headers::Union{Nothing,Dict{String,String}} = nothing
+    headers::Union{Nothing, Dict{String, String}} = nothing
+    compat::Union{Nothing, Dict{String, Any}} = nothing
     kw::Any = (;) # additional keyword arguments that will be passed when api calls are made
 end
 
 with(model::Model; kw...) =
     Model(;
-    id=model.id,
-    name=model.name,
-    api=model.api,
-    provider=model.provider,
-    baseUrl=model.baseUrl,
-    reasoning=model.reasoning,
-    input=model.input,
-    cost=model.cost,
-    contextWindow=model.contextWindow,
-    maxTokens=model.maxTokens,
-    headers=model.headers,
-    kw=kw
+    id = model.id,
+    name = model.name,
+    api = model.api,
+    provider = model.provider,
+    baseUrl = model.baseUrl,
+    reasoning = model.reasoning,
+    input = model.input,
+    cost = model.cost,
+    contextWindow = model.contextWindow,
+    maxTokens = model.maxTokens,
+    headers = model.headers,
+    compat = model.compat,
+    kw = kw
 )
 
 # Model registry - will be populated from models_generated.jl
-const _model_registry = Dict{String,Dict{String,Model}}()
+const _model_registry = Dict{String, Dict{String, Model}}()
 
 """
     getModel(provider::String, modelId::String) -> Union{Nothing,Model}
@@ -62,7 +64,7 @@ end
 Get all models for a given provider.
 """
 function getModels(provider::String)
-    providerModels = get(() -> Dict{String,Model}(), _model_registry, provider)
+    providerModels = get(() -> Dict{String, Model}(), _model_registry, provider)
     return collect(values(providerModels))
 end
 
@@ -73,7 +75,7 @@ Calculate cost based on model pricing and usage.
 Returns the cost dictionary with input, output, cacheRead, cacheWrite, and total.
 """
 function calculateCost(model::Model, usage)
-    cost = Dict{String,Float64}(
+    cost = Dict{String, Float64}(
         "input" => (model.cost["input"] / 1000000) * usage.input,
         "output" => (model.cost["output"] / 1000000) * usage.output,
         "cacheRead" => (model.cost["cacheRead"] / 1000000) * usage.cacheRead,

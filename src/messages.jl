@@ -11,7 +11,7 @@ struct UserMessage <: AgentMessage
 end
 
 @kwarg mutable struct AssistantMessage <: AgentMessage
-    response_id::Union{Nothing,String} = nothing
+    response_id::Union{Nothing, String} = nothing
     text::String = ""
     reasoning::String = ""
     refusal::String = ""
@@ -19,7 +19,7 @@ end
     kind::String = "text"
 end
 
-@kwarg struct ToolResultMessage
+@kwarg struct ToolResultMessage <: AgentMessage
     call_id::String
     name::String
     arguments::String
@@ -29,16 +29,25 @@ end
 
 const AGENT_MESSAGE_TYPE_USER = "user"
 const AGENT_MESSAGE_TYPE_ASSISTANT = "assistant"
+const AGENT_MESSAGE_TYPE_TOOL_RESULT = "tool_result"
 
-JSON.lower(x::UserMessage) = (; type=AGENT_MESSAGE_TYPE_USER, text=x.text)
+JSON.lower(x::UserMessage) = (; type = AGENT_MESSAGE_TYPE_USER, text = x.text)
 JSON.lower(x::AssistantMessage) = (;
-    type=AGENT_MESSAGE_TYPE_ASSISTANT,
-    response_id=x.response_id,
-    text=x.text,
-    reasoning=x.reasoning,
-    refusal=x.refusal,
-    tool_calls=x.tool_calls,
-    kind=x.kind,
+    type = AGENT_MESSAGE_TYPE_ASSISTANT,
+    response_id = x.response_id,
+    text = x.text,
+    reasoning = x.reasoning,
+    refusal = x.refusal,
+    tool_calls = x.tool_calls,
+    kind = x.kind,
+)
+JSON.lower(x::ToolResultMessage) = (;
+    type = AGENT_MESSAGE_TYPE_TOOL_RESULT,
+    call_id = x.call_id,
+    name = x.name,
+    arguments = x.arguments,
+    output = x.output,
+    is_error = x.is_error,
 )
 
 JSON.@choosetype AgentMessage x -> begin
@@ -47,17 +56,21 @@ JSON.@choosetype AgentMessage x -> begin
         return UserMessage
     elseif msg_type == AGENT_MESSAGE_TYPE_ASSISTANT
         return AssistantMessage
+    elseif msg_type == AGENT_MESSAGE_TYPE_TOOL_RESULT
+        return ToolResultMessage
     end
     throw(ArgumentError("Unknown agent message type: $(msg_type)"))
 end
 
-const AgentTurnInput = Union{String,Vector{ToolResultMessage}}
+const AgentTurnInput = Union{String, Vector{ToolResultMessage}}
 
 function include_in_context(msg::AgentMessage)
     if msg isa UserMessage
         return true
     elseif msg isa AssistantMessage
         return msg.kind != "tool"
+    elseif msg isa ToolResultMessage
+        return true
     end
     return false
 end
@@ -81,7 +94,7 @@ end
 
 @kwarg mutable struct AgentState
     messages::Vector{AgentMessage} = AgentMessage[]
-    response_id::Union{Nothing,String} = nothing
+    response_id::Union{Nothing, String} = nothing
     usage::Usage = Usage()
     pending_tool_calls::Vector{PendingToolCall} = PendingToolCall[]
 end
@@ -101,8 +114,5 @@ end
 end
 
 @kwarg struct AgentResult
-    message::Union{Nothing,AssistantMessage}
-    usage::Usage
-    pending_tool_calls::Vector{PendingToolCall}
-    stop_reason::Union{Nothing,Symbol} = nothing
+    state::AgentState
 end

@@ -5,60 +5,89 @@ function event_timestamp()
 end
 
 struct AgentEvaluateStartEvent <: AgentEvent
+    id::UID8
     timestamp::Int64
 end
 
-AgentEvaluateStartEvent() = AgentEvaluateStartEvent(event_timestamp())
+function AgentEvaluateStartEvent(id::UID8)
+    return AgentEvaluateStartEvent(id, event_timestamp())
+end
 
 struct AgentEvaluateEndEvent <: AgentEvent
+    id::UID8
     timestamp::Int64
-    result
+    result::Union{Nothing, AgentResult}
 end
 
-AgentEvaluateEndEvent(result) = AgentEvaluateEndEvent(event_timestamp(), result)
+function AgentEvaluateEndEvent(id::UID8, result)
+    return AgentEvaluateEndEvent(id, event_timestamp(), result)
+end
 
 struct TurnStartEvent <: AgentEvent
+    id::UID8
     timestamp::Int64
     turn::Int
 end
 
-TurnStartEvent(turn::Int) = TurnStartEvent(event_timestamp(), turn)
+function TurnStartEvent(id::UID8, turn::Int)
+    return TurnStartEvent(id, event_timestamp(), turn)
+end
 
 struct TurnEndEvent <: AgentEvent
+    id::UID8
     timestamp::Int64
     turn::Int
-    assistant_message::Union{Nothing,AssistantMessage}
+    assistant_message::Union{Nothing, AssistantMessage}
     pending_tool_calls::Vector{PendingToolCall}
 end
 
-TurnEndEvent(turn::Int, assistant_message::Union{Nothing,AssistantMessage}, pending_tool_calls::Vector{PendingToolCall}) = TurnEndEvent(event_timestamp(), turn, assistant_message, pending_tool_calls)
+function TurnEndEvent(
+        id::UID8,
+        turn::Int,
+        assistant_message::Union{Nothing, AssistantMessage},
+        pending_tool_calls::Vector{PendingToolCall},
+    )
+    return TurnEndEvent(id, event_timestamp(), turn, assistant_message, pending_tool_calls)
+end
 
-struct MessageStartEvent{M<:AgentMessage} <: AgentEvent
+struct MessageStartEvent{M <: AgentMessage} <: AgentEvent
     timestamp::Int64
     role::Symbol
     message::M
 end
 
-MessageStartEvent(role::Symbol, message::M) where {M<:AgentMessage} = MessageStartEvent{M}(event_timestamp(), role, message)
+function MessageStartEvent(role::Symbol, message::M) where {M <: AgentMessage}
+    return MessageStartEvent{M}(event_timestamp(), role, message)
+end
 
-struct MessageUpdateEvent{M<:AgentMessage} <: AgentEvent
+struct MessageUpdateEvent{M <: AgentMessage} <: AgentEvent
     timestamp::Int64
     role::Symbol
     message::M
     kind::Symbol
     delta::String
-    item_id::Union{Nothing,String}
+    item_id::Union{Nothing, String}
 end
 
-MessageUpdateEvent(role::Symbol, message::M, kind::Symbol, delta::String, item_id::Union{Nothing,String}) where {M<:AgentMessage} = MessageUpdateEvent{M}(event_timestamp(), role, message, kind, delta, item_id)
+function MessageUpdateEvent(
+        role::Symbol,
+        message::M,
+        kind::Symbol,
+        delta::String,
+        item_id::Union{Nothing, String},
+    ) where {M <: AgentMessage}
+    return MessageUpdateEvent{M}(event_timestamp(), role, message, kind, delta, item_id)
+end
 
-struct MessageEndEvent{M<:AgentMessage} <: AgentEvent
+struct MessageEndEvent{M <: AgentMessage} <: AgentEvent
     timestamp::Int64
     role::Symbol
     message::M
 end
 
-MessageEndEvent(role::Symbol, message::M) where {M<:AgentMessage} = MessageEndEvent{M}(event_timestamp(), role, message)
+function MessageEndEvent(role::Symbol, message::M) where {M <: AgentMessage}
+    return MessageEndEvent{M}(event_timestamp(), role, message)
+end
 
 struct ToolCallRequestEvent <: AgentEvent
     timestamp::Int64
@@ -66,14 +95,18 @@ struct ToolCallRequestEvent <: AgentEvent
     requires_approval::Bool
 end
 
-ToolCallRequestEvent(tool_call::PendingToolCall, requires_approval::Bool) = ToolCallRequestEvent(event_timestamp(), tool_call, requires_approval)
+function ToolCallRequestEvent(tool_call::PendingToolCall, requires_approval::Bool)
+    return ToolCallRequestEvent(event_timestamp(), tool_call, requires_approval)
+end
 
 struct ToolExecutionStartEvent <: AgentEvent
     timestamp::Int64
     tool_call::PendingToolCall
 end
 
-ToolExecutionStartEvent(tool_call::PendingToolCall) = ToolExecutionStartEvent(event_timestamp(), tool_call)
+function ToolExecutionStartEvent(tool_call::PendingToolCall)
+    return ToolExecutionStartEvent(event_timestamp(), tool_call)
+end
 
 struct ToolExecutionEndEvent <: AgentEvent
     timestamp::Int64
@@ -82,12 +115,19 @@ struct ToolExecutionEndEvent <: AgentEvent
     duration_ms::Int64
 end
 
-ToolExecutionEndEvent(tool_call::PendingToolCall, result::ToolResultMessage) = ToolExecutionEndEvent(event_timestamp(), tool_call, result, 0)
-ToolExecutionEndEvent(tool_call::PendingToolCall, result::ToolResultMessage, duration_ms::Int64) = ToolExecutionEndEvent(event_timestamp(), tool_call, result, duration_ms)
+function ToolExecutionEndEvent(tool_call::PendingToolCall, result::ToolResultMessage)
+    return ToolExecutionEndEvent(event_timestamp(), tool_call, result, 0)
+end
+
+function ToolExecutionEndEvent(tool_call::PendingToolCall, result::ToolResultMessage, duration_ms::Int64)
+    return ToolExecutionEndEvent(event_timestamp(), tool_call, result, duration_ms)
+end
 
 struct AgentErrorEvent <: AgentEvent
     timestamp::Int64
     error::Exception
 end
 
-AgentErrorEvent(error::Exception) = AgentErrorEvent(event_timestamp(), error)
+function AgentErrorEvent(error::Exception)
+    return AgentErrorEvent(event_timestamp(), error)
+end

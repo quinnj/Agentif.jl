@@ -9,6 +9,10 @@ Agentif.jl is a lightweight Julia framework for building autonomous AI agents po
   - `@tool` macro to turn Julia functions into agent-callable tools
   - Predefined suites: `coding_tools()`, `read_only_tools()`, `all_tools()`
   - Includes file I/O (`read`, `write`, `edit`), shell (`bash`), filesystem (`ls`, `grep`, `find`)
+- **Agent Skills support**:
+  - Auto-discovery from `.agentif/skills` (project) then `~/.agentif/skills` (user)
+  - Spec-compliant `<available_skills>` prompt injection
+  - Built-in `skill_loader` tool to load `SKILL.md` instructions
 - **Advanced capabilities**:
   - Input guardrails to prevent unsafe queries
   - Tool call caching for resumable sessions
@@ -55,6 +59,19 @@ Add a subagent tool for delegation and nesting:
 ```julia
 other_tools = coding_tools()
 agent.tools = [create_subagent_tool(agent), other_tools...]
+```
+
+Enable skills with the built-in loader tool:
+```julia
+skills = create_skill_registry()
+tools = coding_tools()
+push!(tools, create_skill_loader_tool(skills))
+agent = Agent(
+    model = getModel("openai", "gpt-4o-mini"),
+    tools = tools,
+    prompt = "You are a helpful coding assistant.",
+    skills = skills,
+)
 ```
 
 ## Models &amp; Providers

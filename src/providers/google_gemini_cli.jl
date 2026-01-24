@@ -1,6 +1,6 @@
 module GoogleGeminiCli
 
-using StructUtils, JSON, UUIDs
+using StructUtils, JSON, JSONSchema, UUIDs
 
 import ..Model
 
@@ -51,7 +51,7 @@ function sanitize_schema(schema::Any)
 end
 
 function schema(::Type{T}) where {T}
-    raw = JSON.schema(T; all_fields_required = true, additionalProperties = false)
+    raw = JSONSchema.schema(T; all_fields_required = false, additionalProperties = false)
     return sanitize_schema(JSON.parse(JSON.json(raw)))
 end
 

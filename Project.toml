@@ -3,21 +3,31 @@ uuid = "b1e21dde-9d8e-492f-89d0-ee48af23bfc5"
 version = "1.0.0"
 
 [deps]
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+Encid = "22e113d6-bca1-46f4-8715-c46169ad70b7"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 InteractiveUtils = "b77e0a4c-d291-57a0-90e8-8db25a27a240"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+JSONSchema = "7d188eb4-7ad8-530c-ae41-71a32a6d4692"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+OAuth = "818da804-8b6f-40df-b4a5-e161c4d67f0f"
+PtySessions = "581b29ee-4021-4243-bea3-a8421693f905"
 StructUtils = "ec057cc2-7a8d-4b58-b3b3-92acb9f63b42"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [sources]
 HTTP = {path = "../HTTP"}
 JSON = {path = "../JSON"}
+JSONSchema = {path = "../JSONSchema"}
+OAuth = {path = "../OAuth"}
 
 [compat]
+Encid = "1.0.0"
 HTTP = "1.10.19"
 InteractiveUtils = "1.11"
 JSON = "1.3"
+JSONSchema = "2"
 Logging = "1.11"
 StructUtils = "2.6"
 UUIDs = "1.11.0"

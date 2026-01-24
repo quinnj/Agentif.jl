@@ -8,6 +8,7 @@ function get_agent end
     model::Model
     apikey::String
     state::AgentState = AgentState()
+    skills::Union{Nothing, SkillRegistry} = create_skill_registry()
     input_guardrail::F = nothing
     tools::Vector{AgentTool} = AgentTool[]
     stream_output::Bool = false
@@ -17,7 +18,7 @@ end
 get_agent(x::Agent) = x
 
 function handle_event(agent::Agent, event)
-    if event isa MessageUpdateEvent && agent.stream_output
+    return if event isa MessageUpdateEvent && agent.stream_output
         print(event.delta)
     elseif event isa MessageEndEvent && agent.stream_output
         println()
@@ -26,6 +27,28 @@ end
 
 struct InvalidInputError <: Exception
     input::String
+end
+
+struct AbortEvaluation <: Exception
+    reason::String
+end
+
+AbortEvaluation() = AbortEvaluation("aborted")
+
+const PENDING_TOOL_CALL_REJECTION_MESSAGE = "User skipped or otherwise chose not to allow this tool call to run. Proceed assuming you can't call this tool with these arguments again."
+
+function auto_reject_pending_tool_calls!(f::Function, state::AgentState)
+    isempty(state.pending_tool_calls) && return ToolResultMessage[]
+    tool_results = ToolResultMessage[]
+    for ptc in state.pending_tool_calls
+        f(ToolExecutionStartEvent(ptc))
+        reject!(ptc, PENDING_TOOL_CALL_REJECTION_MESSAGE)
+        trm = wait(reject_function_tool!(f, ptc))
+        push!(tool_results, trm)
+        push!(state.messages, trm)
+    end
+    state.pending_tool_calls = PendingToolCall[]
+    return tool_results
 end
 
 function validate_guardrail(agent::Agent, input::AgentTurnInput)
@@ -67,7 +90,7 @@ function merge_pending_tool_calls!(state::AgentState, approvals::Vector{PendingT
     return state.pending_tool_calls
 end
 
-function append_state!(state::AgentState, input::AgentTurnInput, message::AssistantMessage, usage::Usage; append_input::Bool=true)
+function append_state!(state::AgentState, input::AgentTurnInput, message::AssistantMessage, usage::Usage; append_input::Bool = true)
     if input isa String
         append_input && push!(state.messages, UserMessage(input))
     elseif input isa Vector{ToolResultMessage}
@@ -87,19 +110,19 @@ evaluate(args...; kw...) = wait(evaluate!(args...; kw...))
 
 evaluate!(ctx::AgentContext, input; kw...) = evaluate!(identity, ctx, input; kw...)
 
-function evaluate!(f::Function, ctx::AgentContext, input::Union{String, Vector{PendingToolCall}}; append_input::Bool=true, kw...)
-    agent = get_agent(ctx)
-    return _evaluate!(agent, input; append_input=append_input, kw...) do event
+function evaluate!(f::Function, ctx::AgentContext, input::Union{String, Vector{PendingToolCall}}; kw...)
+    return _evaluate!(ctx, input; kw...) do event
         handle_event(ctx, event)
         f(event)
     end
 end
 
-function _evaluate!(f::Function, agent::Agent, input::Union{String, Vector{PendingToolCall}}; append_input::Bool=true, kw...)
+function _evaluate!(f::Function, ctx::AgentContext, input::Union{String, Vector{PendingToolCall}}; append_input::Bool = true, kw...)
     return Future{AgentResult}() do
-        state = agent.state
         evaluate_id = UID8()
         f(AgentEvaluateStartEvent(evaluate_id))
+        agent = get_agent(ctx)
+        state = agent.state
         turn = 1
         turn_id = UID8()
         usage = Usage()
@@ -116,6 +139,7 @@ function _evaluate!(f::Function, agent::Agent, input::Union{String, Vector{Pendi
                     state.pending_tool_calls = PendingToolCall[]
                     current_input = tool_results
                 else
+                    isempty(state.pending_tool_calls) || auto_reject_pending_tool_calls!(f, state)
                     current_input = input
                 end
                 validate_guardrail(agent, current_input) || begin
@@ -126,7 +150,7 @@ function _evaluate!(f::Function, agent::Agent, input::Union{String, Vector{Pendi
                 while true
                     response = stream(f, agent, state, current_input, agent.apikey; agent.model, kw...)
                     add_usage!(usage, response.usage)
-                    append_state!(state, current_input, response.message, response.usage; append_input=append_input)
+                    append_state!(state, current_input, response.message, response.usage; append_input = append_input)
 
                     pending_tool_calls = PendingToolCall[]
                     for call in response.message.tool_calls
@@ -145,12 +169,7 @@ function _evaluate!(f::Function, agent::Agent, input::Union{String, Vector{Pendi
 
                     if isempty(pending_tool_calls) || !isempty(requires_approval)
                         state.pending_tool_calls = requires_approval
-                        result = AgentResult(
-                            ; message = response.message,
-                            usage,
-                            pending_tool_calls = requires_approval,
-                            stop_reason = response.stop_reason,
-                        )
+                        result = AgentResult(; state)
                         return result
                     end
 
@@ -167,7 +186,15 @@ function _evaluate!(f::Function, agent::Agent, input::Union{String, Vector{Pendi
                 end
             end
         catch e
-            rethrow(e)
+            if e isa AbortEvaluation
+                result = AgentResult(; state)
+                return result
+            end
+            if e isa CapturedException && e.ex isa AbortEvaluation
+                result = AgentResult(; state)
+                return result
+            end
+            rethrow()
         finally
             f(AgentEvaluateEndEvent(evaluate_id, result))
         end
@@ -177,20 +204,71 @@ end
 function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
     return Future{ToolResultMessage}() do
         start_ns = time_ns()
-        args = JSON.parse(tc.arguments, parameters(tool))
         is_error = false
         output = ""
+        args = nothing
+        parse_error = nothing
         try
-            output = string(tool.func(args...))
+            args = parse_tool_arguments(tc.arguments, parameters(tool))
         catch e
+            parse_error = e
+        end
+
+        if parse_error !== nothing
             is_error = true
-            output = sprint(showerror, e)
+            raw = tc.arguments
+            raw_preview = length(raw) > 500 ? string(raw[1:500], "... (truncated, length=$(length(raw)))") : raw
+            output = "Failed to parse tool arguments: $(sprint(showerror, parse_error))\nRaw arguments: $(raw_preview)"
+        else
+            try
+                output = string(tool.func(args...))
+            catch e
+                is_error = true
+                output = sprint(showerror, e)
+            end
         end
         trm = ToolResultMessage(; output, is_error, call_id = tc.call_id, name = tc.name, arguments = tc.arguments)
         duration_ms = Int64(div(time_ns() - start_ns, 1_000_000))
         f(ToolExecutionEndEvent(tc, trm, duration_ms))
         return trm
     end
+end
+
+function coerce_tool_arg(value, typ)
+    typ === Any && return value
+    if typ isa Union
+        value === nothing && (Nothing <: typ) && return nothing
+        for candidate in Base.uniontypes(typ)
+            candidate === Nothing && continue
+            try
+                return convert(candidate, value)
+            catch
+            end
+        end
+        return value
+    end
+    return convert(typ, value)
+end
+
+function parse_tool_arguments(arguments::String, params_type::Type)
+    parsed = JSON.parse(arguments)
+    parsed isa AbstractDict || throw(ArgumentError("tool arguments must be a JSON object"))
+    names = fieldnames(params_type)
+    types = fieldtypes(params_type)
+    values = Vector{Any}(undef, length(names))
+    for (idx, (name, typ)) in enumerate(zip(names, types))
+        key = String(name)
+        if haskey(parsed, key)
+            values[idx] = coerce_tool_arg(get(() -> nothing, parsed, key), typ)
+        else
+            if Nothing <: typ
+                values[idx] = nothing
+            else
+                throw(ArgumentError("missing required tool argument: $(key)"))
+            end
+        end
+    end
+    return NamedTuple{names}(Tuple(values))
 end
 
 function reject_function_tool!(f, tc::PendingToolCall)

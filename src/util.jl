@@ -61,5 +61,5 @@ function Base.notify(f::Future{T}, x) where {T}
     finally
         unlock(f.notify)
     end
-    nothing
+    return nothing
 end

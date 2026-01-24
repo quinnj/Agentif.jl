@@ -54,9 +54,9 @@ function summarize_tool_args(name::String, args_json::String)
     parsed = try
         JSON.parse(args_json)
     catch
-        return shorten_string(args_json; max_len=80)
+        return shorten_string(args_json; max_len = 80)
     end
-    parsed isa AbstractDict || return shorten_string(args_json; max_len=80)
+    parsed isa AbstractDict || return shorten_string(args_json; max_len = 80)
     keys_list = collect(keys(parsed))
     ordered = String[]
     if "path" in keys_list
@@ -86,10 +86,10 @@ function summarize_tool_output(name::String, output::String, is_error::Bool)
     text = strip(output)
     isempty(text) && return is_error ? "error" : "ok"
     if is_error
-        return shorten_string(text; max_len=200)
+        return shorten_string(text; max_len = 200)
     end
     if name in ("write", "edit")
-        return shorten_string(text; max_len=160)
+        return shorten_string(text; max_len = 160)
     end
     lines = count(==('\n'), text) + 1
     bytes = ncodeunits(text)
@@ -117,7 +117,7 @@ function load_context_files(cwd::AbstractString = pwd())
         for name in ("AGENTS.md", "CLAUDE.md")
             path = joinpath(dir, name)
             if isfile(path) && !(path in seen)
-                push!(context, (path=path, content=read(path, String)))
+                push!(context, (path = path, content = read(path, String)))
                 push!(seen, path)
                 break
             end
@@ -126,7 +126,7 @@ function load_context_files(cwd::AbstractString = pwd())
     return context
 end
 
-function build_system_prompt(; selected_tools, readme_path, docs_path, append_prompt=nothing, context_files=NamedTuple[])
+function build_system_prompt(; selected_tools, readme_path, docs_path, append_prompt = nothing, context_files = NamedTuple[])
     tools_list = join(["- $(name): $(get(() -> "Tool", TOOL_DESCRIPTIONS, name))" for name in selected_tools], "\n")
 
     has_read = "read" in selected_tools
@@ -166,17 +166,17 @@ function build_system_prompt(; selected_tools, readme_path, docs_path, append_pr
 
     prompt = """You are an expert coding assistant. You help users with coding tasks by reading files, executing commands, editing code, and writing new files.
 
-Available tools:
-$(tools_list)
+    Available tools:
+    $(tools_list)
 
-Guidelines:
-$(join(["- $(g)" for g in guidelines], "\n"))
+    Guidelines:
+    $(join(["- $(g)" for g in guidelines], "\n"))
 
-Documentation:
-- Main documentation: $(readme_path)
-- Additional docs: $(docs_path)
-- When asked about: providers/models (README.md), tools (src/predefined_tools.jl), guardrails (src/input_guardrail.jl)
-"""
+    Documentation:
+    - Main documentation: $(readme_path)
+    - Additional docs: $(docs_path)
+    - When asked about: providers/models (README.md), tools (src/predefined_tools.jl), guardrails (src/input_guardrail.jl)
+    """
 
     if append_prompt !== nothing && !isempty(strip(append_prompt))
         prompt *= "\n\n" * append_prompt
@@ -199,7 +199,7 @@ function make_event_handler()
     tool_started = Dict{String, Float64}()
     assistant_in_progress = false
     function handle_event(event)
-        if event isa Agentif.MessageStartEvent
+        return if event isa Agentif.MessageStartEvent
             if event.role == :assistant
                 assistant_in_progress = true
             end
@@ -226,7 +226,7 @@ function make_event_handler()
             assistant_in_progress && println()
             started = get(() -> nothing, tool_started, event.tool_call.call_id)
             started !== nothing && delete!(tool_started, event.tool_call.call_id)
-            elapsed = started === nothing ? "" : " ($(round(time() - started; digits=2))s)"
+            elapsed = started === nothing ? "" : " ($(round(time() - started; digits = 2))s)"
             summary = summarize_tool_output(event.tool_call.name, event.result.output, event.result.is_error)
             status = event.result.is_error ? "error" : "done"
             println(style_tool("[tool] $(event.tool_call.name) $(status)$(elapsed): $(summary)"))
@@ -249,19 +249,24 @@ function main()
 
     base_dir = pwd()
     tools = Agentif.coding_tools(base_dir)
+    skill_registry = Agentif.create_skill_registry(Agentif.default_skill_dirs(base_dir))
+    if !isempty(skill_registry.skills)
+        push!(tools, Agentif.create_skill_loader_tool(skill_registry))
+    end
     selected_tools = [tool.name for tool in tools]
     system_prompt = build_system_prompt(;
         selected_tools,
-        readme_path=abspath("README.md"),
-        docs_path=abspath("docs"),
-        context_files=load_context_files(base_dir),
+        readme_path = abspath("README.md"),
+        docs_path = abspath("docs"),
+        context_files = load_context_files(base_dir),
     )
 
     agent = Agentif.Agent(;
-        prompt=system_prompt,
+        prompt = system_prompt,
         model,
-        input_guardrail=nothing,
+        input_guardrail = nothing,
         tools,
+        skills = skill_registry,
     )
 
     handle_event = make_event_handler()
@@ -283,6 +288,7 @@ function main()
             Agentif.evaluate(handle_event, session, result.pending_tool_calls, apikey)
         end
     end
+    return
 end
 
 main()

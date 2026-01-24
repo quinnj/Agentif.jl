@@ -1,16 +1,16 @@
 module OpenAICompletions
 
-using StructUtils, JSON
+using StructUtils, JSON, JSONSchema
 
 import ..Model
 
-schema(::Type{T}) where {T} = JSON.schema(T; all_fields_required=true, additionalProperties=false)
+schema(::Type{T}) where {T} = JSONSchema.schema(T; all_fields_required = false, additionalProperties = false)
 
 @omit_null @kwarg struct ToolFunction{T}
     name::String
-    description::Union{Nothing,String} = nothing
-    parameters::JSON.Schema{T}
-    strict::Union{Nothing,Bool} = nothing
+    description::Union{Nothing, String} = nothing
+    parameters::JSONSchema.Schema{T}
+    strict::Union{Nothing, Bool} = nothing
 end
 
 @omit_null @kwarg struct FunctionTool{T}
@@ -34,64 +34,74 @@ end
 
 @omit_null @kwarg struct Message
     role::String
-    content::Union{Nothing,String} = nothing
-    reasoning_content::Union{Nothing,String} = nothing
-    reasoning::Union{Nothing,String} = nothing
-    reasoning_text::Union{Nothing,String} = nothing
-    tool_calls::Union{Nothing,Vector{ToolCall}} = nothing
-    tool_call_id::Union{Nothing,String} = nothing
-    name::Union{Nothing,String} = nothing
+    content::Union{Nothing, String} = nothing
+    reasoning_content::Union{Nothing, String} = nothing
+    reasoning::Union{Nothing, String} = nothing
+    reasoning_text::Union{Nothing, String} = nothing
+    tool_calls::Union{Nothing, Vector{ToolCall}} = nothing
+    tool_call_id::Union{Nothing, String} = nothing
+    name::Union{Nothing, String} = nothing
 end
 
 @omit_null @kwarg struct Usage
-    prompt_tokens::Union{Nothing,Int} = nothing
-    completion_tokens::Union{Nothing,Int} = nothing
-    total_tokens::Union{Nothing,Int} = nothing
+    prompt_tokens::Union{Nothing, Int} = nothing
+    completion_tokens::Union{Nothing, Int} = nothing
+    total_tokens::Union{Nothing, Int} = nothing
 end
 
 @omit_null @kwarg struct ResponseChoice
     index::Int
     message::Message
-    finish_reason::Union{Nothing,String} = nothing
+    finish_reason::Union{Nothing, String} = nothing
 end
 
 @omit_null @kwarg struct Response
     id::String
     choices::Vector{ResponseChoice}
-    usage::Union{Nothing,Usage} = nothing
+    usage::Union{Nothing, Usage} = nothing
 end
 
 @omit_null @kwarg struct StreamToolCallFunctionDelta
-    name::Union{Nothing,String} = nothing
-    arguments::Union{Nothing,String} = nothing
+    name::Union{Nothing, String} = nothing
+    arguments::Union{Nothing, String} = nothing
 end
 
 @omit_null @kwarg struct StreamToolCallDelta
     index::Int
-    id::Union{Nothing,String} = nothing
+    id::Union{Nothing, String} = nothing
     type::String = "function"
     var"function"::StreamToolCallFunctionDelta
 end
 
 @omit_null @kwarg struct StreamDelta
-    role::Union{Nothing,String} = nothing
-    content::Union{Nothing,String} = nothing
-    reasoning_content::Union{Nothing,String} = nothing
-    reasoning::Union{Nothing,String} = nothing
-    reasoning_text::Union{Nothing,String} = nothing
-    tool_calls::Union{Nothing,Vector{StreamToolCallDelta}} = nothing
+    role::Union{Nothing, String} = nothing
+    content::Union{Nothing, String} = nothing
+    reasoning_content::Union{Nothing, String} = nothing
+    reasoning::Union{Nothing, String} = nothing
+    reasoning_text::Union{Nothing, String} = nothing
+    tool_calls::Union{Nothing, Vector{StreamToolCallDelta}} = nothing
+    name::Union{Nothing, String} = nothing
+    audio_content::Union{Nothing, String} = nothing
 end
 
 @omit_null @kwarg struct StreamChoice
     delta::StreamDelta
-    finish_reason::Union{Nothing,String} = nothing
+    finish_reason::Union{Nothing, String} = nothing
     index::Int
 end
 
 @omit_null @kwarg struct StreamChunk
-    id::Union{Nothing,String} = nothing
+    id::Union{Nothing, String} = nothing
     choices::Vector{StreamChoice}
-    usage::Union{Nothing,Usage} = nothing
+    usage::Union{Nothing, Usage} = nothing
+    created::Union{Nothing, Int} = nothing
+    model::Union{Nothing, String} = nothing
+    object::Union{Nothing, String} = nothing
+    input_sensitive::Union{Nothing, Bool} = nothing
+    output_sensitive::Union{Nothing, Bool} = nothing
+    input_sensitive_type::Union{Nothing, Int} = nothing
+    output_sensitive_type::Union{Nothing, Int} = nothing
+    output_sensitive_int::Union{Nothing, Int} = nothing
 end
 
 struct StreamDoneEvent end
@@ -104,14 +114,15 @@ end
     model::String
     messages::Vector{Message}
     stream::Bool
-    tools::Union{Nothing,Vector{Tool}} = nothing
-    tool_choice::Union{Nothing,Any} = nothing
-    reasoning_effort::Union{Nothing,String} = nothing
-    max_tokens::Union{Nothing,Int} = nothing
-    temperature::Union{Nothing,Float64} = nothing
-    top_p::Union{Nothing,Float64} = nothing
-    stop::Union{Nothing,Union{String,Vector{String}}} = nothing
-    parallel_tool_calls::Union{Nothing,Bool} = nothing
+    tools::Union{Nothing, Vector{Tool}} = nothing
+    tool_choice::Union{Nothing, Any} = nothing
+    reasoning_effort::Union{Nothing, String} = nothing
+    thinking::Union{Nothing, Any} = nothing
+    max_tokens::Union{Nothing, Int} = nothing
+    temperature::Union{Nothing, Float64} = nothing
+    top_p::Union{Nothing, Float64} = nothing
+    stop::Union{Nothing, Union{String, Vector{String}}} = nothing
+    parallel_tool_calls::Union{Nothing, Bool} = nothing
 end
 
 end # module OpenAICompletions

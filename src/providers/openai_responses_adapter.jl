@@ -7,8 +7,8 @@ function openai_responses_event_callback(
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
         ended::Base.RefValue{Bool},
-        response_usage::Base.RefValue{Union{Nothing,OpenAIResponses.Usage}},
-        response_status::Base.RefValue{Union{Nothing,String}},
+        response_usage::Base.RefValue{Union{Nothing, OpenAIResponses.Usage}},
+        response_status::Base.RefValue{Union{Nothing, String}},
     )
     return function (http_stream, event::HTTP.SSEEvent)
         local parsed
@@ -19,7 +19,7 @@ function openai_responses_event_callback(
             return
         end
 
-        if parsed isa OpenAIResponses.StreamResponseCreatedEvent
+        return if parsed isa OpenAIResponses.StreamResponseCreatedEvent
             response_id = parsed.response.id
             if response_id !== nothing
                 assistant_message.response_id = response_id
@@ -66,13 +66,13 @@ function openai_responses_event_callback(
             item_type = parsed.item.type
             if item_type == "function_call"
                 call = AgentToolCall(
-                    call_id=parsed.item.call_id,
-                    name=parsed.item.name,
-                    arguments=parsed.item.arguments,
+                    call_id = parsed.item.call_id,
+                    name = parsed.item.name,
+                    arguments = parsed.item.arguments,
                 )
                 push!(assistant_message.tool_calls, call)
                 tool = findtool(agent.tools, call.name)
-                ptc = PendingToolCall(; call_id=call.call_id, name=call.name, arguments=call.arguments)
+                ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc, tool.requires_approval))
             end
         elseif parsed isa OpenAIResponses.StreamResponseCompletedEvent

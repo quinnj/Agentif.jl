@@ -6,17 +6,17 @@ function build_tools()
     ]
 end
 
-function build_agent(model, apikey; tools=Agentif.AgentTool[], prompt="You are a helpful assistant.")
+function build_agent(model, apikey; tools = Agentif.AgentTool[], prompt = "You are a helpful assistant.")
     return Agentif.Agent(
         ; prompt,
         model,
         apikey,
-        input_guardrail=nothing,
+        input_guardrail = nothing,
         tools,
     )
 end
 
-function run_stream(agent, input; state=Agentif.AgentState(), kw...)
+function run_stream(agent, input; state = Agentif.AgentState(), kw...)
     events = []
     f = event -> push!(events, event)
     response = Agentif.stream(f, agent, state, input, agent.apikey; kw...)
@@ -37,11 +37,11 @@ function run_evaluate(agent, input; kw...)
     return result, events
 end
 
-function assert_stream_response(response, events; expect_tool=false)
+function assert_stream_response(response, events; expect_tool = false)
     @test response isa Agentif.AgentResponse
     @test response.message isa Agentif.AssistantMessage
     @test any(e -> e isa Agentif.MessageEndEvent, events)
-    if expect_tool
+    return if expect_tool
         @test response.stop_reason == :tool_calls
         @test !isempty(response.message.tool_calls)
         @test any(e -> e isa Agentif.ToolCallRequestEvent, events)
@@ -50,20 +50,20 @@ end
 
 function assert_evaluate_result(result, events)
     @test result isa Agentif.AgentResult
-    @test any(e -> e isa Agentif.MessageEndEvent, events)
+    return @test any(e -> e isa Agentif.MessageEndEvent, events)
 end
 
 function tool_choice_kwargs(model::Agentif.Model)
     if model.api == "openai-responses"
-        return (; tool_choice="required")
+        return (; tool_choice = "required")
     elseif model.api == "openai-completions"
-        return (; tool_choice=Dict("type" => "function", "function" => Dict("name" => "add")))
+        return (; tool_choice = Dict("type" => "function", "function" => Dict("name" => "add")))
     elseif model.api == "anthropic-messages"
-        return (; tool_choice=Dict("type" => "tool", "name" => "add"))
+        return (; tool_choice = Dict("type" => "tool", "name" => "add"))
     elseif model.api == "google-generative-ai"
-        return (; toolConfig=Dict("functionCallingConfig" => Dict("mode" => "ANY")))
+        return (; toolConfig = Dict("functionCallingConfig" => Dict("mode" => "ANY")))
     elseif model.api == "google-gemini-cli"
-        return (; toolChoice="any")
+        return (; toolChoice = "any")
     end
     return (;)
 end
@@ -77,9 +77,9 @@ function tool_call_sum(call::Agentif.AgentToolCall)
     return x + y
 end
 
-function assert_tool_execution(events; expected_output="5")
+function assert_tool_execution(events; expected_output = "5")
     tool_execs = filter(e -> e isa Agentif.ToolExecutionEndEvent, events)
     @test !isempty(tool_execs)
     @test tool_execs[1].result.name == "add"
-    @test tool_execs[1].result.output == expected_output
+    return @test tool_execs[1].result.output == expected_output
 end

@@ -1,25 +1,25 @@
-@kwarg struct AgentTool{F,T}
+@kwarg struct AgentTool{F, T}
     name::String
-    description::Union{Nothing,String} = nothing
+    description::Union{Nothing, String} = nothing
     strict::Bool = true
     func::F
     requires_approval::Bool = false
 end
 
-parameters(::AgentTool{F,T}) where {F,T} = T
+parameters(::AgentTool{F, T}) where {F, T} = T
 
 @kwarg mutable struct PendingToolCall
     const call_id::String
     const name::String
     const arguments::String
-    approved::Union{Nothing,Bool} = nothing
-    rejected_reason::Union{Nothing,String} = nothing
+    approved::Union{Nothing, Bool} = nothing
+    rejected_reason::Union{Nothing, String} = nothing
 end
 
 approve!(pending_tool_call::PendingToolCall) = pending_tool_call.approved = true
-function reject!(pending_tool_call::PendingToolCall, reason::String="the user has explicitly rejected the tool call request with arguments: $(pending_tool_call.arguments); don't attempt to call this tool again")
+function reject!(pending_tool_call::PendingToolCall, reason::String = "the user has explicitly rejected the tool call request with arguments: $(pending_tool_call.arguments); don't attempt to call this tool again")
     pending_tool_call.approved = false
-    pending_tool_call.rejected_reason = reason
+    return pending_tool_call.rejected_reason = reason
 end
 
 function findtool(tools, name)
@@ -134,14 +134,14 @@ macro tool(description::String, func_expr::Expr)
         Expr(:macrocall, Symbol("@NamedTuple"), nothing, Expr(:braces, named_tuple_fields...))
     end
     # Generate function definition and AgentTool construction
-    quote
+    return quote
         # Original function definition
         $(esc(func_expr))
         # AgentTool construction
         Agentif.AgentTool{typeof($(esc(func_name))), $named_tuple_type}(
-            name=string($(Meta.quot(func_name))),
-            description=$(description),
-            func=$(esc(func_name))
+            name = string($(Meta.quot(func_name))),
+            description = $(description),
+            func = $(esc(func_name))
         )
     end
 end
@@ -160,15 +160,15 @@ macro tool_requires_approval(description::String, func_expr::Expr)
         Expr(:macrocall, Symbol("@NamedTuple"), nothing, Expr(:braces, named_tuple_fields...))
     end
     # Generate function definition and AgentTool construction
-    quote
+    return quote
         # Original function definition
         $(esc(func_expr))
         # AgentTool construction
         Agentif.AgentTool{typeof($(esc(func_name))), $named_tuple_type}(
-            name=string($(Meta.quot(func_name))),
-            description=$(description),
-            func=$(esc(func_name)),
-            requires_approval=true
+            name = string($(Meta.quot(func_name))),
+            description = $(description),
+            func = $(esc(func_name)),
+            requires_approval = true
         )
     end
 end

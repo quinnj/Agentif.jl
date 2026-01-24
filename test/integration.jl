@@ -13,13 +13,13 @@ using Test, Agentif
     model === nothing && error("unknown model: provider=$(repr(provider)) model_id=$(repr(model_id))")
 
     @testset "stream" begin
-        agent = build_agent(model, apikey; prompt="You are a helpful assistant.")
+        agent = build_agent(model, apikey; prompt = "You are a helpful assistant.")
         response, events, _ = run_stream(agent, "Say hello in one short sentence.")
         assert_stream_response(response, events)
     end
 
     @testset "evaluate!" begin
-        agent = build_agent(model, apikey; prompt="You are a helpful assistant.")
+        agent = build_agent(model, apikey; prompt = "You are a helpful assistant.")
         result, events = run_evaluate!(agent, "Say hello in one short sentence.")
         assert_evaluate_result(result, events)
     end
@@ -30,7 +30,7 @@ using Test, Agentif
             model,
             apikey;
             tools,
-            prompt="You are a math assistant. Always use the add tool for additions.",
+            prompt = "You are a math assistant. Always use the add tool for additions.",
         )
 
         kwargs = tool_choice_kwargs(model)

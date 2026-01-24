@@ -3,10 +3,10 @@ using UUIDs
 abstract type SessionStore end
 
 struct InMemorySessionStore <: SessionStore
-    sessions::Dict{String,AgentState}
+    sessions::Dict{String, AgentState}
 end
 
-InMemorySessionStore() = InMemorySessionStore(Dict{String,AgentState}())
+InMemorySessionStore() = InMemorySessionStore(Dict{String, AgentState}())
 
 struct FileSessionStore <: SessionStore
     directory::String
@@ -64,13 +64,13 @@ function save_session!(store::FileSessionStore, session_id::String, state::Agent
     return
 end
 
-mutable struct AgentSession{T<:AgentContext,S<:SessionStore} <: AgentContext
+mutable struct AgentSession{T <: AgentContext, S <: SessionStore} <: AgentContext
     ctx::T
     store::S
     session_id::String
 end
 
-function AgentSession(ctx::AgentContext; store::SessionStore=InMemorySessionStore(), session_id::Union{Nothing,String}=nothing)
+function AgentSession(ctx::AgentContext; store::SessionStore = InMemorySessionStore(), session_id::Union{Nothing, String} = nothing)
     sid = session_id === nothing ? string(UUIDs.uuid4()) : session_id
     return AgentSession(ctx, store, sid)
 end

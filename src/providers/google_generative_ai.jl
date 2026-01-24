@@ -1,6 +1,6 @@
 module GoogleGenerativeAI
 
-using StructUtils, JSON
+using StructUtils, JSON, JSONSchema
 
 import ..Model
 
@@ -51,13 +51,13 @@ function sanitize_schema(schema::Any)
 end
 
 function schema(::Type{T}) where {T}
-    raw = JSON.schema(T; all_fields_required=true, additionalProperties=false)
+    raw = JSONSchema.schema(T; all_fields_required = false, additionalProperties = false)
     return sanitize_schema(JSON.parse(JSON.json(raw)))
 end
 
 @omit_null @kwarg struct FunctionDeclaration
     name::String
-    description::Union{Nothing,String} = nothing
+    description::Union{Nothing, String} = nothing
     parameters::AbstractDict{String, Any}
 end
 
@@ -67,49 +67,49 @@ end
 
 
 @omit_null @kwarg struct FunctionCall
-    id::Union{Nothing,String} = nothing
-    name::Union{Nothing,String} = nothing
-    args::Union{Nothing,Any} = nothing
+    id::Union{Nothing, String} = nothing
+    name::Union{Nothing, String} = nothing
+    args::Union{Nothing, Any} = nothing
 end
 
 @omit_null @kwarg struct FunctionResponse
     name::String
-    response::Dict{String,Any}
+    response::Dict{String, Any}
 end
 
 @omit_null @kwarg struct Part
-    text::Union{Nothing,String} = nothing
-    functionCall::Union{Nothing,FunctionCall} = nothing
-    functionResponse::Union{Nothing,FunctionResponse} = nothing
+    text::Union{Nothing, String} = nothing
+    functionCall::Union{Nothing, FunctionCall} = nothing
+    functionResponse::Union{Nothing, FunctionResponse} = nothing
 end
 
 @omit_null @kwarg struct Content
-    parts::Union{Nothing,Vector{Part}} = nothing
-    role::Union{Nothing,String} = nothing
+    parts::Union{Nothing, Vector{Part}} = nothing
+    role::Union{Nothing, String} = nothing
 end
 
 @omit_null @kwarg struct Candidate
-    content::Union{Nothing,Content} = nothing
-    finishReason::Union{Nothing,String} = nothing
+    content::Union{Nothing, Content} = nothing
+    finishReason::Union{Nothing, String} = nothing
 end
 
 @omit_null @kwarg struct UsageMetadata
-    promptTokenCount::Union{Nothing,Int} = nothing
-    candidatesTokenCount::Union{Nothing,Int} = nothing
-    totalTokenCount::Union{Nothing,Int} = nothing
+    promptTokenCount::Union{Nothing, Int} = nothing
+    candidatesTokenCount::Union{Nothing, Int} = nothing
+    totalTokenCount::Union{Nothing, Int} = nothing
 end
 
 @omit_null @kwarg struct GenerateContentResponse
-    candidates::Union{Nothing,Vector{Candidate}} = nothing
-    responseId::Union{Nothing,String} = nothing
-    usageMetadata::Union{Nothing,UsageMetadata} = nothing
+    candidates::Union{Nothing, Vector{Candidate}} = nothing
+    responseId::Union{Nothing, String} = nothing
+    usageMetadata::Union{Nothing, UsageMetadata} = nothing
 end
 
 @omit_null @kwarg struct Request
     contents::Vector{Content}
-    tools::Union{Nothing,Vector{Tool}} = nothing
-    systemInstruction::Union{Nothing,Content} = nothing
-    toolConfig::Union{Nothing,Any} = nothing
+    tools::Union{Nothing, Vector{Tool}} = nothing
+    systemInstruction::Union{Nothing, Content} = nothing
+    toolConfig::Union{Nothing, Any} = nothing
 end
 
 end # module GoogleGenerativeAI
