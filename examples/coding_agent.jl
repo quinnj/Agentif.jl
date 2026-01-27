@@ -227,7 +227,7 @@ function make_event_handler()
             started = get(() -> nothing, tool_started, event.tool_call.call_id)
             started !== nothing && delete!(tool_started, event.tool_call.call_id)
             elapsed = started === nothing ? "" : " ($(round(time() - started; digits = 2))s)"
-            summary = summarize_tool_output(event.tool_call.name, event.result.output, event.result.is_error)
+            summary = summarize_tool_output(event.tool_call.name, message_text(event.result), event.result.is_error)
             status = event.result.is_error ? "error" : "done"
             println(style_tool("[tool] $(event.tool_call.name) $(status)$(elapsed): $(summary)"))
         elseif event isa Agentif.AgentErrorEvent

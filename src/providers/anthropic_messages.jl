@@ -22,6 +22,23 @@ end
     cache_control::Union{Nothing, CacheControl} = nothing
 end
 
+@omit_null @kwarg mutable struct ThinkingBlock
+    type::String = "thinking"
+    thinking::String
+    signature::Union{Nothing, String} = nothing
+end
+
+@omit_null @kwarg struct ImageSource
+    type::String = "base64"
+    media_type::String
+    data::String
+end
+
+@omit_null @kwarg struct ImageBlock
+    type::String = "image"
+    source::ImageSource
+end
+
 @omit_null @kwarg mutable struct ToolUseBlock
     type::String = "tool_use"
     id::String
@@ -29,19 +46,25 @@ end
     input::Any
 end
 
+const ToolResultContentBlock = Union{TextBlock, ImageBlock}
+
 @omit_null @kwarg struct ToolResultBlock
     type::String = "tool_result"
     tool_use_id::String
-    content::Union{String, Vector{TextBlock}}
+    content::Union{String, Vector{ToolResultContentBlock}}
     is_error::Union{Nothing, Bool} = nothing
 end
 
-const ContentBlock = Union{TextBlock, ToolUseBlock, ToolResultBlock}
+const ContentBlock = Union{TextBlock, ThinkingBlock, ImageBlock, ToolUseBlock, ToolResultBlock}
 
 JSON.@choosetype ContentBlock x -> begin
     type = x.type[]
     if type == "text"
         return TextBlock
+    elseif type == "thinking"
+        return ThinkingBlock
+    elseif type == "image"
+        return ImageBlock
     elseif type == "tool_use"
         return ToolUseBlock
     elseif type == "tool_result"
@@ -95,17 +118,31 @@ end
     text::String
 end
 
+@omit_null @kwarg struct ThinkingDelta
+    type::String = "thinking_delta"
+    thinking::String
+end
+
+@omit_null @kwarg struct SignatureDelta
+    type::String = "signature_delta"
+    signature::String
+end
+
 @omit_null @kwarg struct InputJsonDelta
     type::String = "input_json_delta"
     partial_json::String
 end
 
-const ContentBlockDelta = Union{TextDelta, InputJsonDelta}
+const ContentBlockDelta = Union{TextDelta, ThinkingDelta, SignatureDelta, InputJsonDelta}
 
 JSON.@choosetype ContentBlockDelta x -> begin
     type = x.type[]
     if type == "text_delta"
         return TextDelta
+    elseif type == "thinking_delta"
+        return ThinkingDelta
+    elseif type == "signature_delta"
+        return SignatureDelta
     elseif type == "input_json_delta"
         return InputJsonDelta
     else

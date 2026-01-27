@@ -72,6 +72,11 @@ end
     args::Union{Nothing, Any} = nothing
 end
 
+@omit_null @kwarg struct InlineData
+    mimeType::String
+    data::String
+end
+
 @omit_null @kwarg struct FunctionResponse
     id::Union{Nothing, String} = nothing
     name::String
@@ -83,6 +88,7 @@ end
     text::Union{Nothing, String} = nothing
     thought::Union{Nothing, Bool} = nothing
     thoughtSignature::Union{Nothing, String} = nothing
+    inlineData::Union{Nothing, InlineData} = nothing
     functionCall::Union{Nothing, FunctionCall} = nothing
     functionResponse::Union{Nothing, FunctionResponse} = nothing
 end

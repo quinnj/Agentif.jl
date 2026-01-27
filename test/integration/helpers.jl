@@ -81,5 +81,5 @@ function assert_tool_execution(events; expected_output = "5")
     tool_execs = filter(e -> e isa Agentif.ToolExecutionEndEvent, events)
     @test !isempty(tool_execs)
     @test tool_execs[1].result.name == "add"
-    return @test tool_execs[1].result.output == expected_output
+    return @test message_text(tool_execs[1].result) == expected_output
 end

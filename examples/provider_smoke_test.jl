@@ -62,8 +62,9 @@ end
 
 function run_prompt(agent::Agent, prompt::String; kw)
     result = evaluate(agent, prompt; kw...)
-    result.message === nothing && return ""
-    return result.message.text
+    idx = findlast(msg -> msg isa AssistantMessage, result.state.messages)
+    idx === nothing && return ""
+    return message_text(result.state.messages[idx])
 end
 
 function run_provider(provider::String)

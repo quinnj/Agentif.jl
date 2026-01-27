@@ -41,6 +41,7 @@ export TurnStartEvent, TurnEndEvent
 export MessageStartEvent, MessageUpdateEvent, MessageEndEvent
 export ToolCallRequestEvent, ToolExecutionStartEvent, ToolExecutionEndEvent
 export AgentMessage, UserMessage, AssistantMessage, AgentToolCall, ToolResultMessage
+export message_text, message_thinking
 export AgentState, AgentResponse, AgentResult, Usage
 export AgentSession, SessionStore, InMemorySessionStore, FileSessionStore
 export load_session, save_session!

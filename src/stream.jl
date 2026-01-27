@@ -37,10 +37,185 @@ new_call_id(prefix::String) = string(prefix, "-", UUIDs.uuid4())
 
 function parse_tool_arguments(arguments::String)
     try
-        return JSON.parse(arguments)
+        parsed = JSON.parse(arguments)
+        parsed isa AbstractDict || return Dict{String, Any}()
+        return Dict{String, Any}(parsed)
     catch
         return Dict{String, Any}()
     end
+end
+
+function assistant_message_for_model(model::Model; response_id::Union{Nothing, String} = nothing)
+    return AssistantMessage(;
+        response_id = response_id,
+        provider = model.provider,
+        api = model.api,
+        model = model.id,
+    )
+end
+
+function normalize_mistral_tool_id(id::String)
+    normalized = replace(id, r"[^A-Za-z0-9]" => "")
+    if length(normalized) < 9
+        padding = "ABCDEFGHI"
+        normalized *= padding[1:(9 - length(normalized))]
+    elseif length(normalized) > 9
+        normalized = normalized[1:9]
+    end
+    return normalized
+end
+
+function openai_completions_detect_compat(model::Model)
+    provider = model.provider
+    base_url = model.baseUrl
+    is_minimax = provider == "minimax" || occursin("minimax.io", base_url)
+    is_zai = provider == "zai" || occursin("api.z.ai", base_url)
+    is_nonstandard = provider == "cerebras" ||
+        occursin("cerebras.ai", base_url) ||
+        provider == "xai" ||
+        occursin("api.x.ai", base_url) ||
+        provider == "mistral" ||
+        occursin("mistral.ai", base_url) ||
+        occursin("chutes.ai", base_url) ||
+        is_zai ||
+        provider == "opencode" ||
+        occursin("opencode.ai", base_url)
+    use_max_tokens = provider == "mistral" || occursin("mistral.ai", base_url) || occursin("chutes.ai", base_url)
+    is_grok = provider == "xai" || occursin("api.x.ai", base_url)
+    is_mistral = provider == "mistral" || occursin("mistral.ai", base_url)
+    return (;
+        supportsStore = !is_nonstandard,
+        supportsDeveloperRole = !is_nonstandard && !is_minimax,
+        supportsReasoningEffort = !is_grok && !is_zai,
+        supportsUsageInStreaming = true,
+        maxTokensField = use_max_tokens ? "max_tokens" : "max_completion_tokens",
+        requiresToolResultName = is_mistral,
+        requiresAssistantAfterToolResult = false,
+        requiresThinkingAsText = is_mistral,
+        requiresMistralToolIds = is_mistral,
+        thinkingFormat = is_zai ? "zai" : "openai",
+    )
+end
+
+function openai_completions_resolve_compat(model::Model)
+    detected = openai_completions_detect_compat(model)
+    compat = model.compat
+    compat === nothing && return detected
+    return (;
+        supportsStore = get(() -> detected.supportsStore, compat, "supportsStore"),
+        supportsDeveloperRole = get(() -> detected.supportsDeveloperRole, compat, "supportsDeveloperRole"),
+        supportsReasoningEffort = get(() -> detected.supportsReasoningEffort, compat, "supportsReasoningEffort"),
+        supportsUsageInStreaming = get(() -> detected.supportsUsageInStreaming, compat, "supportsUsageInStreaming"),
+        maxTokensField = get(() -> detected.maxTokensField, compat, "maxTokensField"),
+        requiresToolResultName = get(() -> detected.requiresToolResultName, compat, "requiresToolResultName"),
+        requiresAssistantAfterToolResult = get(() -> detected.requiresAssistantAfterToolResult, compat, "requiresAssistantAfterToolResult"),
+        requiresThinkingAsText = get(() -> detected.requiresThinkingAsText, compat, "requiresThinkingAsText"),
+        requiresMistralToolIds = get(() -> detected.requiresMistralToolIds, compat, "requiresMistralToolIds"),
+        thinkingFormat = get(() -> detected.thinkingFormat, compat, "thinkingFormat"),
+    )
+end
+
+function openai_completions_has_tool_history(messages::Vector{AgentMessage})
+    for msg in messages
+        if msg isa ToolResultMessage
+            return true
+        elseif msg isa AssistantMessage
+            !isempty(msg.tool_calls) && return true
+            for block in msg.content
+                block isa ToolCallContent && return true
+            end
+        end
+    end
+    return false
+end
+
+function transform_messages(messages::Vector{AgentMessage}, model::Model; normalize_tool_call_id::Function = identity)
+    tool_call_id_map = Dict{String, String}()
+    transformed = AgentMessage[]
+    for msg in messages
+        if msg isa UserMessage
+            push!(transformed, msg)
+        elseif msg isa ToolResultMessage
+            call_id = get(() -> msg.call_id, tool_call_id_map, msg.call_id)
+            if call_id != msg.call_id
+                push!(transformed, ToolResultMessage(; call_id, name = msg.name, content = msg.content, is_error = msg.is_error))
+            else
+                push!(transformed, msg)
+            end
+        elseif msg isa AssistantMessage
+            is_same = msg.provider == model.provider && msg.api == model.api && msg.model == model.id
+            blocks = AssistantContentBlock[]
+            for block in msg.content
+                if block isa TextContent
+                    isempty(block.text) && continue
+                    push!(blocks, TextContent(; text = block.text, textSignature = is_same ? block.textSignature : nothing))
+                elseif block isa ThinkingContent
+                    isempty(block.thinking) && continue
+                    if is_same && block.thinkingSignature !== nothing && !isempty(block.thinkingSignature)
+                        push!(blocks, ThinkingContent(; thinking = block.thinking, thinkingSignature = block.thinkingSignature))
+                    else
+                        push!(blocks, TextContent(; text = block.thinking))
+                    end
+                elseif block isa ToolCallContent
+                    normalized = normalize_tool_call_id(block.id)
+                    if normalized != block.id
+                        tool_call_id_map[block.id] = normalized
+                    end
+                    thought_sig = is_same ? block.thoughtSignature : nothing
+                    push!(blocks, ToolCallContent(; id = normalized, name = block.name, arguments = block.arguments, thoughtSignature = thought_sig))
+                end
+            end
+            push!(transformed, AssistantMessage(;
+                response_id = msg.response_id,
+                provider = msg.provider,
+                api = msg.api,
+                model = msg.model,
+                content = blocks,
+                tool_calls = msg.tool_calls,
+            ))
+        end
+    end
+
+    normalized = AgentMessage[]
+    pending = ToolCallContent[]
+    resolved = Set{String}()
+
+    function flush_pending!()
+        isempty(pending) && return
+        for call in pending
+            if !(call.id in resolved)
+                push!(normalized, ToolResultMessage(;
+                    call_id = call.id,
+                    name = call.name,
+                    content = ToolResultContentBlock[TextContent("No result provided")],
+                    is_error = true,
+                ))
+            end
+        end
+        empty!(pending)
+        empty!(resolved)
+        return
+    end
+
+    for msg in transformed
+        if msg isa AssistantMessage
+            flush_pending!()
+            push!(normalized, msg)
+            empty!(pending)
+            empty!(resolved)
+            for block in msg.content
+                block isa ToolCallContent && push!(pending, block)
+            end
+        elseif msg isa ToolResultMessage
+            !isempty(pending) && push!(resolved, msg.call_id)
+            push!(normalized, msg)
+        else
+            flush_pending!()
+            push!(normalized, msg)
+        end
+    end
+    flush_pending!()
+    return normalized
 end
 
 function openai_responses_build_tools(tools::Vector{AgentTool})
@@ -59,13 +234,52 @@ function openai_responses_build_tools(tools::Vector{AgentTool})
     return provider_tools
 end
 
+function openai_responses_input_content(blocks::Vector{UserContentBlock})
+    content = OpenAIResponses.InputContent[]
+    for block in blocks
+        if block isa TextContent
+            push!(content, OpenAIResponses.InputTextContent(; text = block.text))
+        elseif block isa ImageContent
+            url = "data:$(block.mimeType);base64,$(block.data)"
+            push!(content, OpenAIResponses.InputImageContent(; image_url = url))
+        end
+    end
+    return content
+end
+
+function openai_responses_tool_output_content(blocks::Vector{ToolResultContentBlock})
+    content = OpenAIResponses.InputContent[]
+    for block in blocks
+        if block isa TextContent
+            push!(content, OpenAIResponses.InputTextContent(; text = block.text))
+        elseif block isa ImageContent
+            url = "data:$(block.mimeType);base64,$(block.data)"
+            push!(content, OpenAIResponses.InputImageContent(; image_url = url))
+        end
+    end
+    return content
+end
+
 function openai_responses_build_input(input::AgentTurnInput)
     if input isa String
         return input
+    elseif input isa UserMessage
+        content = openai_responses_input_content(input.content)
+        return OpenAIResponses.InputItem[OpenAIResponses.Message(; role = "user", content = content)]
+    elseif input isa Vector{UserContentBlock}
+        content = openai_responses_input_content(input)
+        return OpenAIResponses.InputItem[OpenAIResponses.Message(; role = "user", content = content)]
     elseif input isa Vector{ToolResultMessage}
         outputs = OpenAIResponses.FunctionToolCallOutput[]
         for result in input
-            push!(outputs, OpenAIResponses.FunctionToolCallOutput(; call_id = result.call_id, output = result.output))
+            output_blocks = openai_responses_tool_output_content(result.content)
+            if isempty(output_blocks)
+                push!(outputs, OpenAIResponses.FunctionToolCallOutput(; call_id = result.call_id, output = ""))
+            elseif length(output_blocks) == 1 && output_blocks[1] isa OpenAIResponses.InputTextContent
+                push!(outputs, OpenAIResponses.FunctionToolCallOutput(; call_id = result.call_id, output = output_blocks[1].text))
+            else
+                push!(outputs, OpenAIResponses.FunctionToolCallOutput(; call_id = result.call_id, output = output_blocks))
+            end
         end
         return OpenAIResponses.InputItem[outputs...]
     end
@@ -99,45 +313,74 @@ end
 
 function codex_input_from_message(msg::AgentMessage)
     if msg isa UserMessage
-        return Any[Dict("role" => "user", "content" => [Dict("type" => "input_text", "text" => msg.text)])]
+        content = Any[]
+        for block in msg.content
+            if block isa TextContent
+                push!(content, Dict("type" => "input_text", "text" => block.text))
+            elseif block isa ImageContent
+                push!(content, Dict("type" => "input_image", "image_url" => "data:$(block.mimeType);base64,$(block.data)"))
+            end
+        end
+        isempty(content) && return Any[]
+        return Any[Dict("role" => "user", "content" => content)]
     elseif msg isa AssistantMessage
         parts = Any[]
-        if !isempty(msg.reasoning)
+        thinking = message_thinking(msg)
+        if !isempty(thinking)
             push!(
                 parts, Dict(
                     "type" => "reasoning",
-                    "summary" => [Dict("type" => "summary_text", "text" => msg.reasoning)],
+                    "summary" => [Dict("type" => "summary_text", "text" => thinking)],
                     "status" => "completed",
                 )
             )
         end
-        if !isempty(msg.text)
+        text = message_text(msg)
+        if !isempty(text)
             push!(
                 parts, Dict(
                     "type" => "message",
                     "role" => "assistant",
-                    "content" => [Dict("type" => "output_text", "text" => msg.text)],
+                    "content" => [Dict("type" => "output_text", "text" => text)],
                     "status" => "completed",
                 )
             )
         end
-        for tc in msg.tool_calls
-            push!(
-                parts, Dict(
-                    "type" => "function_call",
-                    "call_id" => tc.call_id,
-                    "name" => tc.name,
-                    "arguments" => tc.arguments,
+        tool_blocks = ToolCallContent[]
+        for block in msg.content
+            block isa ToolCallContent && push!(tool_blocks, block)
+        end
+        if isempty(tool_blocks)
+            for tc in msg.tool_calls
+                push!(
+                    parts, Dict(
+                        "type" => "function_call",
+                        "call_id" => tc.call_id,
+                        "name" => tc.name,
+                        "arguments" => tc.arguments,
+                    )
                 )
-            )
+            end
+        else
+            for block in tool_blocks
+                push!(
+                    parts, Dict(
+                        "type" => "function_call",
+                        "call_id" => block.id,
+                        "name" => block.name,
+                        "arguments" => JSON.json(block.arguments),
+                    )
+                )
+            end
         end
         return parts
     elseif msg isa ToolResultMessage
+        output = message_text(msg)
         return Any[
             Dict(
                 "type" => "function_call_output",
                 "call_id" => msg.call_id,
-                "output" => msg.output,
+                "output" => output,
             ),
         ]
     end
@@ -152,9 +395,13 @@ function codex_build_input(agent::Agent, state::AgentState, input::AgentTurnInpu
     end
     if input isa String
         push!(items, Dict("role" => "user", "content" => [Dict("type" => "input_text", "text" => input)]))
+    elseif input isa UserMessage
+        append!(items, codex_input_from_message(input))
+    elseif input isa Vector{UserContentBlock}
+        append!(items, codex_input_from_message(UserMessage(input)))
     elseif input isa Vector{ToolResultMessage}
         for result in input
-            push!(items, Dict("type" => "function_call_output", "call_id" => result.call_id, "output" => result.output))
+            push!(items, Dict("type" => "function_call_output", "call_id" => result.call_id, "output" => message_text(result)))
         end
     end
     return items
@@ -200,13 +447,13 @@ function openai_codex_event_callback(
 
     function update_reasoning(delta::String, item_id)
         ensure_started()
-        assistant_message.reasoning *= delta
+        append_thinking!(assistant_message, delta)
         return f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, delta, item_id))
     end
 
     function update_text(delta::String, item_id)
         ensure_started()
-        assistant_message.text *= delta
+        append_text!(assistant_message, delta)
         return f(MessageUpdateEvent(:assistant, assistant_message, :text, delta, item_id))
     end
 
@@ -265,7 +512,7 @@ function openai_codex_event_callback(
         elseif event_type == "response.refusal.delta"
             ensure_started()
             delta = String(get(() -> "", raw, "delta"))
-            assistant_message.refusal *= delta
+            append_text!(assistant_message, delta)
             f(MessageUpdateEvent(:assistant, assistant_message, :refusal, delta, get(() -> nothing, raw, "item_id")))
         elseif event_type == "response.function_call_arguments.delta"
             ensure_started()
@@ -289,7 +536,7 @@ function openai_codex_event_callback(
                         s isa AbstractDict || continue
                         push!(text_parts, String(get(() -> "", s, "text")))
                     end
-                    assistant_message.reasoning = join(text_parts, "\n\n")
+                    set_last_thinking!(assistant_message, join(text_parts, "\n\n"))
                 end
             elseif item_type == "message"
                 content = get(() -> nothing, item, "content")
@@ -304,7 +551,7 @@ function openai_codex_event_callback(
                             print(io, get(() -> "", part, "refusal"))
                         end
                     end
-                    assistant_message.text = String(take!(io))
+                    set_last_text!(assistant_message, String(take!(io)))
                 end
             elseif item_type == "function_call"
                 call_id = string(get(() -> get(() -> new_call_id("codex"), item, "id"), item, "call_id"))
@@ -316,6 +563,7 @@ function openai_codex_event_callback(
                 end
                 call = AgentToolCall(; call_id = call_id, name = name, arguments = args)
                 push!(assistant_message.tool_calls, call)
+                push!(assistant_message.content, ToolCallContent(; id = call_id, name, arguments = parse_tool_arguments(args)))
                 tool = findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc, tool.requires_approval))
@@ -353,15 +601,17 @@ function openai_codex_event_callback(
 end
 
 function openai_completions_is_zai(model::Model)
-    return model.provider == "zai" || occursin("api.z.ai", model.baseUrl)
+    compat = openai_completions_resolve_compat(model)
+    return compat.thinkingFormat == "zai"
 end
 
 function openai_completions_supports_reasoning_effort(model::Model)
-    return !occursin("api.x.ai", model.baseUrl) && !openai_completions_is_zai(model)
+    compat = openai_completions_resolve_compat(model)
+    return compat.supportsReasoningEffort
 end
 
-function openai_completions_build_tools(tools::Vector{AgentTool})
-    isempty(tools) && return nothing
+function openai_completions_build_tools(tools::Vector{AgentTool}; force_empty::Bool = false)
+    isempty(tools) && return force_empty ? OpenAICompletions.Tool[] : nothing
     provider_tools = OpenAICompletions.Tool[]
     for tool in tools
         push!(
@@ -378,12 +628,12 @@ function openai_completions_build_tools(tools::Vector{AgentTool})
     return provider_tools
 end
 
-function openai_completions_tool_call_from_agent(call::AgentToolCall)
+function openai_completions_tool_call_from_content(call::ToolCallContent)
     return OpenAICompletions.ToolCall(
-        id = call.call_id,
+        id = call.id,
         var"function" = OpenAICompletions.ToolCallFunction(
             name = call.name,
-            arguments = call.arguments,
+            arguments = JSON.json(call.arguments),
         )
     )
 end
@@ -396,46 +646,196 @@ function agent_system_prompt(agent::Agent)
     return append_available_skills(agent.prompt, values(registry.skills))
 end
 
-function openai_completions_message_from_agent(msg::AgentMessage)
-    if msg isa UserMessage
-        return OpenAICompletions.Message(; role = "user", content = msg.text)
-    elseif msg isa AssistantMessage
-        content = isempty(msg.text) ? nothing : msg.text
-        tool_calls = isempty(msg.tool_calls) ? nothing : OpenAICompletions.ToolCall[
-                openai_completions_tool_call_from_agent(tc) for tc in msg.tool_calls
-            ]
-        kwargs = (; role = "assistant", content, tool_calls)
-        if !isempty(msg.reasoning)
-            kwargs = (; kwargs..., reasoning = msg.reasoning)
-        end
-        return OpenAICompletions.Message(; kwargs...)
-    elseif msg isa ToolResultMessage
-        return OpenAICompletions.Message(;
-            role = "tool",
-            content = msg.output,
-            tool_call_id = msg.call_id,
-            name = msg.name,
-        )
-    end
-    throw(ArgumentError("unsupported message: $(typeof(msg))"))
-end
-
-function openai_completions_build_messages(agent::Agent, state::AgentState, input::AgentTurnInput)
-    messages = OpenAICompletions.Message[]
-    system_prompt = agent_system_prompt(agent)
-    push!(messages, OpenAICompletions.Message(; role = "system", content = system_prompt))
+function openai_completions_build_messages(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
+    compat = openai_completions_resolve_compat(model)
+    raw_messages = AgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
-        push!(messages, openai_completions_message_from_agent(msg))
+        push!(raw_messages, msg)
     end
     if input isa String
-        push!(messages, OpenAICompletions.Message(; role = "user", content = input))
+        push!(raw_messages, UserMessage(input))
+    elseif input isa UserMessage
+        push!(raw_messages, input)
+    elseif input isa Vector{UserContentBlock}
+        push!(raw_messages, UserMessage(input))
     elseif input isa Vector{ToolResultMessage}
-        for result in input
-            push!(messages, OpenAICompletions.Message(; role = "tool", content = result.output, tool_call_id = result.call_id))
-        end
+        append!(raw_messages, input)
     end
-    return messages
+
+    normalize_tool_call_id = function (id::String)
+        if compat.requiresMistralToolIds
+            return normalize_mistral_tool_id(id)
+        end
+        if model.provider == "openai"
+            return length(id) > 40 ? id[1:40] : id
+        end
+        if model.provider == "github-copilot" && occursin("claude", lowercase(model.id))
+            normalized = replace(id, r"[^A-Za-z0-9_-]" => "_")
+            return normalized[1:min(length(normalized), 64)]
+        end
+        return id
+    end
+
+    messages = OpenAICompletions.Message[]
+    system_prompt = agent_system_prompt(agent)
+    if !isempty(system_prompt)
+        role = model.reasoning && compat.supportsDeveloperRole ? "developer" : "system"
+        push!(messages, OpenAICompletions.Message(; role, content = system_prompt))
+    end
+
+    transformed = transform_messages(raw_messages, model; normalize_tool_call_id = normalize_tool_call_id)
+    last_role = nothing
+
+    i = 1
+    while i <= length(transformed)
+        msg = transformed[i]
+        if compat.requiresAssistantAfterToolResult && last_role == "toolResult" && msg isa UserMessage
+            push!(messages, OpenAICompletions.Message(; role = "assistant", content = "I have processed the tool results."))
+        end
+
+        if msg isa UserMessage
+            parts = OpenAICompletions.ContentPart[]
+            for block in msg.content
+                if block isa TextContent
+                    push!(parts, OpenAICompletions.ContentPart(; type = "text", text = block.text))
+                elseif block isa ImageContent
+                    url = "data:$(block.mimeType);base64,$(block.data)"
+                    push!(parts, OpenAICompletions.ContentPart(; type = "image_url", image_url = OpenAICompletions.ImageURL(; url)))
+                end
+            end
+            if !("image" in model.input)
+                parts = OpenAICompletions.ContentPart[part for part in parts if part.type != "image_url"]
+            end
+            isempty(parts) && continue
+            push!(messages, OpenAICompletions.Message(; role = "user", content = parts))
+            last_role = "user"
+        elseif msg isa AssistantMessage
+            assistant_msg = OpenAICompletions.Message(; role = "assistant", content = compat.requiresAssistantAfterToolResult ? "" : nothing)
+            text_blocks = TextContent[]
+            thinking_blocks = ThinkingContent[]
+            tool_calls = ToolCallContent[]
+            for block in msg.content
+                block isa TextContent && push!(text_blocks, block)
+                block isa ThinkingContent && push!(thinking_blocks, block)
+                block isa ToolCallContent && push!(tool_calls, block)
+            end
+            if isempty(tool_calls) && !isempty(msg.tool_calls)
+                for call in msg.tool_calls
+                    push!(tool_calls, ToolCallContent(; id = call.call_id, name = call.name, arguments = parse_tool_arguments(call.arguments)))
+                end
+            end
+
+            non_empty_text = [b for b in text_blocks if !isempty(strip(b.text))]
+            if !isempty(non_empty_text)
+                if model.provider == "github-copilot"
+                    assistant_msg.content = join((b.text for b in non_empty_text), "")
+                else
+                    assistant_msg.content = OpenAICompletions.ContentPart[
+                        OpenAICompletions.ContentPart(; type = "text", text = b.text) for b in non_empty_text
+                    ]
+                end
+            end
+
+            non_empty_thinking = [b for b in thinking_blocks if !isempty(strip(b.thinking))]
+            if !isempty(non_empty_thinking) && compat.requiresThinkingAsText
+                thinking_text = join((b.thinking for b in non_empty_thinking), "\n\n")
+                if assistant_msg.content === nothing || assistant_msg.content === ""
+                    assistant_msg.content = OpenAICompletions.ContentPart[OpenAICompletions.ContentPart(; type = "text", text = thinking_text)]
+                elseif assistant_msg.content isa String
+                    assistant_msg.content = thinking_text * assistant_msg.content
+                else
+                    pushfirst!(assistant_msg.content, OpenAICompletions.ContentPart(; type = "text", text = thinking_text))
+                end
+            elseif !isempty(non_empty_thinking)
+                signature = non_empty_thinking[1].thinkingSignature
+                if signature !== nothing && !isempty(signature)
+                    extra = assistant_msg.extra === nothing ? Dict{String, Any}() : assistant_msg.extra
+                    extra[signature] = join((b.thinking for b in non_empty_thinking), "\n")
+                    assistant_msg.extra = extra
+                end
+            end
+
+            if !isempty(tool_calls)
+                assistant_msg.tool_calls = OpenAICompletions.ToolCall[openai_completions_tool_call_from_content(tc) for tc in tool_calls]
+                reasoning_details = Any[]
+                for tc in tool_calls
+                    tc.thoughtSignature === nothing && continue
+                    isempty(tc.thoughtSignature) && continue
+                    try
+                        push!(reasoning_details, JSON.parse(tc.thoughtSignature))
+                    catch
+                    end
+                end
+                isempty(reasoning_details) || (assistant_msg.reasoning_details = reasoning_details)
+            end
+
+            content = assistant_msg.content
+            has_content = content !== nothing && !(content isa String && isempty(content)) && !(content isa Vector && isempty(content))
+            has_extra = assistant_msg.extra !== nothing && !isempty(assistant_msg.extra)
+            has_reasoning = assistant_msg.reasoning_details !== nothing
+            if !has_content && assistant_msg.tool_calls === nothing && !has_extra && !has_reasoning
+                continue
+            end
+            push!(messages, assistant_msg)
+            last_role = "assistant"
+            i += 1
+            continue
+        elseif msg isa ToolResultMessage
+            image_blocks = OpenAICompletions.ContentPart[]
+            j = i
+            while j <= length(transformed) && transformed[j] isa ToolResultMessage
+                tool_msg = transformed[j]::ToolResultMessage
+                text_result = message_text(tool_msg)
+                has_text = !isempty(text_result)
+                tool_result_msg = OpenAICompletions.Message(;
+                    role = "tool",
+                    content = has_text ? text_result : "(see attached image)",
+                    tool_call_id = tool_msg.call_id,
+                )
+                if compat.requiresToolResultName
+                    tool_result_msg = OpenAICompletions.Message(;
+                        role = "tool",
+                        content = has_text ? text_result : "(see attached image)",
+                        tool_call_id = tool_msg.call_id,
+                        name = tool_msg.name,
+                    )
+                end
+                push!(messages, tool_result_msg)
+
+                for block in tool_msg.content
+                    if block isa ImageContent && "image" in model.input
+                        url = "data:$(block.mimeType);base64,$(block.data)"
+                        push!(image_blocks, OpenAICompletions.ContentPart(; type = "image_url", image_url = OpenAICompletions.ImageURL(; url)))
+                    end
+                end
+                j += 1
+            end
+            if !isempty(image_blocks)
+                if compat.requiresAssistantAfterToolResult
+                    push!(messages, OpenAICompletions.Message(; role = "assistant", content = "I have processed the tool results."))
+                end
+                push!(
+                    messages,
+                    OpenAICompletions.Message(;
+                        role = "user",
+                        content = OpenAICompletions.ContentPart[
+                            OpenAICompletions.ContentPart(; type = "text", text = "Attached image(s) from tool result:"),
+                            image_blocks...,
+                        ],
+                    ),
+                )
+                last_role = "user"
+            else
+                last_role = "toolResult"
+            end
+            i = j
+            continue
+        end
+        i += 1
+    end
+
+    return messages, openai_completions_has_tool_history(raw_messages)
 end
 
 function openai_completions_usage_from_response(u::Union{Nothing, OpenAICompletions.Usage})
@@ -503,7 +903,7 @@ function openai_completions_event_callback(
                 started[] = true
                 f(MessageStartEvent(:assistant, assistant_message))
             end
-            assistant_message.text *= delta.content
+            append_text!(assistant_message, delta.content)
             f(MessageUpdateEvent(:assistant, assistant_message, :text, delta.content, nothing))
         end
         for field in (:reasoning_content, :reasoning, :reasoning_text)
@@ -513,7 +913,7 @@ function openai_completions_event_callback(
                     started[] = true
                     f(MessageStartEvent(:assistant, assistant_message))
                 end
-                assistant_message.reasoning *= value
+                append_thinking!(assistant_message, value)
                 f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, value, nothing))
             end
         end
@@ -585,31 +985,48 @@ function anthropic_sanitize_tool_call_id(id::String)
     return replace(id, r"[^A-Za-z0-9_-]" => "_")
 end
 
+function anthropic_tool_result_content(blocks::Vector{ToolResultContentBlock})
+    has_images = any(block -> block isa ImageContent, blocks)
+    if !has_images
+        parts = String[]
+        for block in blocks
+            block isa TextContent && push!(parts, block.text)
+        end
+        return join(parts, "\n")
+    end
+    content = AnthropicMessages.ToolResultContentBlock[]
+    for block in blocks
+        if block isa TextContent
+            push!(content, AnthropicMessages.TextBlock(; text = block.text))
+        elseif block isa ImageContent
+            source = AnthropicMessages.ImageSource(; media_type = block.mimeType, data = block.data)
+            push!(content, AnthropicMessages.ImageBlock(; source))
+        end
+    end
+    has_text = any(block -> block isa AnthropicMessages.TextBlock, content)
+    has_text || pushfirst!(content, AnthropicMessages.TextBlock(; text = "(see attached image)"))
+    return content
+end
+
 function anthropic_tool_result_block(result::ToolResultMessage)
     return AnthropicMessages.ToolResultBlock(;
         tool_use_id = anthropic_sanitize_tool_call_id(result.call_id),
-        content = result.output,
+        content = anthropic_tool_result_content(result.content),
         is_error = result.is_error,
     )
 end
 
 function anthropic_insert_missing_tool_results(messages::Vector{AgentMessage})
     normalized = AgentMessage[]
-    pending = AgentToolCall[]
+    pending = ToolCallContent[]
     resolved = Set{String}()
     function flush_pending!()
         isempty(pending) && return
         for call in pending
-            if !(call.call_id in resolved)
-                @warn "Inserted synthetic tool_result for orphaned tool_use" tool_name = call.name call_id = call.call_id
+            if !(call.id in resolved)
+                @warn "Inserted synthetic tool_result for orphaned tool_use" tool_name = call.name call_id = call.id
                 push!(
-                    normalized, ToolResultMessage(;
-                        call_id = call.call_id,
-                        name = call.name,
-                        arguments = call.arguments,
-                        output = ANTHROPIC_TOOL_RESULT_PLACEHOLDER,
-                        is_error = true,
-                    )
+                    normalized, ToolResultMessage(call.id, call.name, ANTHROPIC_TOOL_RESULT_PLACEHOLDER; is_error = true)
                 )
             end
         end
@@ -621,10 +1038,12 @@ function anthropic_insert_missing_tool_results(messages::Vector{AgentMessage})
         if msg isa AssistantMessage
             flush_pending!()
             push!(normalized, msg)
-            if !isempty(msg.tool_calls)
+            if !isempty(msg.content)
                 empty!(pending)
                 empty!(resolved)
-                append!(pending, msg.tool_calls)
+                for block in msg.content
+                    block isa ToolCallContent && push!(pending, block)
+                end
             end
         elseif msg isa ToolResultMessage
             !isempty(pending) && push!(resolved, msg.call_id)
@@ -666,25 +1085,56 @@ function anthropic_oauth_system_blocks(prompt::String)
     return blocks
 end
 
-function anthropic_message_from_agent(msg::AgentMessage, tool_name_map::Dict{String, String})
+function anthropic_message_from_agent(msg::AgentMessage, tool_name_map::Dict{String, String}, model::Model)
     if msg isa UserMessage
-        return AnthropicMessages.Message(; role = "user", content = msg.text)
-    elseif msg isa AssistantMessage
-        has_tool_calls = !isempty(msg.tool_calls)
-        has_text = !isempty(msg.text)
-        if !has_tool_calls
-            return AnthropicMessages.Message(; role = "assistant", content = msg.text)
-        end
         blocks = AnthropicMessages.ContentBlock[]
-        if has_text
-            push!(blocks, AnthropicMessages.TextBlock(; text = msg.text))
+        for block in msg.content
+            if block isa TextContent
+                isempty(strip(block.text)) && continue
+                push!(blocks, AnthropicMessages.TextBlock(; text = block.text))
+            elseif block isa ImageContent
+                "image" in model.input || continue
+                source = AnthropicMessages.ImageSource(; media_type = block.mimeType, data = block.data)
+                push!(blocks, AnthropicMessages.ImageBlock(; source))
+            end
         end
-        for call in msg.tool_calls
-            args = parse_tool_arguments(call.arguments)
-            call_id = anthropic_sanitize_tool_call_id(call.call_id)
-            tool_name = anthropic_external_tool_name(tool_name_map, call.name)
-            push!(blocks, AnthropicMessages.ToolUseBlock(; id = call_id, name = tool_name, input = args))
+        isempty(blocks) && return nothing
+        has_images = any(block -> block isa AnthropicMessages.ImageBlock, blocks)
+        if !has_images
+            text = join((b.text for b in blocks if b isa AnthropicMessages.TextBlock), "")
+            isempty(strip(text)) && return nothing
+            return AnthropicMessages.Message(; role = "user", content = text)
         end
+        return AnthropicMessages.Message(; role = "user", content = blocks)
+    elseif msg isa AssistantMessage
+        blocks = AnthropicMessages.ContentBlock[]
+        saw_tool_calls = false
+        for block in msg.content
+            if block isa TextContent
+                isempty(strip(block.text)) && continue
+                push!(blocks, AnthropicMessages.TextBlock(; text = block.text))
+            elseif block isa ThinkingContent
+                isempty(strip(block.thinking)) && continue
+                if block.thinkingSignature === nothing || isempty(block.thinkingSignature)
+                    push!(blocks, AnthropicMessages.TextBlock(; text = block.thinking))
+                else
+                    push!(blocks, AnthropicMessages.ThinkingBlock(; thinking = block.thinking, signature = block.thinkingSignature))
+                end
+            elseif block isa ToolCallContent
+                saw_tool_calls = true
+                call_id = anthropic_sanitize_tool_call_id(block.id)
+                tool_name = anthropic_external_tool_name(tool_name_map, block.name)
+                push!(blocks, AnthropicMessages.ToolUseBlock(; id = call_id, name = tool_name, input = block.arguments))
+            end
+        end
+        if !saw_tool_calls && !isempty(msg.tool_calls)
+            for call in msg.tool_calls
+                call_id = anthropic_sanitize_tool_call_id(call.call_id)
+                tool_name = anthropic_external_tool_name(tool_name_map, call.name)
+                push!(blocks, AnthropicMessages.ToolUseBlock(; id = call_id, name = tool_name, input = parse_tool_arguments(call.arguments)))
+            end
+        end
+        isempty(blocks) && return nothing
         return AnthropicMessages.Message(; role = "assistant", content = blocks)
     elseif msg isa ToolResultMessage
         block = anthropic_tool_result_block(msg)
@@ -693,7 +1143,7 @@ function anthropic_message_from_agent(msg::AgentMessage, tool_name_map::Dict{Str
     throw(ArgumentError("unsupported message: $(typeof(msg))"))
 end
 
-function anthropic_build_messages(agent::Agent, state::AgentState, input::AgentTurnInput, tool_name_map::Dict{String, String})
+function anthropic_build_messages(agent::Agent, state::AgentState, input::AgentTurnInput, tool_name_map::Dict{String, String}, model::Model)
     context = AgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
@@ -701,10 +1151,14 @@ function anthropic_build_messages(agent::Agent, state::AgentState, input::AgentT
     end
     if input isa String
         push!(context, UserMessage(input))
+    elseif input isa UserMessage
+        push!(context, input)
+    elseif input isa Vector{UserContentBlock}
+        push!(context, UserMessage(input))
     elseif input isa Vector{ToolResultMessage}
         append!(context, input)
     end
-    normalized = anthropic_insert_missing_tool_results(context)
+    normalized = transform_messages(context, model; normalize_tool_call_id = anthropic_sanitize_tool_call_id)
     messages = AnthropicMessages.Message[]
     i = 1
     while i <= length(normalized)
@@ -718,7 +1172,8 @@ function anthropic_build_messages(agent::Agent, state::AgentState, input::AgentT
             end
             isempty(blocks) || push!(messages, AnthropicMessages.Message(; role = "user", content = blocks))
         else
-            push!(messages, anthropic_message_from_agent(msg, tool_name_map))
+            converted = anthropic_message_from_agent(msg, tool_name_map, model)
+            converted === nothing || push!(messages, converted)
             i += 1
         end
     end
@@ -759,10 +1214,11 @@ function anthropic_event_callback(
         ended::Base.RefValue{Bool},
         stop_reason::Base.RefValue{Union{Nothing, String}},
         latest_usage::Base.RefValue{Union{Nothing, AnthropicMessages.Usage}},
-        blocks_by_index::Dict{Int, AnthropicMessages.ContentBlock},
+        blocks_by_index::Dict{Int, AssistantContentBlock},
         partial_json_by_index::Dict{Int, String},
         tool_name_reverse_map::Dict{String, String},
     )
+    stop_on_tool_call = get(ENV, "AGENTIF_STOP_ON_TOOL_CALL", "") != ""
     return function (http_stream, event::HTTP.SSEEvent)
         local parsed
         try
@@ -783,27 +1239,55 @@ function anthropic_event_callback(
             end
         elseif parsed isa AnthropicMessages.StreamContentBlockStartEvent
             if parsed.content_block isa AnthropicMessages.TextBlock
-                block = AnthropicMessages.TextBlock(; text = parsed.content_block.text)
+                block = TextContent(; text = parsed.content_block.text)
+                push!(assistant_message.content, block)
+                blocks_by_index[parsed.index] = block
+            elseif parsed.content_block isa AnthropicMessages.ThinkingBlock
+                block = ThinkingContent(;
+                    thinking = parsed.content_block.thinking,
+                    thinkingSignature = parsed.content_block.signature,
+                )
+                push!(assistant_message.content, block)
                 blocks_by_index[parsed.index] = block
             elseif parsed.content_block isa AnthropicMessages.ToolUseBlock
-                block = parsed.content_block
+                tool_name = anthropic_internal_tool_name(tool_name_reverse_map, parsed.content_block.name)
+                args = parsed.content_block.input isa AbstractDict ? Dict{String, Any}(parsed.content_block.input) : Dict{String, Any}()
+                block = ToolCallContent(;
+                    id = parsed.content_block.id,
+                    name = tool_name,
+                    arguments = args,
+                )
+                push!(assistant_message.content, block)
                 blocks_by_index[parsed.index] = block
                 partial_json_by_index[parsed.index] = ""
             end
         elseif parsed isa AnthropicMessages.StreamContentBlockDeltaEvent
             if parsed.delta isa AnthropicMessages.TextDelta
                 block = get(() -> nothing, blocks_by_index, parsed.index)
-                block isa AnthropicMessages.TextBlock || return
+                block isa TextContent || return
                 block.text *= parsed.delta.text
                 if !started[]
                     started[] = true
                     f(MessageStartEvent(:assistant, assistant_message))
                 end
-                assistant_message.text *= parsed.delta.text
                 f(MessageUpdateEvent(:assistant, assistant_message, :text, parsed.delta.text, nothing))
+            elseif parsed.delta isa AnthropicMessages.ThinkingDelta
+                block = get(() -> nothing, blocks_by_index, parsed.index)
+                block isa ThinkingContent || return
+                block.thinking *= parsed.delta.thinking
+                if !started[]
+                    started[] = true
+                    f(MessageStartEvent(:assistant, assistant_message))
+                end
+                f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, parsed.delta.thinking, nothing))
+            elseif parsed.delta isa AnthropicMessages.SignatureDelta
+                block = get(() -> nothing, blocks_by_index, parsed.index)
+                block isa ThinkingContent || return
+                sig = block.thinkingSignature === nothing ? "" : block.thinkingSignature
+                block.thinkingSignature = sig * parsed.delta.signature
             elseif parsed.delta isa AnthropicMessages.InputJsonDelta
                 block = get(() -> nothing, blocks_by_index, parsed.index)
-                block isa AnthropicMessages.ToolUseBlock || return
+                block isa ToolCallContent || return
                 partial = get(() -> "", partial_json_by_index, parsed.index)
                 partial *= parsed.delta.partial_json
                 partial_json_by_index[parsed.index] = partial
@@ -811,16 +1295,16 @@ function anthropic_event_callback(
             end
         elseif parsed isa AnthropicMessages.StreamContentBlockStopEvent
             block = get(() -> nothing, blocks_by_index, parsed.index)
-            if block isa AnthropicMessages.ToolUseBlock
+            if block isa ToolCallContent
                 partial = get(() -> "", partial_json_by_index, parsed.index)
-                args_json = isempty(partial) ? "{}" : partial
-                args = parse_tool_arguments(args_json)
-                tool_name = anthropic_internal_tool_name(tool_name_reverse_map, block.name)
-                call = AgentToolCall(; call_id = block.id, name = tool_name, arguments = JSON.json(args))
+                args = isempty(partial) ? (block.arguments isa AbstractDict ? block.arguments : Dict{String, Any}()) : parse_tool_arguments(partial)
+                block.arguments = args
+                call = AgentToolCall(; call_id = block.id, name = block.name, arguments = JSON.json(args))
                 push!(assistant_message.tool_calls, call)
                 tool = findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc, tool.requires_approval))
+                stop_on_tool_call && throw(StopStreaming("tool call arguments complete"))
             end
         elseif parsed isa AnthropicMessages.StreamMessageDeltaEvent
             parsed.usage !== nothing && (latest_usage[] = parsed.usage)
@@ -839,6 +1323,31 @@ function anthropic_event_callback(
     end
 end
 
+const GOOGLE_THOUGHT_SIGNATURE_REGEX = r"^[A-Za-z0-9+/]+={0,2}$"
+
+function google_requires_tool_call_id(model_id::String)
+    return startswith(model_id, "claude-") || startswith(model_id, "gpt-oss-")
+end
+
+function google_normalize_tool_call_id(model_id::String, id::String)
+    google_requires_tool_call_id(model_id) || return id
+    normalized = replace(id, r"[^A-Za-z0-9_-]" => "_")
+    return normalized[1:min(length(normalized), 64)]
+end
+
+function google_valid_thought_signature(signature::Union{Nothing, String})
+    signature === nothing && return false
+    isempty(signature) && return false
+    length(signature) % 4 == 0 || return false
+    return occursin(GOOGLE_THOUGHT_SIGNATURE_REGEX, signature)
+end
+
+function google_resolve_thought_signature(is_same::Bool, signature::Union{Nothing, String})
+    return is_same && google_valid_thought_signature(signature) ? signature : nothing
+end
+
+google_supports_multimodal_function_response(model_id::String) = occursin("gemini-3", lowercase(model_id))
+
 function google_generative_build_tools(tools::Vector{AgentTool})
     isempty(tools) && return nothing
     decls = GoogleGenerativeAI.FunctionDeclaration[]
@@ -852,53 +1361,122 @@ function google_generative_build_tools(tools::Vector{AgentTool})
     return [GoogleGenerativeAI.Tool(; functionDeclarations = decls)]
 end
 
-function google_generative_message_from_agent(msg::AgentMessage)
-    if msg isa UserMessage
-        return GoogleGenerativeAI.Content(; role = "user", parts = [GoogleGenerativeAI.Part(; text = msg.text)])
-    elseif msg isa AssistantMessage
-        parts = GoogleGenerativeAI.Part[]
-        if !isempty(msg.text)
-            push!(parts, GoogleGenerativeAI.Part(; text = msg.text))
-        end
-        for call in msg.tool_calls
-            args = parse_tool_arguments(call.arguments)
-            push!(
-                parts, GoogleGenerativeAI.Part(
-                    ; functionCall = GoogleGenerativeAI.FunctionCall(; id = call.call_id, name = call.name, args)
-                )
-            )
-        end
-        return GoogleGenerativeAI.Content(; role = "model", parts)
-    elseif msg isa ToolResultMessage
-        response_payload = msg.is_error ? Dict("error" => msg.output) : Dict("result" => msg.output)
-        part = GoogleGenerativeAI.Part(;
-            functionResponse = GoogleGenerativeAI.FunctionResponse(; name = msg.name, response = response_payload),
-        )
-        return GoogleGenerativeAI.Content(; role = "user", parts = [part])
-    end
-    throw(ArgumentError("unsupported message: $(typeof(msg))"))
-end
-
-function google_generative_build_contents(agent::Agent, state::AgentState, input::AgentTurnInput)
-    contents = GoogleGenerativeAI.Content[]
+function google_generative_build_contents(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
+    context = AgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
-        push!(contents, google_generative_message_from_agent(msg))
+        push!(context, msg)
     end
     if input isa String
-        push!(contents, GoogleGenerativeAI.Content(; role = "user", parts = [GoogleGenerativeAI.Part(; text = input)]))
+        push!(context, UserMessage(input))
+    elseif input isa UserMessage
+        push!(context, input)
+    elseif input isa Vector{UserContentBlock}
+        push!(context, UserMessage(input))
     elseif input isa Vector{ToolResultMessage}
-        parts = GoogleGenerativeAI.Part[]
-        for result in input
-            response_payload = result.is_error ? Dict("error" => result.output) : Dict("result" => result.output)
-            push!(
-                parts, GoogleGenerativeAI.Part(
-                    ; functionResponse = GoogleGenerativeAI.FunctionResponse(; name = result.name, response = response_payload)
-                )
-            )
-        end
-        if !isempty(parts)
+        append!(context, input)
+    end
+
+    normalize_tool_call_id = id -> google_normalize_tool_call_id(model.id, id)
+    normalized = transform_messages(context, model; normalize_tool_call_id = normalize_tool_call_id)
+
+    contents = GoogleGenerativeAI.Content[]
+    for msg in normalized
+        if msg isa UserMessage
+            parts = GoogleGenerativeAI.Part[]
+            for block in msg.content
+                if block isa TextContent
+                    isempty(strip(block.text)) && continue
+                    push!(parts, GoogleGenerativeAI.Part(; text = block.text))
+                elseif block isa ImageContent
+                    "image" in model.input || continue
+                    push!(parts, GoogleGenerativeAI.Part(; inlineData = GoogleGenerativeAI.InlineData(; mimeType = block.mimeType, data = block.data)))
+                end
+            end
+            isempty(parts) && continue
             push!(contents, GoogleGenerativeAI.Content(; role = "user", parts))
+        elseif msg isa AssistantMessage
+            parts = GoogleGenerativeAI.Part[]
+            is_same = msg.provider == model.provider && msg.model == model.id
+            blocks = copy(msg.content)
+            if !any(b -> b isa ToolCallContent, blocks) && !isempty(msg.tool_calls)
+                for call in msg.tool_calls
+                    push!(blocks, ToolCallContent(; id = call.call_id, name = call.name, arguments = parse_tool_arguments(call.arguments)))
+                end
+            end
+            for block in blocks
+                if block isa TextContent
+                    isempty(strip(block.text)) && continue
+                    signature = google_resolve_thought_signature(is_same, block.textSignature)
+                    push!(parts, GoogleGenerativeAI.Part(; text = block.text, thoughtSignature = signature))
+                elseif block isa ThinkingContent
+                    isempty(strip(block.thinking)) && continue
+                    if is_same
+                        signature = google_resolve_thought_signature(is_same, block.thinkingSignature)
+                        push!(parts, GoogleGenerativeAI.Part(; text = block.thinking, thought = true, thoughtSignature = signature))
+                    else
+                        push!(parts, GoogleGenerativeAI.Part(; text = block.thinking))
+                    end
+                elseif block isa ToolCallContent
+                    signature = google_resolve_thought_signature(is_same, block.thoughtSignature)
+                    is_gemini3 = occursin("gemini-3", lowercase(model.id))
+                    if is_gemini3 && signature === nothing
+                        args_str = JSON.json(block.arguments)
+                        push!(
+                            parts,
+                            GoogleGenerativeAI.Part(;
+                                text = "[Historical context: a different model called tool \"$(block.name)\" with arguments: $(args_str). Do not mimic this format - use proper function calling.]",
+                            ),
+                        )
+                    else
+                        call = GoogleGenerativeAI.FunctionCall(;
+                            name = block.name,
+                            args = block.arguments,
+                            id = google_requires_tool_call_id(model.id) ? block.id : nothing,
+                        )
+                        push!(parts, GoogleGenerativeAI.Part(; functionCall = call, thoughtSignature = signature))
+                    end
+                end
+            end
+            isempty(parts) && continue
+            push!(contents, GoogleGenerativeAI.Content(; role = "model", parts))
+        elseif msg isa ToolResultMessage
+            text_blocks = String[]
+            image_blocks = ImageContent[]
+            for block in msg.content
+                if block isa TextContent
+                    push!(text_blocks, block.text)
+                elseif block isa ImageContent && "image" in model.input
+                    push!(image_blocks, block)
+                end
+            end
+            text_result = join(text_blocks, "\n")
+            has_text = !isempty(text_result)
+            has_images = !isempty(image_blocks)
+            response_value = has_text ? text_result : (has_images ? "(see attached image)" : "")
+            image_parts = GoogleGenerativeAI.Part[
+                GoogleGenerativeAI.Part(; inlineData = GoogleGenerativeAI.InlineData(; mimeType = block.mimeType, data = block.data)) for block in image_blocks
+            ]
+            include_id = google_requires_tool_call_id(model.id)
+            supports_multimodal = google_supports_multimodal_function_response(model.id)
+            response_payload = msg.is_error ? Dict("error" => response_value) : Dict("output" => response_value)
+            response = GoogleGenerativeAI.FunctionResponse(;
+                name = msg.name,
+                response = response_payload,
+                id = include_id ? msg.call_id : nothing,
+                parts = (has_images && supports_multimodal) ? image_parts : nothing,
+            )
+            part = GoogleGenerativeAI.Part(; functionResponse = response)
+            last_content = isempty(contents) ? nothing : contents[end]
+            if last_content !== nothing && last_content.role == "user" && last_content.parts !== nothing &&
+                    any(p -> p.functionResponse !== nothing, last_content.parts)
+                push!(last_content.parts, part)
+            else
+                push!(contents, GoogleGenerativeAI.Content(; role = "user", parts = [part]))
+            end
+            if has_images && !supports_multimodal
+                push!(contents, GoogleGenerativeAI.Content(; role = "user", parts = [GoogleGenerativeAI.Part(; text = "Tool result image:"), image_parts...]))
+            end
         end
     end
     return contents
@@ -967,13 +1545,45 @@ function google_generative_event_callback(
         candidate.finishReason !== nothing && (latest_finish[] = candidate.finishReason)
         candidate.content === nothing && return
         candidate.content.parts === nothing && return
+
+        function append_text_with_signature!(delta::String, signature::Union{Nothing, String})
+            if isempty(assistant_message.content) || !(assistant_message.content[end] isa TextContent)
+                push!(assistant_message.content, TextContent(; text = delta, textSignature = signature))
+            else
+                block = assistant_message.content[end]
+                block.text *= delta
+                if block.textSignature === nothing && signature !== nothing
+                    block.textSignature = signature
+                end
+            end
+        end
+
+        function append_thinking_with_signature!(delta::String, signature::Union{Nothing, String})
+            if isempty(assistant_message.content) || !(assistant_message.content[end] isa ThinkingContent)
+                push!(assistant_message.content, ThinkingContent(; thinking = delta, thinkingSignature = signature))
+            else
+                block = assistant_message.content[end]
+                block.thinking *= delta
+                if block.thinkingSignature === nothing && signature !== nothing
+                    block.thinkingSignature = signature
+                end
+            end
+        end
+
         for part in candidate.content.parts
-            if part.text !== nothing
+            if part.text !== nothing && part.thought === true
                 if !started[]
                     started[] = true
                     f(MessageStartEvent(:assistant, assistant_message))
                 end
-                assistant_message.text *= part.text
+                append_thinking_with_signature!(part.text, part.thoughtSignature)
+                f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, part.text, nothing))
+            elseif part.text !== nothing
+                if !started[]
+                    started[] = true
+                    f(MessageStartEvent(:assistant, assistant_message))
+                end
+                append_text_with_signature!(part.text, part.thoughtSignature)
                 f(MessageUpdateEvent(:assistant, assistant_message, :text, part.text, nothing))
             elseif part.functionCall !== nothing
                 if !started[]
@@ -982,12 +1592,14 @@ function google_generative_event_callback(
                 end
                 fc = part.functionCall
                 fc.name === nothing && throw(ArgumentError("function call missing name"))
-                call_id = fc.id === nothing ? new_call_id("gemini") : fc.id
+                call_id = fc.id === nothing ? new_call_id("gemini") : google_normalize_tool_call_id(assistant_message.model, fc.id)
                 call_id in seen_call_ids && continue
                 push!(seen_call_ids, call_id)
                 args_json = fc.args === nothing ? "{}" : JSON.json(fc.args)
                 call = AgentToolCall(; call_id = call_id, name = fc.name, arguments = args_json)
                 push!(assistant_message.tool_calls, call)
+                args_dict = fc.args isa AbstractDict ? Dict{String, Any}(fc.args) : Dict{String, Any}()
+                push!(assistant_message.content, ToolCallContent(; id = call_id, name = fc.name, arguments = args_dict, thoughtSignature = part.thoughtSignature))
                 tool = findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc, tool.requires_approval))
@@ -1010,60 +1622,122 @@ function google_gemini_cli_build_tools(tools::Vector{AgentTool})
     return [GoogleGeminiCli.Tool(; functionDeclarations = decls)]
 end
 
-function google_gemini_cli_message_from_agent(msg::AgentMessage)
-    if msg isa UserMessage
-        return GoogleGeminiCli.Content(; role = "user", parts = [GoogleGeminiCli.Part(; text = msg.text)])
-    elseif msg isa AssistantMessage
-        parts = GoogleGeminiCli.Part[]
-        if !isempty(msg.reasoning)
-            push!(parts, GoogleGeminiCli.Part(; text = msg.reasoning, thought = true))
-        end
-        if !isempty(msg.text)
-            push!(parts, GoogleGeminiCli.Part(; text = msg.text))
-        end
-        for call in msg.tool_calls
-            args = parse_tool_arguments(call.arguments)
-            push!(
-                parts, GoogleGeminiCli.Part(
-                    ; functionCall = GoogleGeminiCli.FunctionCall(; id = call.call_id, name = call.name, args)
-                )
-            )
-        end
-        return GoogleGeminiCli.Content(; role = "model", parts)
-    elseif msg isa ToolResultMessage
-        response_payload = msg.is_error ? Dict("error" => msg.output) : Dict("output" => msg.output)
-        part = GoogleGeminiCli.Part(;
-            functionResponse = GoogleGeminiCli.FunctionResponse(;
-                id = msg.call_id,
-                name = msg.name,
-                response = response_payload,
-            ),
-        )
-        return GoogleGeminiCli.Content(; role = "user", parts = [part])
-    end
-    throw(ArgumentError("unsupported message: $(typeof(msg))"))
-end
-
-function google_gemini_cli_build_contents(agent::Agent, state::AgentState, input::AgentTurnInput)
-    contents = GoogleGeminiCli.Content[]
+function google_gemini_cli_build_contents(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
+    context = AgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
-        push!(contents, google_gemini_cli_message_from_agent(msg))
+        push!(context, msg)
     end
     if input isa String
-        push!(contents, GoogleGeminiCli.Content(; role = "user", parts = [GoogleGeminiCli.Part(; text = input)]))
+        push!(context, UserMessage(input))
+    elseif input isa UserMessage
+        push!(context, input)
+    elseif input isa Vector{UserContentBlock}
+        push!(context, UserMessage(input))
     elseif input isa Vector{ToolResultMessage}
-        parts = GoogleGeminiCli.Part[]
-        for result in input
-            response_payload = result.is_error ? Dict("error" => result.output) : Dict("output" => result.output)
-            push!(
-                parts, GoogleGeminiCli.Part(
-                    ; functionResponse = GoogleGeminiCli.FunctionResponse(; id = result.call_id, name = result.name, response = response_payload)
-                )
-            )
-        end
-        if !isempty(parts)
+        append!(context, input)
+    end
+
+    normalize_tool_call_id = id -> google_normalize_tool_call_id(model.id, id)
+    normalized = transform_messages(context, model; normalize_tool_call_id = normalize_tool_call_id)
+
+    contents = GoogleGeminiCli.Content[]
+    for msg in normalized
+        if msg isa UserMessage
+            parts = GoogleGeminiCli.Part[]
+            for block in msg.content
+                if block isa TextContent
+                    isempty(strip(block.text)) && continue
+                    push!(parts, GoogleGeminiCli.Part(; text = block.text))
+                elseif block isa ImageContent
+                    "image" in model.input || continue
+                    push!(parts, GoogleGeminiCli.Part(; inlineData = GoogleGeminiCli.InlineData(; mimeType = block.mimeType, data = block.data)))
+                end
+            end
+            isempty(parts) && continue
             push!(contents, GoogleGeminiCli.Content(; role = "user", parts))
+        elseif msg isa AssistantMessage
+            parts = GoogleGeminiCli.Part[]
+            is_same = msg.provider == model.provider && msg.model == model.id
+            blocks = copy(msg.content)
+            if !any(b -> b isa ToolCallContent, blocks) && !isempty(msg.tool_calls)
+                for call in msg.tool_calls
+                    push!(blocks, ToolCallContent(; id = call.call_id, name = call.name, arguments = parse_tool_arguments(call.arguments)))
+                end
+            end
+            for block in blocks
+                if block isa TextContent
+                    isempty(strip(block.text)) && continue
+                    signature = google_resolve_thought_signature(is_same, block.textSignature)
+                    push!(parts, GoogleGeminiCli.Part(; text = block.text, thoughtSignature = signature))
+                elseif block isa ThinkingContent
+                    isempty(strip(block.thinking)) && continue
+                    if is_same
+                        signature = google_resolve_thought_signature(is_same, block.thinkingSignature)
+                        push!(parts, GoogleGeminiCli.Part(; text = block.thinking, thought = true, thoughtSignature = signature))
+                    else
+                        push!(parts, GoogleGeminiCli.Part(; text = block.thinking))
+                    end
+                elseif block isa ToolCallContent
+                    signature = google_resolve_thought_signature(is_same, block.thoughtSignature)
+                    is_gemini3 = occursin("gemini-3", lowercase(model.id))
+                    if is_gemini3 && signature === nothing
+                        args_str = JSON.json(block.arguments)
+                        push!(
+                            parts,
+                            GoogleGeminiCli.Part(;
+                                text = "[Historical context: a different model called tool \"$(block.name)\" with arguments: $(args_str). Do not mimic this format - use proper function calling.]",
+                            ),
+                        )
+                    else
+                        call = GoogleGeminiCli.FunctionCall(;
+                            name = block.name,
+                            args = block.arguments,
+                            id = google_requires_tool_call_id(model.id) ? block.id : nothing,
+                        )
+                        push!(parts, GoogleGeminiCli.Part(; functionCall = call, thoughtSignature = signature))
+                    end
+                end
+            end
+            isempty(parts) && continue
+            push!(contents, GoogleGeminiCli.Content(; role = "model", parts))
+        elseif msg isa ToolResultMessage
+            text_blocks = String[]
+            image_blocks = ImageContent[]
+            for block in msg.content
+                if block isa TextContent
+                    push!(text_blocks, block.text)
+                elseif block isa ImageContent && "image" in model.input
+                    push!(image_blocks, block)
+                end
+            end
+            text_result = join(text_blocks, "\n")
+            has_text = !isempty(text_result)
+            has_images = !isempty(image_blocks)
+            response_value = has_text ? text_result : (has_images ? "(see attached image)" : "")
+            image_parts = GoogleGeminiCli.Part[
+                GoogleGeminiCli.Part(; inlineData = GoogleGeminiCli.InlineData(; mimeType = block.mimeType, data = block.data)) for block in image_blocks
+            ]
+            include_id = google_requires_tool_call_id(model.id)
+            supports_multimodal = google_supports_multimodal_function_response(model.id)
+            response_payload = msg.is_error ? Dict("error" => response_value) : Dict("output" => response_value)
+            response = GoogleGeminiCli.FunctionResponse(;
+                id = include_id ? msg.call_id : nothing,
+                name = msg.name,
+                response = response_payload,
+                parts = (has_images && supports_multimodal) ? image_parts : nothing,
+            )
+            part = GoogleGeminiCli.Part(; functionResponse = response)
+            last_content = isempty(contents) ? nothing : contents[end]
+            if last_content !== nothing && last_content.role == "user" && last_content.parts !== nothing &&
+                    any(p -> p.functionResponse !== nothing, last_content.parts)
+                push!(last_content.parts, part)
+            else
+                push!(contents, GoogleGeminiCli.Content(; role = "user", parts = [part]))
+            end
+            if has_images && !supports_multimodal
+                push!(contents, GoogleGeminiCli.Content(; role = "user", parts = [GoogleGeminiCli.Part(; text = "Tool result image:"), image_parts...]))
+            end
         end
     end
     return contents
@@ -1137,20 +1811,45 @@ function google_gemini_cli_event_callback(
         candidate.finishReason !== nothing && (latest_finish[] = candidate.finishReason)
         candidate.content === nothing && return
         candidate.content.parts === nothing && return
+
+        function append_text_with_signature!(delta::String, signature::Union{Nothing, String})
+            if isempty(assistant_message.content) || !(assistant_message.content[end] isa TextContent)
+                push!(assistant_message.content, TextContent(; text = delta, textSignature = signature))
+            else
+                block = assistant_message.content[end]
+                block.text *= delta
+                if block.textSignature === nothing && signature !== nothing
+                    block.textSignature = signature
+                end
+            end
+        end
+
+        function append_thinking_with_signature!(delta::String, signature::Union{Nothing, String})
+            if isempty(assistant_message.content) || !(assistant_message.content[end] isa ThinkingContent)
+                push!(assistant_message.content, ThinkingContent(; thinking = delta, thinkingSignature = signature))
+            else
+                block = assistant_message.content[end]
+                block.thinking *= delta
+                if block.thinkingSignature === nothing && signature !== nothing
+                    block.thinkingSignature = signature
+                end
+            end
+        end
+
         for part in candidate.content.parts
             if part.text !== nothing && part.thought === true
                 if !started[]
                     started[] = true
                     f(MessageStartEvent(:assistant, assistant_message))
                 end
-                assistant_message.reasoning *= part.text
+                append_thinking_with_signature!(part.text, part.thoughtSignature)
                 f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, part.text, nothing))
             elseif part.text !== nothing
                 if !started[]
                     started[] = true
                     f(MessageStartEvent(:assistant, assistant_message))
                 end
-                assistant_message.text *= part.text
+                append_text_with_signature!(part.text, part.thoughtSignature)
                 f(MessageUpdateEvent(:assistant, assistant_message, :text, part.text, nothing))
             elseif part.functionCall !== nothing
                 if !started[]
@@ -1159,12 +1858,14 @@ function google_gemini_cli_event_callback(
                 end
                 fc = part.functionCall
                 fc.name === nothing && throw(ArgumentError("function call missing name"))
-                call_id = fc.id === nothing ? new_call_id("gemini") : fc.id
+                call_id = fc.id === nothing ? new_call_id("gemini") : google_normalize_tool_call_id(assistant_message.model, fc.id)
                 call_id in seen_call_ids && continue
                 push!(seen_call_ids, call_id)
                 args_json = fc.args === nothing ? "{}" : JSON.json(fc.args)
                 call = AgentToolCall(; call_id = call_id, name = fc.name, arguments = args_json)
                 push!(assistant_message.tool_calls, call)
+                args_dict = fc.args isa AbstractDict ? Dict{String, Any}(fc.args) : Dict{String, Any}()
+                push!(assistant_message.content, ToolCallContent(; id = call_id, name = fc.name, arguments = args_dict, thoughtSignature = part.thoughtSignature))
                 tool = findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc, tool.requires_approval))
@@ -1188,7 +1889,7 @@ function stream(
     if model.api == "openai-responses"
         tools = openai_responses_build_tools(agent.tools)
         current_input = openai_responses_build_input(input)
-        assistant_message = AssistantMessage(; response_id = state.response_id)
+        assistant_message = assistant_message_for_model(model; response_id = state.response_id)
         started = Ref(false)
         ended = Ref(false)
         response_usage = Ref{Union{Nothing, OpenAIResponses.Usage}}(nothing)
@@ -1238,9 +1939,10 @@ function stream(
         stop_reason = openai_responses_stop_reason(response_status[], assistant_message.tool_calls)
         return AgentResponse(; message = assistant_message, usage, stop_reason)
     elseif model.api == "openai-completions"
-        tools = openai_completions_build_tools(agent.tools)
-        messages = openai_completions_build_messages(agent, state, input)
-        assistant_message = AssistantMessage(; response_id = state.response_id)
+        compat = openai_completions_resolve_compat(model)
+        messages, has_tool_history = openai_completions_build_messages(agent, state, input, model)
+        tools = openai_completions_build_tools(agent.tools; force_empty = isempty(agent.tools) && has_tool_history)
+        assistant_message = assistant_message_for_model(model; response_id = state.response_id)
         started = Ref(false)
         ended = Ref(false)
         latest_usage = Ref{Union{Nothing, OpenAICompletions.Usage}}(nothing)
@@ -1264,12 +1966,39 @@ function stream(
         if haskey(stream_kw, :reasoning_effort)
             reasoning_effort_value = stream_kw[:reasoning_effort]
         end
-        if haskey(stream_kw, :reasoning_effort) && !openai_completions_supports_reasoning_effort(model)
+        if haskey(stream_kw, :reasoning_effort) && !compat.supportsReasoningEffort
             stream_kw = Base.structdiff(stream_kw, (; reasoning_effort = nothing))
         end
-        if openai_completions_is_zai(model) && model.reasoning && !haskey(stream_kw, :thinking)
+        if compat.thinkingFormat == "zai" && model.reasoning && !haskey(stream_kw, :thinking)
             thinking_type = reasoning_effort_value === nothing ? "disabled" : "enabled"
             stream_kw = merge(stream_kw, (; thinking = Dict("type" => thinking_type)))
+        end
+
+        max_tokens_value = nothing
+        if haskey(stream_kw, :maxTokens)
+            max_tokens_value = stream_kw[:maxTokens]
+            stream_kw = Base.structdiff(stream_kw, (; maxTokens = nothing))
+        elseif haskey(stream_kw, :max_tokens)
+            max_tokens_value = stream_kw[:max_tokens]
+            stream_kw = Base.structdiff(stream_kw, (; max_tokens = nothing))
+        elseif haskey(stream_kw, :max_completion_tokens)
+            max_tokens_value = stream_kw[:max_completion_tokens]
+            stream_kw = Base.structdiff(stream_kw, (; max_completion_tokens = nothing))
+        end
+
+        if max_tokens_value !== nothing
+            if compat.maxTokensField == "max_tokens"
+                stream_kw = merge(stream_kw, (; max_tokens = max_tokens_value))
+            else
+                stream_kw = merge(stream_kw, (; max_completion_tokens = max_tokens_value))
+            end
+        end
+
+        if compat.supportsUsageInStreaming && use_stream && !haskey(stream_kw, :stream_options)
+            stream_kw = merge(stream_kw, (; stream_options = Dict("include_usage" => true)))
+        end
+        if compat.supportsStore && !haskey(stream_kw, :store)
+            stream_kw = merge(stream_kw, (; store = false))
         end
 
         request_kw = merge((; tools), stream_kw)
@@ -1329,6 +2058,7 @@ function stream(
                 args = isempty(acc.arguments) ? "{}" : acc.arguments
                 call = AgentToolCall(; call_id, name = acc.name, arguments = args)
                 push!(assistant_message.tool_calls, call)
+                push!(assistant_message.content, ToolCallContent(; id = call_id, name = acc.name, arguments = parse_tool_arguments(args)))
                 tool = findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc, tool.requires_approval))
@@ -1338,11 +2068,28 @@ function stream(
             isempty(response.choices) && return AgentResponse(; message = assistant_message, usage = Usage(), stop_reason = :stop)
             choice = response.choices[1]
             if choice.message.content !== nothing
-                assistant_message.text = choice.message.content
+                if choice.message.content isa String
+                    append_text!(assistant_message, choice.message.content)
+                else
+                    for part in choice.message.content
+                        part.type == "text" || continue
+                        part.text === nothing && continue
+                        append_text!(assistant_message, part.text)
+                    end
+                end
             end
-            if !isempty(assistant_message.text)
+            reasoning_parts = String[]
+            for field in (:reasoning_content, :reasoning, :reasoning_text)
+                value = getfield(choice.message, field)
+                value === nothing && continue
+                isempty(value) && continue
+                push!(reasoning_parts, value)
+            end
+            isempty(reasoning_parts) || append_thinking!(assistant_message, join(reasoning_parts, "\n\n"))
+            text = message_text(assistant_message)
+            if !isempty(text)
                 f(MessageStartEvent(:assistant, assistant_message))
-                f(MessageUpdateEvent(:assistant, assistant_message, :text, assistant_message.text, nothing))
+                f(MessageUpdateEvent(:assistant, assistant_message, :text, text, nothing))
                 f(MessageEndEvent(:assistant, assistant_message))
             end
             if choice.message.tool_calls !== nothing
@@ -1351,6 +2098,7 @@ function stream(
                     args = tc.function.arguments === nothing ? "{}" : tc.function.arguments
                     call = AgentToolCall(; call_id, name = tc.function.name, arguments = args)
                     push!(assistant_message.tool_calls, call)
+                    push!(assistant_message.content, ToolCallContent(; id = call_id, name = tc.function.name, arguments = parse_tool_arguments(args)))
                     tool = findtool(agent.tools, call.name)
                     ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                     f(ToolCallRequestEvent(ptc, tool.requires_approval))
@@ -1370,13 +2118,13 @@ function stream(
         is_oauth = startswith(apikey, "sk-ant-oat")
         tool_name_map, tool_name_reverse_map = anthropic_tool_name_maps(agent.tools, is_oauth)
         tools = anthropic_build_tools(agent.tools, tool_name_map)
-        messages = anthropic_build_messages(agent, state, input, tool_name_map)
-        assistant_message = AssistantMessage(; response_id = state.response_id)
+        messages = anthropic_build_messages(agent, state, input, tool_name_map, model)
+        assistant_message = assistant_message_for_model(model; response_id = state.response_id)
         started = Ref(false)
         ended = Ref(false)
         stop_reason = Ref{Union{Nothing, String}}(nothing)
         latest_usage = Ref{Union{Nothing, AnthropicMessages.Usage}}(nothing)
-        blocks_by_index = Dict{Int, AnthropicMessages.ContentBlock}()
+        blocks_by_index = Dict{Int, AssistantContentBlock}()
         partial_json_by_index = Dict{Int, String}()
 
         max_tokens = haskey(kw_nt, :max_tokens) ? kw_nt[:max_tokens] : model.maxTokens
@@ -1408,11 +2156,12 @@ function stream(
             stream_kw = merge(Base.structdiff(stream_kw, (; tool_choice = nothing)), (; tool_choice))
         end
         request_kw = merge((; tools, system = system_value), stream_kw)
+        disable_streaming = get(ENV, "AGENTIF_DISABLE_STREAMING", "") != ""
         req = AnthropicMessages.Request(
             ; model = model.id,
             messages,
             max_tokens,
-            stream = true,
+            stream = !disable_streaming,
             model.kw...,
             request_kw...,
         )
@@ -1434,37 +2183,87 @@ function stream(
         end
         model.headers !== nothing && merge!(headers, model.headers)
         url = joinpath(model.baseUrl, "v1", "messages")
-        HTTP.post(
-            url,
-            headers;
-            body = JSON.json(req),
-            sse_callback = anthropic_event_callback(
-                f,
-                agent,
-                assistant_message,
-                started,
-                ended,
-                stop_reason,
-                latest_usage,
-                blocks_by_index,
-                partial_json_by_index,
-                tool_name_reverse_map,
-            ),
-            merged_http_kw...,
-        )
+        if disable_streaming
+            response = JSON.parse(HTTP.post(url, headers; body = JSON.json(req), merged_http_kw...).body, AnthropicMessages.Response)
+            response.id !== nothing && (assistant_message.response_id = response.id)
+            response.stop_reason !== nothing && (stop_reason[] = response.stop_reason)
 
-        if started[] && !ended[]
-            ended[] = true
-            f(MessageEndEvent(:assistant, assistant_message))
+            for block in response.content
+                if block isa AnthropicMessages.TextBlock
+                    append_text!(assistant_message, block.text)
+                elseif block isa AnthropicMessages.ThinkingBlock
+                    thinking = ThinkingContent(;
+                        thinking = block.thinking,
+                        thinkingSignature = block.signature,
+                    )
+                    push!(assistant_message.content, thinking)
+                elseif block isa AnthropicMessages.ToolUseBlock
+                    tool_name = anthropic_internal_tool_name(tool_name_reverse_map, block.name)
+                    args = block.input isa AbstractDict ? Dict{String, Any}(block.input) : Dict{String, Any}()
+                    tool_block = ToolCallContent(;
+                        id = block.id,
+                        name = tool_name,
+                        arguments = args,
+                    )
+                    push!(assistant_message.content, tool_block)
+                    call = AgentToolCall(; call_id = block.id, name = tool_name, arguments = JSON.json(args))
+                    push!(assistant_message.tool_calls, call)
+                    tool = findtool(agent.tools, call.name)
+                    ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
+                    f(ToolCallRequestEvent(ptc, tool.requires_approval))
+                end
+            end
+
+            text = message_text(assistant_message)
+            if !isempty(text)
+                f(MessageStartEvent(:assistant, assistant_message))
+                f(MessageUpdateEvent(:assistant, assistant_message, :text, text, nothing))
+                f(MessageEndEvent(:assistant, assistant_message))
+            end
+
+            latest_usage[] = response.usage
+            usage = anthropic_usage_from_response(latest_usage[])
+            final_stop = anthropic_stop_reason(stop_reason[], assistant_message.tool_calls)
+            return AgentResponse(; message = assistant_message, usage, stop_reason = final_stop)
+        else
+            try
+                HTTP.post(
+                    url,
+                    headers;
+                    body = JSON.json(req),
+                    sse_callback = anthropic_event_callback(
+                        f,
+                        agent,
+                        assistant_message,
+                        started,
+                        ended,
+                        stop_reason,
+                        latest_usage,
+                        blocks_by_index,
+                        partial_json_by_index,
+                        tool_name_reverse_map,
+                    ),
+                    merged_http_kw...,
+                )
+            catch e
+                if !(e isa StopStreaming)
+                    rethrow()
+                end
+            end
+
+            if started[] && !ended[]
+                ended[] = true
+                f(MessageEndEvent(:assistant, assistant_message))
+            end
+
+            usage = anthropic_usage_from_response(latest_usage[])
+            final_stop = anthropic_stop_reason(stop_reason[], assistant_message.tool_calls)
+            return AgentResponse(; message = assistant_message, usage, stop_reason = final_stop)
         end
-
-        usage = anthropic_usage_from_response(latest_usage[])
-        final_stop = anthropic_stop_reason(stop_reason[], assistant_message.tool_calls)
-        return AgentResponse(; message = assistant_message, usage, stop_reason = final_stop)
     elseif model.api == "google-generative-ai"
         tools = google_generative_build_tools(agent.tools)
-        contents = google_generative_build_contents(agent, state, input)
-        assistant_message = AssistantMessage(; response_id = state.response_id)
+        contents = google_generative_build_contents(agent, state, input, model)
+        assistant_message = assistant_message_for_model(model; response_id = state.response_id)
         started = Ref(false)
         ended = Ref(false)
         latest_usage = Ref{Union{Nothing, GoogleGenerativeAI.UsageMetadata}}(nothing)
@@ -1513,8 +2312,8 @@ function stream(
         return AgentResponse(; message = assistant_message, usage, stop_reason)
     elseif model.api == "google-gemini-cli"
         tools = google_gemini_cli_build_tools(agent.tools)
-        contents = google_gemini_cli_build_contents(agent, state, input)
-        assistant_message = AssistantMessage(; response_id = state.response_id)
+        contents = google_gemini_cli_build_contents(agent, state, input, model)
+        assistant_message = assistant_message_for_model(model; response_id = state.response_id)
         started = Ref(false)
         ended = Ref(false)
         latest_usage = Ref{Union{Nothing, GoogleGeminiCli.UsageMetadata}}(nothing)
@@ -1580,7 +2379,7 @@ function stream(
     elseif model.api == "openai-codex-responses"
         creds = codex_login()
 
-        assistant_message = AssistantMessage(; response_id = state.response_id)
+        assistant_message = assistant_message_for_model(model; response_id = state.response_id)
         started = Ref(false)
         ended = Ref(false)
         response_usage = Ref{Any}(nothing)

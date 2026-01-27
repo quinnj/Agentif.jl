@@ -52,8 +52,13 @@ function auto_reject_pending_tool_calls!(f::Function, state::AgentState)
 end
 
 function validate_guardrail(agent::Agent, input::AgentTurnInput)
-    if input isa String && agent.input_guardrail !== nothing
+    agent.input_guardrail === nothing && return true
+    if input isa String
         return agent.input_guardrail(agent.prompt, input, agent.apikey)
+    elseif input isa UserMessage
+        return agent.input_guardrail(agent.prompt, message_text(input), agent.apikey)
+    elseif input isa Vector{UserContentBlock}
+        return agent.input_guardrail(agent.prompt, content_text(input), agent.apikey)
     end
     return true
 end
@@ -92,6 +97,10 @@ end
 
 function append_state!(state::AgentState, input::AgentTurnInput, message::AssistantMessage, usage::Usage; append_input::Bool = true)
     if input isa String
+        append_input && push!(state.messages, UserMessage(input))
+    elseif input isa UserMessage
+        append_input && push!(state.messages, input)
+    elseif input isa Vector{UserContentBlock}
         append_input && push!(state.messages, UserMessage(input))
     elseif input isa Vector{ToolResultMessage}
         for result in input
@@ -227,7 +236,7 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
                 output = sprint(showerror, e)
             end
         end
-        trm = ToolResultMessage(; output, is_error, call_id = tc.call_id, name = tc.name, arguments = tc.arguments)
+        trm = ToolResultMessage(tc.call_id, tc.name, output; is_error)
         duration_ms = Int64(div(time_ns() - start_ns, 1_000_000))
         f(ToolExecutionEndEvent(tc, trm, duration_ms))
         return trm
@@ -273,7 +282,7 @@ end
 
 function reject_function_tool!(f, tc::PendingToolCall)
     reason = tc.rejected_reason === nothing ? "tool call rejected by user" : tc.rejected_reason
-    trm = ToolResultMessage(; output = reason, is_error = true, call_id = tc.call_id, name = tc.name, arguments = tc.arguments)
+    trm = ToolResultMessage(tc.call_id, tc.name, reason; is_error = true)
     f(ToolExecutionEndEvent(tc, trm, Int64(0)))
     return Future{ToolResultMessage}(() -> trm)
 end

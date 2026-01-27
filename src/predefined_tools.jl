@@ -471,11 +471,15 @@ function create_subagent_tool(parent::AgentContext)
             parent_agent = get_agent(parent)
             child_box = AgentBox(nothing)
             child_tools = AgentTool[]
-            for tool in parent_agent.tools
-                tool.name == "subagent" && continue
-                push!(child_tools, tool)
+            allow_tools = get(ENV, "AGENTIF_SUBAGENT_ALLOW_TOOLS", "1") != "0"
+            allow_nested = get(ENV, "AGENTIF_SUBAGENT_ALLOW_NESTED", "1") != "0"
+            if allow_tools
+                for tool in parent_agent.tools
+                    tool.name == "subagent" && continue
+                    push!(child_tools, tool)
+                end
+                allow_nested && push!(child_tools, create_subagent_tool(child_box))
             end
-            push!(child_tools, create_subagent_tool(child_box))
             child = Agent(
                 ; prompt = system_prompt,
                 model = parent_agent.model,
@@ -495,7 +499,7 @@ function create_subagent_tool(parent::AgentContext)
                 break
             end
             message === nothing && return ""
-            output = string(message.text)
+            output = string(message_text(message))
             return truncate_tool_output(output; label = "Subagent output")
         end,
     )
@@ -768,23 +772,15 @@ function format_head_tail_buffer(buffer::HeadTailBuffer)::String
     return join(parts, "")
 end
 
-struct PollFd
-    fd::Cint
-    events::Cshort
-    revents::Cshort
-end
-
-const POLLIN = Int16(0x0001)
-
 function create_long_running_process_tool(base_dir::AbstractString = pwd())
     base = ensure_base_dir(base_dir)
 
     function readavailable_with_timeout(session::PtySessions.PtySession, timeout_s::Real)
-        # PtySessions.readavailable is non-blocking; loop until data arrives or timeout.
+        # Use poll-based non-blocking reads to avoid hanging on PTY output.
         deadline = time() + timeout_s
         output = ""
         while time() < deadline
-            output = PtySessions.readavailable(session)
+            output = readavailable_nonblocking(session)
             !isempty(output) && return output
             sleep(0.01)
         end
@@ -793,10 +789,6 @@ function create_long_running_process_tool(base_dir::AbstractString = pwd())
 
     function readavailable_nonblocking(session::PtySessions.PtySession)
         session.master_fd < 0 && return ""
-        pfd = Ref(PollFd(Cint(session.master_fd), POLLIN, 0))
-        poll_ret = ccall(:poll, Cint, (Ptr{PollFd}, Culong, Cint), pfd, 1, 0)
-        poll_ret <= 0 && return ""
-        (pfd[].revents & POLLIN) == 0 && return ""
         return PtySessions.readavailable(session)
     end
 
@@ -1056,7 +1048,11 @@ function create_long_running_process_tool(base_dir::AbstractString = pwd())
             # Write input if provided
             if !isempty(chars)
                 debug_pty && @info "write_stdin writing" bytes = length(chars)
-                Base.write(pty_session, chars)
+                write_timeout_s = max(1.0, min(5.0, yield_ms / 1000.0))
+                written = PtySessions.write_with_timeout(pty_session, chars; timeout_s = write_timeout_s)
+                if debug_pty && written < ncodeunits(chars)
+                    @info "write_stdin partial write" written = written total = ncodeunits(chars) timeout_s = write_timeout_s
+                end
                 # Give process brief time to react (100ms like Codex)
                 sleep(0.1)
             end
@@ -1821,16 +1817,19 @@ function create_web_search_tool()
         Parameters:
         - query: The search query (required).
         - num_results: Maximum number of results to return (default: 10, max: 20).
+        - timeout: Request timeout in seconds (default: 30).
 
         Returns: List of search results with title, URL, and description snippet.""",
         web_search(
             query::String,
-            num_results::Int = 10
+            num_results::Int = 10,
+            timeout::Int = WEB_FETCH_READ_TIMEOUT
         ) = begin
             query = strip(query)
             isempty(query) && throw(ArgumentError("Search query cannot be empty"))
 
             num_results = clamp(num_results, 1, SEARCH_MAX_RESULTS)
+            timeout_s = max(1, timeout)
 
             # Use DuckDuckGo Lite - more reliable than html.duckduckgo.com
             # which returns 202 bot detection responses
@@ -1856,7 +1855,7 @@ function create_web_search_tool()
                         search_url,
                         request_headers;
                         connect_timeout = WEB_FETCH_CONNECT_TIMEOUT,
-                        readtimeout = WEB_FETCH_READ_TIMEOUT,
+                        readtimeout = timeout_s,
                         redirect = true,
                         status_exception = false,
                     )

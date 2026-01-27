@@ -4,7 +4,7 @@ using StructUtils, JSON, JSONSchema
 
 import ..Model
 
-schema(::Type{T}) where {T} = JSONSchema.schema(T; all_fields_required = false, additionalProperties = false)
+schema(::Type{T}) where {T} = JSONSchema.schema(T; all_fields_required = true, additionalProperties = false)
 
 @omit_null @kwarg struct InputTextContent
     type::String = "input_text"

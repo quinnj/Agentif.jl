@@ -32,15 +32,45 @@ end
     var"function"::ToolCallFunction
 end
 
-@omit_null @kwarg struct Message
+@omit_null @kwarg struct ImageURL
+    url::String
+end
+
+@omit_null @kwarg struct ContentPart
+    type::String
+    text::Union{Nothing, String} = nothing
+    image_url::Union{Nothing, ImageURL} = nothing
+end
+
+@omit_null @kwarg mutable struct Message
     role::String
-    content::Union{Nothing, String} = nothing
+    content::Union{Nothing, String, Vector{ContentPart}} = nothing
     reasoning_content::Union{Nothing, String} = nothing
     reasoning::Union{Nothing, String} = nothing
     reasoning_text::Union{Nothing, String} = nothing
+    reasoning_details::Union{Nothing, Any} = nothing
     tool_calls::Union{Nothing, Vector{ToolCall}} = nothing
     tool_call_id::Union{Nothing, String} = nothing
     name::Union{Nothing, String} = nothing
+    extra::Union{Nothing, Dict{String, Any}} = nothing
+end
+
+function JSON.lower(x::Message)
+    data = Dict{String, Any}("role" => x.role)
+    x.content !== nothing && (data["content"] = x.content)
+    x.reasoning_content !== nothing && (data["reasoning_content"] = x.reasoning_content)
+    x.reasoning !== nothing && (data["reasoning"] = x.reasoning)
+    x.reasoning_text !== nothing && (data["reasoning_text"] = x.reasoning_text)
+    x.reasoning_details !== nothing && (data["reasoning_details"] = x.reasoning_details)
+    x.tool_calls !== nothing && (data["tool_calls"] = x.tool_calls)
+    x.tool_call_id !== nothing && (data["tool_call_id"] = x.tool_call_id)
+    x.name !== nothing && (data["name"] = x.name)
+    if x.extra !== nothing
+        for (k, v) in x.extra
+            data[k] = v
+        end
+    end
+    return data
 end
 
 @omit_null @kwarg struct Usage
@@ -116,9 +146,12 @@ end
     stream::Bool
     tools::Union{Nothing, Vector{Tool}} = nothing
     tool_choice::Union{Nothing, Any} = nothing
+    store::Union{Nothing, Bool} = nothing
+    stream_options::Union{Nothing, Any} = nothing
     reasoning_effort::Union{Nothing, String} = nothing
     thinking::Union{Nothing, Any} = nothing
     max_tokens::Union{Nothing, Int} = nothing
+    max_completion_tokens::Union{Nothing, Int} = nothing
     temperature::Union{Nothing, Float64} = nothing
     top_p::Union{Nothing, Float64} = nothing
     stop::Union{Nothing, Union{String, Vector{String}}} = nothing

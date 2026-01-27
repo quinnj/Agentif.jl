@@ -1,5 +1,15 @@
 using Test, Agentif, JSON
 
+@testset "OpenAI Responses tool schema requires all fields" begin
+    schema = Agentif.OpenAIResponses.schema(
+        @NamedTuple{path::String, offset::Union{Nothing, Int}, limit::Union{Nothing, Int}}
+    )
+    raw = JSON.parse(JSON.json(schema))
+    properties = sort(collect(keys(raw["properties"])))
+    required = sort(raw["required"])
+    @test required == properties
+end
+
 function get_env_first(keys::Vector{String})
     for key in keys
         value = get(() -> nothing, ENV, key)
@@ -110,7 +120,7 @@ function run_tool_call(model::Agentif.Model, apikey::String, tool::Agentif.Agent
                     is_error = true
                     output = sprint(showerror, e)
                 end
-                trm = Agentif.ToolResultMessage(; output, is_error, call_id = call.call_id, name = call.name, arguments = call.arguments)
+                trm = Agentif.ToolResultMessage(call.call_id, call.name, output; is_error)
                 push!(events, Agentif.ToolExecutionEndEvent(ptc, trm, 0))
             end
         end
@@ -178,15 +188,15 @@ function assert_tool_called(events, tool_name::String)
                 break
             end
         end
-        last_msg !== nothing && @info "No tool call for $(tool_name). Assistant text: $(last_msg.text)"
+        last_msg !== nothing && @info "No tool call for $(tool_name). Assistant text: $(message_text(last_msg))"
     end
     @test called
     results = tool_exec_results(events, tool_name)
     @test !isempty(results)
     isempty(results) && return ""
-    results[end].is_error && @info "Tool error output for $(tool_name): $(results[end].output)"
+    results[end].is_error && @info "Tool error output for $(tool_name): $(message_text(results[end]))"
     @test results[end].is_error == false
-    return results[end].output
+    return message_text(results[end])
 end
 
 function run_tool_call_with_timeout(model::Agentif.Model, apikey::String, tool::Agentif.AgentTool, prompt::String; timeout_s::Real = 45, kwargs...)
