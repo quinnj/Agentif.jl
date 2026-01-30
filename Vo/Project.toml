@@ -1,0 +1,44 @@
+name = "Vo"
+uuid = "46916a23-5c37-4b23-b62b-45b422578c04"
+version = "0.1.0"
+authors = ["Jacob Quinn <quinn.jacobd@gmail.com>"]
+
+[deps]
+Agentif = "b1e21dde-9d8e-492f-89d0-ee48af23bfc5"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+LLMTools = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+Markdown = "d6f4376e-aef5-505a-96c1-9c027394607a"
+PtySessions = "581b29ee-4021-4243-bea3-a8421693f905"
+Qmd = "80d76a79-6984-4019-9967-cf331f2deafb"
+REPL = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
+ScopedValues = "7e506255-f358-4e82-b7e4-beb19740aa63"
+SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
+Tempus = "e6262be2-5787-4bdc-bc3f-4b5a3442fa30"
+Term = "22787eb5-b846-44ae-b979-8e399b8463ab"
+UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
+
+[sources]
+Agentif = {path = "../Agentif"}
+LLMTools = {path = "../LLMTools"}
+JSON = {path = "../../JSON"}
+PtySessions = {path = "../../PtySessions"}
+Qmd = {path = "../../QMD"}
+Tempus = {path = "../../Tempus"}
+
+[compat]
+Agentif = "1"
+HTTP = "1"
+LLMTools = "1"
+Markdown = "1.11"
+ScopedValues = "1.5"
+Term = "2"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

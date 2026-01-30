@@ -1,0 +1,36 @@
+name = "LLMTools"
+uuid = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
+version = "1.0.0"
+
+[deps]
+Agentif = "b1e21dde-9d8e-492f-89d0-ee48af23bfc5"
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+LLMProviders = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+PtySessions = "581b29ee-4021-4243-bea3-a8421693f905"
+Qmd = "80d76a79-6984-4019-9967-cf331f2deafb"
+UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
+
+[sources]
+Agentif = {path = "../Agentif"}
+LLMProviders = {path = "../LLMProviders"}
+PtySessions = {path = "../../PtySessions"}
+Qmd = {path = "../../QMD"}
+
+[compat]
+Agentif = "1"
+HTTP = "1"
+JSON = "1.3"
+Logging = "1"
+PtySessions = "0.1"
+UUIDs = "1"
+julia = "1.6"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
