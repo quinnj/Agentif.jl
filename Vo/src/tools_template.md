@@ -5,12 +5,12 @@ Best practices and patterns Vo has learned for using tools effectively. Update t
 ## Memory Search
 - Try multiple keyword variations when searching — user's exact phrasing may differ from stored memories.
 - Search memories early in a conversation to avoid asking the user to repeat things.
-- Combine keyword search with history search for full context on a topic.
+- Combine keyword search with session search for full context on a topic.
 
-## History Search
-- Search history before memories when looking for recent conversations.
-- Use history to reconnect threads: "Last time we discussed X, we decided Y."
-- Check history for context before asking the user to re-explain something.
+## Session Search
+- Search session entries before memories when looking for recent conversations.
+- Use session context to reconnect threads: "Last time we discussed X, we decided Y."
+- Check session entries for context before asking the user to re-explain something.
 
 ## Skills
 - Check available skills before doing manual work — a skill may already handle the workflow.

@@ -16,38 +16,35 @@ end
 struct AgentEvaluateEndEvent <: AgentEvent
     id::UID8
     timestamp::Int64
-    result::Union{Nothing, AgentResult}
+    state::Union{Nothing, AgentState}
 end
 
-function AgentEvaluateEndEvent(id::UID8, result)
-    return AgentEvaluateEndEvent(id, event_timestamp(), result)
+function AgentEvaluateEndEvent(id::UID8, state)
+    return AgentEvaluateEndEvent(id, event_timestamp(), state)
 end
 
 struct TurnStartEvent <: AgentEvent
     id::UID8
     timestamp::Int64
-    turn::Int
 end
 
-function TurnStartEvent(id::UID8, turn::Int)
-    return TurnStartEvent(id, event_timestamp(), turn)
+function TurnStartEvent(id::UID8)
+    return TurnStartEvent(id, event_timestamp())
 end
 
 struct TurnEndEvent <: AgentEvent
     id::UID8
     timestamp::Int64
-    turn::Int
     assistant_message::Union{Nothing, AssistantMessage}
-    pending_tool_calls::Vector{PendingToolCall}
+    pending_tool_calls::Union{Nothing, Vector{PendingToolCall}}
 end
 
 function TurnEndEvent(
         id::UID8,
-        turn::Int,
         assistant_message::Union{Nothing, AssistantMessage},
-        pending_tool_calls::Vector{PendingToolCall},
+        pending_tool_calls::Union{Nothing, Vector{PendingToolCall}},
     )
-    return TurnEndEvent(id, event_timestamp(), turn, assistant_message, pending_tool_calls)
+    return TurnEndEvent(id, event_timestamp(), assistant_message, pending_tool_calls)
 end
 
 struct MessageStartEvent{M <: AgentMessage} <: AgentEvent
@@ -92,11 +89,10 @@ end
 struct ToolCallRequestEvent <: AgentEvent
     timestamp::Int64
     tool_call::PendingToolCall
-    requires_approval::Bool
 end
 
-function ToolCallRequestEvent(tool_call::PendingToolCall, requires_approval::Bool)
-    return ToolCallRequestEvent(event_timestamp(), tool_call, requires_approval)
+function ToolCallRequestEvent(tool_call::PendingToolCall)
+    return ToolCallRequestEvent(event_timestamp(), tool_call)
 end
 
 struct ToolExecutionStartEvent <: AgentEvent

@@ -243,6 +243,8 @@ end
     response_id::Union{Nothing, String} = nothing
     usage::Usage = Usage()
     pending_tool_calls::Vector{PendingToolCall} = PendingToolCall[]
+    most_recent_stop_reason::Union{Nothing, Symbol} = nothing
+    session_id::Union{Nothing, String} = nothing
 end
 
 function set!(dest::AgentState, source::AgentState)
@@ -250,15 +252,7 @@ function set!(dest::AgentState, source::AgentState)
     dest.response_id = source.response_id
     dest.usage = source.usage
     dest.pending_tool_calls = source.pending_tool_calls
+    dest.most_recent_stop_reason = source.most_recent_stop_reason
+    dest.session_id = source.session_id
     return
-end
-
-@kwarg struct AgentResponse
-    message::AssistantMessage
-    usage::Usage
-    stop_reason::Symbol
-end
-
-@kwarg struct AgentResult
-    state::AgentState
 end

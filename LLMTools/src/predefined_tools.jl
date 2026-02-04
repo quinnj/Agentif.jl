@@ -451,49 +451,41 @@ function create_codex_tool()
     )
 end
 
-function subagent_evaluate(parent::AgentContext, child::Agent, input_message::String)
+function subagent_evaluate(child::Agent, input_message::String)
     return evaluate(child, input_message)
 end
 
-mutable struct AgentBox <: AgentContext
-    agent::Union{Nothing, Agent}
+function create_subagent_tool(parent::Agent)
+    return create_subagent_tool(() -> parent)
 end
 
-function get_agent(x::AgentBox)
-    x.agent === nothing && throw(ArgumentError("agent not initialized for subagent"))
-    return x.agent
-end
-
-function create_subagent_tool(parent::AgentContext)
+function create_subagent_tool(parent_provider::Function)
     return @tool(
         "Create and run a subagent with an independent prompt and input. Returns the subagent's response text. Useful for well-defined, isolatable tasks where the subagent can be specialized for the task and the parent agent can avoid unnecessary context pollution.",
         subagent(system_prompt::String, input_message::String) = begin
-            parent_agent = get_agent(parent)
-            child_box = AgentBox(nothing)
+            parent_agent = parent_provider()
+            parent_agent === nothing && throw(ArgumentError("parent agent not initialized for subagent"))
             child_tools = AgentTool[]
             allow_tools = get(ENV, "AGENTIF_SUBAGENT_ALLOW_TOOLS", "1") != "0"
             allow_nested = get(ENV, "AGENTIF_SUBAGENT_ALLOW_NESTED", "1") != "0"
+            child_ref = Ref{Union{Nothing, Agent}}(nothing)
             if allow_tools
                 for tool in parent_agent.tools
                     tool.name == "subagent" && continue
                     push!(child_tools, tool)
                 end
-                allow_nested && push!(child_tools, create_subagent_tool(child_box))
+                allow_nested && push!(child_tools, create_subagent_tool(() -> child_ref[]))
             end
             child = Agent(
                 ; prompt = system_prompt,
                 model = parent_agent.model,
                 apikey = parent_agent.apikey,
-                state = AgentState(),
-                input_guardrail = parent_agent.input_guardrail,
                 tools = child_tools,
-                stream_output = false,
-                skills = parent_agent.skills,
             )
-            child_box.agent = child
-            result = subagent_evaluate(parent, child, input_message)
+            allow_tools && allow_nested && (child_ref[] = child)
+            result_state = subagent_evaluate(child, input_message)
             message = nothing
-            for msg in reverse(result.state.messages)
+            for msg in reverse(result_state.messages)
                 msg isa AssistantMessage || continue
                 message = msg
                 break
@@ -695,7 +687,7 @@ function read_only_tools(base_dir::AbstractString = pwd())
     ]
 end
 
-function all_tools(base_dir::AbstractString = pwd(); parent::Union{Nothing, AgentContext} = nothing)
+function all_tools(base_dir::AbstractString = pwd(); parent::Union{Nothing, Agent, Function} = nothing)
     tools = Dict(
         "read" => create_read_tool(base_dir),
         "edit" => create_edit_tool(base_dir),

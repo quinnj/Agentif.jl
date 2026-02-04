@@ -1,27 +1,32 @@
 module Agentif
 
-using Base64, Dates, HTTP, InteractiveUtils, JSON, JSONSchema, Logging, PtySessions, StructUtils, UUIDs
+using Base64, Dates, HTTP, InteractiveUtils, JSON, JSONSchema, Logging, PtySessions, ScopedValues, StructUtils
 using Encid: UID8
 using LLMProviders
 using LLMProviders: Model, getModel, getProviders, getModels, calculateCost
 using LLMProviders: OpenAIResponses, OpenAICompletions, AnthropicMessages, GoogleGenerativeAI, GoogleGeminiCli
+
+const CURRENT_EVALUATION_ID = ScopedValue{Union{Nothing, UID8}}(nothing)
 
 # Include core modules
 include("util.jl")
 include("tools.jl")  # Must come before messages.jl (PendingToolCall used in AgentState)
 include("messages.jl")
 include("events.jl")
-include("skills.jl")  # Must come before agent.jl (SkillRegistry used in Agent)
+include("skills.jl")
 include("agent.jl")
 include("session.jl")
 include("input_guardrail.jl")
 include("stream.jl")
-
-# Include provider adapters that depend on Agent types
-include("providers/openai_responses_adapter.jl")
+include("middleware.jl")
 
 # Exports
-export Agent, evaluate, evaluate!, stream
+export Agent, Abort, abort!, isaborted, AgentHandler, AgentMiddleware
+export evaluate, stream, build_default_handler
+export steer_middleware, tool_call_middleware, queue_middleware, session_middleware
+export input_guardrail_middleware, skills_middleware
+export with_prompt, with_tools
+export CURRENT_EVALUATION_ID, CURRENT_TURN_ID
 export Model, getModel, getProviders, getModels, calculateCost
 export OpenAIResponses, OpenAICompletions, AnthropicMessages, GoogleGenerativeAI, GoogleGeminiCli
 export @tool, tool_name, AgentTool
@@ -34,8 +39,9 @@ export MessageStartEvent, MessageUpdateEvent, MessageEndEvent
 export ToolCallRequestEvent, ToolExecutionStartEvent, ToolExecutionEndEvent
 export AgentMessage, UserMessage, AssistantMessage, AgentToolCall, ToolResultMessage
 export message_text, message_thinking
-export AgentState, AgentResponse, AgentResult, Usage
-export AgentSession, SessionStore, InMemorySessionStore, FileSessionStore
-export load_session, save_session!
+export AgentState, Usage
+export SessionStore, InMemorySessionStore, FileSessionStore
+export SessionEntry, session_entries, session_entry_count, append_session_entry!
+export load_session, save_session!, new_session_id
 
 end

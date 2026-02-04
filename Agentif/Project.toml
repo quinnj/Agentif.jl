@@ -13,8 +13,8 @@ JSONSchema = "7d188eb4-7ad8-530c-ae41-71a32a6d4692"
 LLMProviders = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 PtySessions = "581b29ee-4021-4243-bea3-a8421693f905"
+ScopedValues = "7e506255-f358-4e82-b7e4-beb19740aa63"
 StructUtils = "ec057cc2-7a8d-4b58-b3b3-92acb9f63b42"
-UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [sources]
 LLMProviders = {path = "../LLMProviders"}
@@ -22,7 +22,7 @@ JSON = {path = "../../JSON"}
 JSONSchema = {path = "../../JSONSchema"}
 PtySessions = {path = "../../PtySessions"}
 Encid = {path = "../../Encid"}
-HTTP = {path = "~/.julia/packages/HTTP/na214"}
+HTTP = {path = "/Users/jacob.quinn/.julia/packages/HTTP/na214"}
 
 [compat]
 Encid = "1.0.0"
@@ -33,9 +33,9 @@ JSONSchema = "2"
 LLMProviders = "1"
 Logging = "1"
 PtySessions = "0.1"
+ScopedValues = "1.5"
 StructUtils = "2.6"
-UUIDs = "1"
-julia = "1.6"
+julia = "1.8"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"

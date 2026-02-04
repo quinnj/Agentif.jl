@@ -86,7 +86,7 @@ function _handle_update(update::Telegram.Update)
     @debug "VoTelegramExt: Starting evaluation" chat_id=chat_id assistant_provider=assistant.config.provider
     sm = Telegram.send_streaming_message(chat_id)
     try
-        Agentif.evaluate(assistant, text) do event
+        Vo.evaluate(assistant, text) do event
             if event isa Agentif.MessageUpdateEvent && event.kind == :text
                 Telegram.append!(sm, event.delta)
             end

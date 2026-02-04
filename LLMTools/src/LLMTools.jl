@@ -1,10 +1,9 @@
 module LLMTools
 
 using Agentif
-using Agentif: Agent, AgentContext, AgentState, AgentTool, AgentToolCall, PendingToolCall
+using Agentif: Agent, AgentState, AgentTool, AgentToolCall, PendingToolCall
 using Agentif: UserMessage, AssistantMessage, ToolResultMessage, ToolCallContent
 using Agentif: message_text, evaluate
-import Agentif: get_agent
 using Base64, Dates, HTTP, JSON, Logging, PtySessions, UUIDs
 using Qmd
 

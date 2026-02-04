@@ -285,10 +285,10 @@ function codex_load_credentials()
 end
 
 """
-    codex_login(; open_browser::Bool=true, timeout::Real=180) -> CodexCredentials
+    codex_login(; open_browser::Bool=true, timeout::Real=180) -> (String, String)
 
 Perform OAuth login for OpenAI Codex using a local loopback server.
-Returns credentials including the access token and account ID.
+Returns `(access_token, account_id)`.
 
 If valid stored credentials exist, returns those. Otherwise, initiates the OAuth flow
 by starting a local HTTP server on port 1455 to receive the authorization callback.
@@ -296,7 +296,8 @@ by starting a local HTTP server on port 1455 to receive the authorization callba
 function codex_login(; open_browser::Bool = true, timeout::Real = 180)
     # Try to use existing credentials
     try
-        return codex_credentials()
+        creds = codex_credentials()
+        return (creds.access_token, creds.account_id)
     catch
         # Fall back to interactive login
     end
@@ -358,7 +359,7 @@ function codex_login(; open_browser::Bool = true, timeout::Real = 180)
         codex_save_credentials(creds)
 
         println("Successfully authenticated with Codex!")
-        return creds
+        return (creds.access_token, creds.account_id)
     finally
         # Always stop the listener
         OAuth.stop_loopback_listener(listener)

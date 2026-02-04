@@ -6,26 +6,23 @@ using Dates
 using JSON
 using Logging
 using Qmd
-using SQLite
 using Tempus
 using UUIDs
 using ScopedValues
 
 export AbstractAssistantStore, FileStore, InMemoryStore
 export AgentAssistant, AssistantConfig
-export AgentSnapshot, HistoryEntry  # Note: Memory not exported to avoid conflict with Base.Memory in Julia 1.11+
+export search_session
 export AssistantMessage, UserMessage
-export run!, evaluate!, @a_str
+export run!, evaluate, @a_str
 export getIdentityAndPurpose, setIdentityAndPurpose!
 export getUserProfile, setUserProfile!
 export getBootstrap, setBootstrap!
 export getHeartbeatTasks, setHeartbeatTasks!, trigger_event_heartbeat!
 export getToolsGuide, setToolsGuide!
 export addNewMemory, searchMemories, forgetMemory
-export getHistoryAtIndex, appendHistory, searchHistory
 export SkillMetadata, getSkills, addNewSkill, forgetSkill
 export listJobs, addJob!, removeJob!
-export enable_markdown_rendering, disable_markdown_rendering
 export run_telegram_bot
 
 const TRIGGER_PROMPT = ScopedValue{Union{String, Nothing}}(nothing)
@@ -33,9 +30,8 @@ const DEFAULT_IDENTITY = read(joinpath(@__DIR__, "soul_template.md"), String)
 const DEFAULT_USER_PROFILE = read(joinpath(@__DIR__, "user_template.md"), String)
 const DEFAULT_BOOTSTRAP = read(joinpath(@__DIR__, "bootstrap_template.md"), String)
 const DEFAULT_TOOLS_GUIDE = read(joinpath(@__DIR__, "tools_template.md"), String)
-const DEFAULT_HISTORY_CONTEXT_LIMIT = 10
+const DEFAULT_SESSION_CONTEXT_LIMIT = 10
 const DEFAULT_MEMORY_CONTEXT_LIMIT = 6
-const DEFAULT_HISTORY_PAGE_SIZE = 10
 const ENV_AGENT_PROVIDER = "VO_AGENT_PROVIDER"
 const ENV_AGENT_MODEL = "VO_AGENT_MODEL"
 const ENV_AGENT_API_KEY = "VO_AGENT_API_KEY"
@@ -45,7 +41,8 @@ const BOOTSTRAP_FILENAME = "bootstrap.md"
 const MODES_DIRNAME = "modes"
 const DEFAULT_MODES_DIR = joinpath(@__DIR__, "default_modes")
 const MEMORIES_FILENAME = "memories.jsonl"
-const HISTORY_FILENAME = "history.jsonl"
+const SESSION_DIRNAME = "sessions"
+const SESSION_ID_FILENAME = "session_id"
 const SKILLS_DIRNAME = "skills"
 const SCHEDULER_STORE_FILENAME = "scheduler.bin"
 const HEARTBEAT_JOB_NAME = "heartbeat"
@@ -65,7 +62,7 @@ const SkillMetadata = Agentif.SkillMetadata
 struct Memory
     memory::String
     createdAt::Float64
-    historyIndex::Int64
+    eval_id::Union{Nothing, String}
 end
 
 struct PersonalityMode
@@ -76,28 +73,12 @@ struct PersonalityMode
     active_end::Int       # Hour (0-23), -1 = no constraint
 end
 
-struct AgentSnapshot
-    prompt::String
-    provider::String
-    modelId::String
-    tools::Vector{String}
-    skills::Vector{String}
-end
-
-struct HistoryEntry
-    index::Int64
-    createdAt::Float64
-    snapshot::AgentSnapshot
-    state::Agentif.AgentState
-end
-
 Base.@kwdef struct AssistantConfig
     provider::String
     model_id::String
     api_key::String
-    history_context_limit::Int = DEFAULT_HISTORY_CONTEXT_LIMIT
+    session_context_limit::Int = DEFAULT_SESSION_CONTEXT_LIMIT
     memory_context_limit::Int = DEFAULT_MEMORY_CONTEXT_LIMIT
-    history_page_size::Int = DEFAULT_HISTORY_PAGE_SIZE
     base_dir::String = pwd()
     enable_heartbeat::Bool = true
     heartbeat_interval_minutes::Int = DEFAULT_HEARTBEAT_INTERVAL_MINUTES
@@ -113,12 +94,10 @@ mutable struct FileStore <: AbstractAssistantStore
     tools_guide_path::String
     heartbeat_tasks_path::String
     memories_path::String
-    history_path::String
+    session_id_path::String
+    sessions_dir::String
     skills_dir::String
     modes_dir::String
-    history_offsets::Vector{Int64}
-    history_count::Int64
-    history_indexed::Bool
 end
 
 mutable struct InMemoryStore <: AbstractAssistantStore
@@ -129,7 +108,6 @@ mutable struct InMemoryStore <: AbstractAssistantStore
     tools_guide::String
     heartbeat_tasks::String
     memories::Vector{Memory}
-    history::Vector{HistoryEntry}
     skills_dir::String
     modes_dir::String
     skills_registry::Agentif.SkillRegistry
@@ -143,15 +121,15 @@ function get_current_assistant()
     return CURRENT_ASSISTANT[]
 end
 
-mutable struct AgentAssistant{S <: AbstractAssistantStore, T <: IO} <: Agentif.AgentContext
+mutable struct AgentAssistant{S <: AbstractAssistantStore, T <: IO}
     store::S
+    session_store::Union{Nothing, Agentif.SessionStore}
+    session_id::Union{Nothing, String}
     scheduler::Tempus.Scheduler
     lock::ReentrantLock
     config::AssistantConfig
-    messages::Channel{Union{String, Vector{Agentif.PendingToolCall}}} # channel type matches Agentif.evaluate! input type
     output::T
     initialized::Bool
-    current_snapshot::Union{Nothing, AgentSnapshot}
     watcher_state::Union{Nothing, Qmd.Watcher.WatcherState}
     @atomic evaluating::Bool                      # true while an evaluation is in progress (#8: in-flight check)
     last_heartbeat_hash::UInt64                    # hash of last heartbeat response (#9: dedup)
@@ -301,12 +279,10 @@ function FileStore(root::String)
         joinpath(abs_root, TOOLS_GUIDE_FILENAME),
         joinpath(abs_root, HEARTBEAT_TASKS_FILENAME),
         joinpath(abs_root, MEMORIES_FILENAME),
-        joinpath(abs_root, HISTORY_FILENAME),
+        joinpath(abs_root, SESSION_ID_FILENAME),
+        joinpath(abs_root, SESSION_DIRNAME),
         joinpath(abs_root, SKILLS_DIRNAME),
         joinpath(abs_root, MODES_DIRNAME),
-        Int64[],
-        0,
-        false,
     )
     initialize_store!(store)
     return store
@@ -316,7 +292,7 @@ function InMemoryStore(; identity::String = DEFAULT_IDENTITY, user_profile::Stri
     skills_dir = mktempdir()
     modes_dir = mktempdir()
     registry = Agentif.create_skill_registry([skills_dir]; warn = false)
-    store = InMemoryStore(ReentrantLock(), identity, user_profile, bootstrap, DEFAULT_TOOLS_GUIDE, DEFAULT_HEARTBEAT_TASKS, Memory[], HistoryEntry[], skills_dir, modes_dir, registry)
+    store = InMemoryStore(ReentrantLock(), identity, user_profile, bootstrap, DEFAULT_TOOLS_GUIDE, DEFAULT_HEARTBEAT_TASKS, Memory[], skills_dir, modes_dir, registry)
     finalizer(store) do s
         isdir(s.skills_dir) && rm(s.skills_dir; recursive = true, force = true)
         isdir(s.modes_dir) && rm(s.modes_dir; recursive = true, force = true)
@@ -340,7 +316,8 @@ function initialize_store!(store::FileStore)
     end
     ensure_file(store.heartbeat_tasks_path)
     ensure_file(store.memories_path)
-    ensure_file(store.history_path)
+    ensure_session_id!(store)
+    isdir(store.sessions_dir) || mkpath(store.sessions_dir)
     isdir(store.skills_dir) || mkpath(store.skills_dir)
     if !isdir(store.modes_dir)
         mkpath(store.modes_dir)
@@ -354,9 +331,6 @@ function initialize_store!(store::FileStore)
             end
         end
     end
-    store.history_offsets = Int64[]
-    store.history_count = 0
-    store.history_indexed = false
     return nothing
 end
 
@@ -365,50 +339,43 @@ function initialize_store!(store::InMemoryStore)
     return nothing
 end
 
-function ensure_history_index!(store::FileStore)
-    store.history_indexed && return nothing
-    offsets = Int64[]
-    count = 0
-    isfile(store.history_path) || begin
-        store.history_offsets = offsets
-        store.history_count = count
-        store.history_indexed = true
-        return nothing
-    end
-    open(store.history_path, "r") do io
-        while !eof(io)
-            push!(offsets, position(io))
-            readline(io)
-            count += 1
-        end
-    end
-    store.history_offsets = offsets
-    store.history_count = count
-    store.history_indexed = true
-    return nothing
+function load_session_id(store::FileStore)
+    isfile(store.session_id_path) || return nothing
+    id = strip(read(store.session_id_path, String))
+    isempty(id) && return nothing
+    return id
 end
 
-function history_count(store::FileStore)
-    return lock(store.lock) do
-        ensure_history_index!(store)
-        return store.history_count
+function ensure_session_id!(store::FileStore)
+    id = load_session_id(store)
+    if id === nothing
+        id = string(Agentif.new_session_id())
+        write_atomic(store.session_id_path, id)
     end
-end
-
-function history_count(store::InMemoryStore)
-    return lock(store.lock) do
-        return length(store.history)
-    end
+    return id
 end
 
 function ensure_initialized!(assistant::AgentAssistant)
     lock(assistant.lock) do
         assistant.initialized && return nothing
         initialize_store!(assistant.store)
-        base_index = history_count(assistant.store) + 1
         assistant.initialized = true
     end
     return nothing
+end
+
+function session_entry_count(assistant::AgentAssistant)
+    store = assistant.session_store
+    sid = assistant.session_id
+    (store === nothing || sid === nothing) && return 0
+    return Agentif.session_entry_count(store, sid)
+end
+
+function list_session_entries(assistant::AgentAssistant, start::Int, limit::Int)
+    store = assistant.session_store
+    sid = assistant.session_id
+    (store === nothing || sid === nothing) && return SessionEntry[]
+    return Agentif.session_entries(store, sid; start, limit)
 end
 
 include("tools.jl")
@@ -491,7 +458,7 @@ function heartbeat_prompt(local_time::DateTime, offset_minutes::Int, heartbeat_t
     - For other heartbeats with no pending tasks, only respond if you find something useful; otherwise respond exactly with HEARTBEAT_OK.
 
     Checklist:
-    - Review recent history and memories for events, lessons, or follow-ups worth acting on.
+    - Review recent session entries and memories for events, lessons, or follow-ups worth acting on.
     $(skill_section)
     - Use memories about user interests to find or propose noteworthy content, refining interest/topics over time.
     - If responding outside the first/last heartbeat, be concise — only meaningful updates or actions.
@@ -515,9 +482,8 @@ function AgentAssistant(;
         provider::Union{Nothing, String} = nothing,
         model_id::Union{Nothing, String} = nothing,
         api_key::Union{Nothing, String} = nothing,
-        history_context_limit::Int = DEFAULT_HISTORY_CONTEXT_LIMIT,
+        session_context_limit::Int = DEFAULT_SESSION_CONTEXT_LIMIT,
         memory_context_limit::Int = DEFAULT_MEMORY_CONTEXT_LIMIT,
-        history_page_size::Int = DEFAULT_HISTORY_PAGE_SIZE,
         base_dir::String = pwd(),
         enable_heartbeat::Bool = true,
         heartbeat_interval_minutes::Int = DEFAULT_HEARTBEAT_INTERVAL_MINUTES,
@@ -531,6 +497,8 @@ function AgentAssistant(;
         store = FileStore(data_dir)
         scheduler = build_scheduler(store)
     end
+    session_store = store isa FileStore ? Agentif.FileSessionStore(store.sessions_dir) : Agentif.InMemorySessionStore()
+    session_id = store isa FileStore ? ensure_session_id!(store) : string(Agentif.new_session_id())
     provider_value = provider === nothing ? get_env_with_fallback(ENV_AGENT_PROVIDER, "ANTHROPIC_PROVIDER", "anthropic") : provider
     model_id_value = model_id === nothing ? get_env_with_fallback(ENV_AGENT_MODEL, "ANTHROPIC_MODEL", nothing) : model_id
     api_key_value = resolve_api_key(provider_value, api_key)
@@ -548,9 +516,8 @@ function AgentAssistant(;
         provider = provider_value,
         model_id = model_id_value,
         api_key = api_key_value,
-        history_context_limit = history_context_limit,
+        session_context_limit = session_context_limit,
         memory_context_limit = memory_context_limit,
-        history_page_size = history_page_size,
         base_dir = base_dir,
         enable_heartbeat = enable_heartbeat,
         heartbeat_interval_minutes = heartbeat_interval_minutes,
@@ -559,13 +526,13 @@ function AgentAssistant(;
     model === nothing && error("Unknown model provider=$(config.provider) model_id=$(config.model_id)")
     assistant = AgentAssistant(
         store,
+        session_store,
+        session_id,
         scheduler,
         ReentrantLock(),
         config,
-        Channel{Union{String, Vector{Agentif.PendingToolCall}}}(Inf),
         output,
         false,
-        nothing,  # current_snapshot
         nothing,  # watcher_state
         false,    # evaluating (in-flight flag)
         UInt64(0),# last_heartbeat_hash
@@ -577,18 +544,18 @@ function AgentAssistant(;
 end
 
 """
-Build a context query string from recent history for memory retrieval.
+Build a context query string from recent session entries for memory retrieval.
 """
-function build_memory_query(history_entries::Vector{HistoryEntry}; max_chars::Int=500)
-    isempty(history_entries) && return ""
+function build_memory_query(session_entries::Vector{SessionEntry}; max_chars::Int=500)
+    isempty(session_entries) && return ""
 
     # Collect recent user messages and assistant responses
     parts = String[]
     total_chars = 0
 
     # Process entries in reverse (most recent first)
-    for entry in reverse(history_entries)
-        user_text, assistant_text = history_summary(entry)
+    for entry in reverse(session_entries)
+        user_text, assistant_text = session_entry_summary(entry)
 
         # Add user message (prioritize user context)
         if !isempty(user_text) && total_chars < max_chars
@@ -614,13 +581,13 @@ end
 Retrieve memories relevant to the current conversation context using semantic search.
 Falls back to recent memories if semantic search is unavailable.
 """
-function get_relevant_memories(assistant::AgentAssistant, history_entries::Vector{HistoryEntry})
+function get_relevant_memories(assistant::AgentAssistant, session_entries::Vector{SessionEntry})
     store = assistant.store
     limit = assistant.config.memory_context_limit
     limit <= 0 && return Memory[]
 
-    # Build context query from recent history
-    context_query = build_memory_query(history_entries)
+    # Build context query from recent session entries
+    context_query = build_memory_query(session_entries)
 
     # Try semantic search if we have context and Qmd is available
     if !isempty(context_query)
@@ -779,10 +746,12 @@ end
 function build_prompt(assistant::AgentAssistant; trigger_prompt::Union{Nothing, String} = TRIGGER_PROMPT[])
     identity = getIdentityAndPurpose(assistant.store)
     user_profile = getUserProfile(assistant.store)
-    history_entries = listHistory(assistant.store, max(1, history_count(assistant.store) - assistant.config.history_context_limit + 1), assistant.config.history_context_limit)
+    entry_count = session_entry_count(assistant)
+    start_index = max(1, entry_count - assistant.config.session_context_limit + 1)
+    session_entries = entry_count == 0 ? SessionEntry[] : list_session_entries(assistant, start_index, assistant.config.session_context_limit)
 
     # Retrieve relevant memories based on conversation context
-    relevant_memories = get_relevant_memories(assistant, history_entries)
+    relevant_memories = get_relevant_memories(assistant, session_entries)
 
     io = IOBuffer()
     local_time = Dates.now()
@@ -838,11 +807,11 @@ function build_prompt(assistant::AgentAssistant; trigger_prompt::Union{Nothing, 
         end
     end
 
-    if !isempty(history_entries)
-        print(io, "\n## Recent History\n")
-        for entry in history_entries
-            user_text, assistant_text = history_summary(entry)
-            print(io, "- [", entry.index, "] User: ", user_text, "\n  Vo: ", assistant_text, "\n")
+    if !isempty(session_entries)
+        print(io, "\n## Recent Session\n")
+        for entry in session_entries
+            user_text, assistant_text = session_entry_summary(entry)
+            print(io, "- User: ", user_text, "\n  Vo: ", assistant_text, "\n")
         end
     end
     if trigger_prompt !== nothing
@@ -851,18 +820,10 @@ function build_prompt(assistant::AgentAssistant; trigger_prompt::Union{Nothing, 
     return String(take!(io))
 end
 
-available_tool_names(tools::Vector{Agentif.AgentTool}) = [tool.name for tool in tools]
-
-function available_skill_names(registry::Agentif.SkillRegistry)
-    names = collect(keys(registry.skills))
-    sort!(names)
-    return names
-end
-
-function history_summary(entry::HistoryEntry)
+function session_entry_summary(entry::SessionEntry)
     user = ""
     assistant = ""
-    for msg in entry.state.messages
+    for msg in entry.messages
         if msg isa Agentif.UserMessage
             user = Agentif.message_text(msg)
         elseif msg isa Agentif.AssistantMessage
@@ -872,9 +833,9 @@ function history_summary(entry::HistoryEntry)
     return user, assistant
 end
 
-function history_search_text(entry::HistoryEntry)
+function session_entry_search_text(entry::SessionEntry)
     parts = String[]
-    for msg in entry.state.messages
+    for msg in entry.messages
         if msg isa Agentif.UserMessage
             push!(parts, Agentif.message_text(msg))
         elseif msg isa Agentif.AssistantMessage
@@ -888,47 +849,65 @@ function history_search_text(entry::HistoryEntry)
     return lowercase(join(parts, "\n"))
 end
 
+function search_session(assistant::AgentAssistant, keywords::String; limit::Union{Nothing, Int} = nothing, offset::Int = 0)
+    keywords_list = parse_keywords(keywords)
+    matches = SessionEntry[]
+    store = assistant.session_store
+    sid = assistant.session_id
+    (store === nothing || sid === nothing) && return matches
+    entries = Agentif.session_entries(store, sid)
+    seen = 0
+    for entry in entries
+        text = session_entry_search_text(entry)
+        if matches_keywords(text, keywords_list)
+            if seen >= offset
+                push!(matches, entry)
+            end
+            seen += 1
+            if limit !== nothing && length(matches) >= limit
+                break
+            end
+        end
+    end
+    return matches
+end
+
 function build_error_state(input::String, error_text::String)
     messages = Agentif.AgentMessage[]
     push!(messages, Agentif.UserMessage(input))
     push!(messages, Agentif.AssistantMessage(; provider = "local", api = "local", model = "local", content = Agentif.AssistantContentBlock[Agentif.TextContent(error_text)]))
     usage = Agentif.Usage()
     pending = Agentif.PendingToolCall[]
-    return Agentif.AgentState(messages, nothing, usage, pending)
-end
-
-function Agentif.get_agent(assistant::AgentAssistant)
-    prompt = build_prompt(assistant)
-    tools = build_tools(assistant)
-    tool_names = available_tool_names(tools)
-    registry = get_skills_registry(assistant.store)
-    skill_names = available_skill_names(registry)
-    assistant.current_snapshot = AgentSnapshot(prompt, assistant.config.provider, assistant.config.model_id, tool_names, skill_names)
-    return Agentif.Agent(
-        ; prompt,
-        model = Agentif.getModel(assistant.config.provider, assistant.config.model_id),
-        apikey = assistant.config.api_key,
-        state = Agentif.AgentState(),
-        skills = registry,
-        tools,
+    return Agentif.AgentState(;
+        messages,
+        response_id = nothing,
+        usage,
+        pending_tool_calls = pending,
+        most_recent_stop_reason = :error,
     )
 end
 
-function Agentif.handle_event(assistant::AgentAssistant, event::Agentif.AgentEvent)
+function base_agent(assistant::AgentAssistant)
+    model = Agentif.getModel(assistant.config.provider, assistant.config.model_id)
+    model === nothing && error("Unknown model provider=$(assistant.config.provider) model_id=$(assistant.config.model_id)")
+    return Agentif.Agent(
+        id = "vo",
+        name = "Vo",
+        prompt = "",
+        model = model,
+        apikey = assistant.config.api_key,
+        tools = Agentif.AgentTool[],
+    )
+end
+
+function handle_event!(assistant::AgentAssistant, event::Agentif.AgentEvent)
     return if event isa Agentif.AgentEvaluateStartEvent
         @debug "[vo] AgentEvaluateStartEvent received"
         @atomic assistant.evaluating = true
         lock(assistant.lock) # ensure only one evaluation happens at a time (mostly user inputs vs. scheduled prompts)
     elseif event isa Agentif.AgentEvaluateEndEvent
-        @debug "[vo] AgentEvaluateEndEvent received" has_result = (event.result !== nothing)
         try
             @atomic assistant.evaluating = false
-            # event.result can be nothing if evaluation failed
-            if event.result !== nothing && hasproperty(event.result, :state)
-                index = history_count(assistant.store) + 1
-                history_entry = HistoryEntry(index, time(), assistant.current_snapshot, event.result.state)
-                appendHistory(assistant.store, history_entry)
-            end
         finally
             unlock(assistant.lock)
         end
@@ -940,6 +919,66 @@ function Agentif.handle_event(assistant::AgentAssistant, event::Agentif.AgentEve
         @debug "[vo] MessageEndEvent"
         println(assistant.output)
     end
+end
+
+function memory_middleware(agent_handler::Agentif.AgentHandler, assistant::AgentAssistant)
+    return function (f, agent::Agentif.Agent, state::Agentif.AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+        prompt = build_prompt(assistant)
+        return agent_handler(f, Agentif.with_prompt(agent, prompt), state, current_input, abort; kw...)
+    end
+end
+
+function tools_middleware(agent_handler::Agentif.AgentHandler, assistant::AgentAssistant)
+    return function (f, agent::Agentif.Agent, state::Agentif.AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+        tools = build_tools(assistant; include_scheduler = false)
+        return agent_handler(f, Agentif.with_tools(agent, tools), state, current_input, abort; kw...)
+    end
+end
+
+function scheduler_middleware(agent_handler::Agentif.AgentHandler, assistant::AgentAssistant)
+    return function (f, agent::Agentif.Agent, state::Agentif.AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+        scheduler_tools = build_scheduler_tools(assistant)
+        tools = isempty(agent.tools) ? scheduler_tools : vcat(agent.tools, scheduler_tools)
+        agent_with_tools = Agentif.with_tools(agent, tools)
+        subagent_tool = LLMTools.create_subagent_tool(agent_with_tools)
+        tools = vcat(tools, [subagent_tool])
+        agent_with_tools = Agentif.with_tools(agent, tools)
+        return agent_handler(f, agent_with_tools, state, current_input, abort; kw...)
+    end
+end
+
+function build_handler(assistant::AgentAssistant)
+    handler = Agentif.stream
+    handler = scheduler_middleware(handler, assistant)
+    handler = tools_middleware(handler, assistant)
+    handler = memory_middleware(handler, assistant)
+    return handler
+end
+
+evaluate(assistant::AgentAssistant, input::Agentif.AgentTurnInput; abort::Agentif.Abort = Agentif.Abort(), kw...) = evaluate(identity, assistant, input; abort, kw...)
+
+function evaluate(f::Function, assistant::AgentAssistant, input::Agentif.AgentTurnInput; abort::Agentif.Abort = Agentif.Abort(), kw...)
+    ensure_initialized!(assistant)
+    agent = base_agent(assistant)
+    state = Agentif.AgentState()
+    handler = build_handler(assistant)
+    registry = get_skills_registry(assistant.store)
+    function event_cb(event)
+        handle_event!(assistant, event)
+        f(event)
+    end
+    return Agentif.evaluate(
+        event_cb,
+        agent,
+        input;
+        state,
+        base_handler = handler,
+        session_store = assistant.session_store,
+        session_id = assistant.session_id,
+        skill_registry = registry,
+        abort,
+        kw...,
+    )
 end
 
 function run!(assistant::AgentAssistant)
@@ -1023,7 +1062,6 @@ function Base.close(assistant::AgentAssistant)
     CURRENT_ASSISTANT[] === assistant && (CURRENT_ASSISTANT[] = nothing)
     lock(assistant.lock) do
         try
-            isopen(assistant.messages) && close(assistant.messages)
             # Only close scheduler if it's actually running to avoid hanging
             assistant.scheduler.running && Tempus.close(assistant.scheduler)
         catch err
@@ -1098,12 +1136,12 @@ function execute_heartbeat!(assistant::AgentAssistant)
     end
     prompt = heartbeat_prompt(local_time, offset_minutes, heartbeat_tasks, skill_names)
 
-    result = @with TRIGGER_PROMPT => prompt Agentif.evaluate(assistant, "Evaluate heartbeat prompt")
+    result_state = @with TRIGGER_PROMPT => prompt evaluate(assistant, "Evaluate heartbeat prompt")
 
     # #9: Deduplication — skip delivery if response is identical to last heartbeat within 24h
-    if result !== nothing && hasproperty(result, :state)
+    if result_state !== nothing
         response_text = ""
-        for msg in result.state.messages
+        for msg in result_state.messages
             if msg isa Agentif.AssistantMessage
                 response_text = Agentif.message_text(msg)
             end
@@ -1152,7 +1190,7 @@ function trigger_event_heartbeat!(assistant::AgentAssistant, event_prompt::Strin
         @debug "[vo] Event heartbeat skipped: evaluation in progress"
         return nothing
     end
-    @with TRIGGER_PROMPT => event_prompt Agentif.evaluate(assistant, "Process event notification")
+    @with TRIGGER_PROMPT => event_prompt evaluate(assistant, "Process event notification")
     return nothing
 end
 
@@ -1199,40 +1237,8 @@ struct ReplResponse
     input::String
 end
 
-mutable struct Done
-    @atomic done::Bool
-end
-
-Done() = Done(false)
-done!(d::Done) = @atomic d.done = true
-isdone(d::Done) = @atomic d.done
-
-const SPINNER_FRAMES = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
-const CLEAR_LINE = "\e[2K"
-
 function Base.show(io::IO, resp::ReplResponse)
-    d = Done()
-    # immediately spawn 'thinking...' task
-    Threads.@spawn begin
-        idx = 1
-        while !isdone(d)
-            i = mod1(idx, length(SPINNER_FRAMES))
-            spinner_text = "$(SPINNER_FRAMES[i]) thinking..."
-            # Simple in-place update: go to start of line, clear, print spinner
-            print(io, "\r", CLEAR_LINE, spinner_text)
-            flush(io)
-            idx += 1
-            sleep(0.08)
-        end
-    end
-    return Agentif.evaluate(get_current_assistant(), resp.input) do event
-        if event isa Agentif.MessageUpdateEvent
-            if !isdone(d)
-                done!(d)
-                println(io)
-            end
-        end
-    end
+    return evaluate(get_current_assistant(), resp.input)
 end
 
 macro a_str(input)

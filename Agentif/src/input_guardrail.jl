@@ -1,5 +1,3 @@
-using HTTP
-
 const INPUT_GUARDRAIL_PROMPT = """
 SYSTEM (InputGuard v1)
 
@@ -48,39 +46,28 @@ struct ValidUserInput
     valid_user_input::Bool
 end
 
-const INPUT_GUARDRAIL_OUTPUT_FORMAT = OpenAIResponses.Text(; format = OpenAIResponses.TextFormatJSONSchema(; name = "valid_user_input", strict = true, schema = JSONSchema.schema(ValidUserInput; all_fields_required = true, additionalProperties = false)))
-
-function openai_responses_request(model::Model, input::String, apikey::String; http_kw = (;), kw...)
-    req = OpenAIResponses.Request(; model = model.id, input = input, stream = false, model.kw..., kw...)
-    headers = Dict(
-        "Authorization" => "Bearer $apikey",
-        "Content-Type" => "application/json",
-    )
-    model.headers !== nothing && merge!(headers, model.headers)
-    url = joinpath(model.baseUrl, "responses")
-    return JSON.parse(HTTP.post(url, headers; body = JSON.json(req), http_kw...).body, OpenAIResponses.Response)
+struct InputGuardrailAgent
+    prompt::String
 end
 
-function default_input_guardrail(classifier_model::Model)
-    return function check(agent_prompt, input, apikey)
-        classifier_input = """
-            AGENT_SPEC: `$agent_prompt`
+const DEFAULT_INPUT_GUARDRAIL_AGENT = InputGuardrailAgent(INPUT_GUARDRAIL_PROMPT)
 
-            USER_INPUT: `$input`
-        """
-        if classifier_model.api == "openai-responses"
-            resp = openai_responses_request(
-                classifier_model,
-                classifier_input,
-                apikey;
-                text = INPUT_GUARDRAIL_OUTPUT_FORMAT,
-                instructions = INPUT_GUARDRAIL_PROMPT,
-                include = nothing,
-                reasoning = OpenAIResponses.Reasoning(; effort = "minimal")
-            )
-            return JSON.parse(resp.output[end].content[1].text, ValidUserInput).valid_user_input
-        else
-            throw(ArgumentError("$(classifier_model.api) api type currently unsupported"))
-        end
-    end
+function build_guardrail_input(agent_prompt::String, input::String)
+    return """
+    AGENT_SPEC: `$agent_prompt`
+
+    USER_INPUT: `$input`
+    """
+end
+
+function materialize_guardrail_agent(agent::Agent, guardrail::InputGuardrailAgent; model::Union{Nothing, Model} = nothing, apikey::Union{Nothing, String} = nothing)
+    return Agent(;
+        id = agent.id,
+        name = agent.name,
+        prompt = guardrail.prompt,
+        model = model === nothing ? agent.model : model,
+        apikey = apikey === nothing ? agent.apikey : apikey,
+        tools = AgentTool[],
+        http_kw = agent.http_kw,
+    )
 end

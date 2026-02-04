@@ -184,18 +184,18 @@ function removePersonalityMode!(store::AbstractAssistantStore, name::String)
     return 0
 end
 
-function addNewMemory(store::FileStore, memory::String; history_index::Union{Nothing,Int64}=nothing)
-    history_index === nothing && (history_index = history_count(store) + 1)
-    mem = Memory(memory, time(), history_index)
+function addNewMemory(store::FileStore, memory::String; eval_id::Union{Nothing, String} = nothing)
+    eval_id_str = eval_id === nothing ? nothing : string(eval_id)
+    mem = Memory(memory, time(), eval_id_str)
     lock(store.lock) do
         append_jsonl(store.memories_path, mem)
     end
     return mem
 end
 
-function addNewMemory(store::InMemoryStore, memory::String; history_index::Union{Nothing,Int64}=nothing)
-    history_index === nothing && (history_index = history_count(store) + 1)
-    mem = Memory(memory, time(), history_index)
+function addNewMemory(store::InMemoryStore, memory::String; eval_id::Union{Nothing, String} = nothing)
+    eval_id_str = eval_id === nothing ? nothing : string(eval_id)
+    mem = Memory(memory, time(), eval_id_str)
     lock(store.lock) do
         push!(store.memories, mem)
     end
@@ -325,127 +325,6 @@ function forgetMemory(store::InMemoryStore, memory::String)
         store.memories = kept
     end
     return removed
-end
-
-function appendHistory(store::FileStore, entry::HistoryEntry)
-    lock(store.lock) do
-        ensure_history_index!(store)
-        expected = store.history_count + 1
-        entry.index == expected || throw(ArgumentError("history index must be $expected"))
-        open(store.history_path, "a") do io
-            pos = position(io)
-            write(io, JSON.json(entry))
-            write(io, "\n")
-            push!(store.history_offsets, pos)
-            store.history_count += 1
-        end
-    end
-    return nothing
-end
-
-function appendHistory(store::InMemoryStore, entry::HistoryEntry)
-    lock(store.lock) do
-        expected = length(store.history) + 1
-        entry.index == expected || throw(ArgumentError("history index must be $expected"))
-        push!(store.history, entry)
-    end
-    return nothing
-end
-
-function getHistoryAtIndex(store::FileStore, index::Int64)
-    return lock(store.lock) do
-        ensure_history_index!(store)
-        (index < 1 || index > store.history_count) && throw(ArgumentError("history index out of range: $(index)"))
-        offset = store.history_offsets[index]
-        open(store.history_path, "r") do io
-            seek(io, offset)
-            line = readline(io)
-            return JSON.parse(line, HistoryEntry)
-        end
-    end
-end
-
-function getHistoryAtIndex(store::InMemoryStore, index::Int64)
-    return lock(store.lock) do
-        (index < 1 || index > length(store.history)) && throw(ArgumentError("history index out of range: $(index)"))
-        return store.history[index]
-    end
-end
-
-function listHistory(store::FileStore, start_index::Int64, limit::Int64)
-    return lock(store.lock) do
-        ensure_history_index!(store)
-        start_index < 1 && (start_index = 1)
-        limit < 1 && return HistoryEntry[]
-        start_index > store.history_count && return HistoryEntry[]
-        stop_index = min(store.history_count, start_index + limit - 1)
-        entries = HistoryEntry[]
-        open(store.history_path, "r") do io
-            for idx in start_index:stop_index
-                seek(io, store.history_offsets[idx])
-                line = readline(io)
-                push!(entries, JSON.parse(line, HistoryEntry))
-            end
-        end
-        return entries
-    end
-end
-
-function listHistory(store::InMemoryStore, start_index::Int64, limit::Int64)
-    return lock(store.lock) do
-        start_index < 1 && (start_index = 1)
-        limit < 1 && return HistoryEntry[]
-        start_index > length(store.history) && return HistoryEntry[]
-        stop_index = min(length(store.history), start_index + limit - 1)
-        return store.history[start_index:stop_index]
-    end
-end
-
-function searchHistory(store::FileStore, keywords::String; limit::Union{Nothing,Int}=nothing, offset::Int=0)
-    keywords_list = parse_keywords(keywords)
-    matches = HistoryEntry[]
-    seen = 0
-    lock(store.lock) do
-        isfile(store.history_path) || return matches
-        open(store.history_path, "r") do io
-            for line in eachline(io)
-                isempty(strip(line)) && continue
-                entry = JSON.parse(line, HistoryEntry)
-                text = history_search_text(entry)
-                if matches_keywords(text, keywords_list)
-                    if seen >= offset
-                        push!(matches, entry)
-                    end
-                    seen += 1
-                    if limit !== nothing && length(matches) >= limit
-                        return matches
-                    end
-                end
-            end
-        end
-    end
-    return matches
-end
-
-function searchHistory(store::InMemoryStore, keywords::String; limit::Union{Nothing,Int}=nothing, offset::Int=0)
-    keywords_list = parse_keywords(keywords)
-    matches = HistoryEntry[]
-    seen = 0
-    lock(store.lock) do
-        for entry in store.history
-            text = history_search_text(entry)
-            if matches_keywords(text, keywords_list)
-                if seen >= offset
-                    push!(matches, entry)
-                end
-                seen += 1
-                if limit !== nothing && length(matches) >= limit
-                    return matches
-                end
-            end
-        end
-    end
-    return matches
 end
 
 function get_skills_registry(store::FileStore)
@@ -597,7 +476,17 @@ function parse_iso8601_utc(s::AbstractString)
     return dt - sign * offset
 end
 
-function addJob!(assistant, job_name, prompt, schedule; enabled::Bool=true, expires_at::Union{Nothing, DateTime}=nothing, max_executions::Union{Nothing, Int}=nothing, run_once::Bool=false)
+function addJob!(
+        assistant,
+        job_name,
+        prompt,
+        schedule;
+        enabled::Bool = true,
+        expires_at::Union{Nothing, DateTime} = nothing,
+        max_executions::Union{Nothing, Int} = nothing,
+        run_once::Bool = false,
+        evaluate_fn::Function = Vo.evaluate,
+    )
     isempty(strip(prompt)) && throw(ArgumentError("prompt cannot be empty"))
     schedule_str = String(strip(schedule))
     isempty(schedule_str) && throw(ArgumentError("schedule cannot be empty"))
@@ -641,7 +530,7 @@ function addJob!(assistant, job_name, prompt, schedule; enabled::Bool=true, expi
         () -> begin
             a = get_current_assistant()
             a === nothing && return nothing  # Assistant was closed
-            Agentif.evaluate(a, prompt)
+            evaluate_fn(a, prompt)
         end,
         job_name,
         cron_schedule;
@@ -660,7 +549,33 @@ function removeJob!(assistant, job_name)
     return count
 end
 
-function build_tools(assistant::AgentAssistant)
+function build_scheduler_tools(assistant::AgentAssistant; evaluate_fn::Function = Vo.evaluate)
+    listJobs_tool = @tool(
+        "List scheduled jobs and their status.",
+        listJobs() = begin
+            jobs = Vo.listJobs(assistant.scheduler)
+            return JSON.json([job_summary(job) for job in jobs])
+        end,
+    )
+    addJob_tool = @tool(
+        "Schedule a prompt to run at a specific time or cron schedule. Use ISO 8601 timestamps (UTC) or cron expressions.",
+        addJob(name::String, prompt::String, schedule::String; enabled::Bool=true, expires_at::Union{Nothing, String}=nothing, max_executions::Union{Nothing, Int}=nothing, run_once::Bool=false) = begin
+            expires_at_dt = expires_at === nothing ? nothing : parse_iso8601_utc(expires_at)
+            job = Vo.addJob!(assistant, name, prompt, schedule; enabled=enabled, expires_at=expires_at_dt, max_executions=max_executions, run_once=run_once, evaluate_fn=evaluate_fn)
+            return JSON.json(job_summary(job))
+        end,
+    )
+    removeJob_tool = @tool(
+        "Remove a scheduled job by name.",
+        removeJob(name::String) = begin
+            removed = Vo.removeJob!(assistant, name)
+            return string(removed)
+        end,
+    )
+    return Agentif.AgentTool[listJobs_tool, addJob_tool, removeJob_tool]
+end
+
+function build_tools(assistant::AgentAssistant; include_scheduler::Bool = true)
     setIdentityAndPurpose_tool = @tool(
         "Update Vo's identity and purpose with new content.",
         setIdentityAndPurpose(content::String) = begin
@@ -738,8 +653,9 @@ function build_tools(assistant::AgentAssistant)
     addNewMemory_tool = @tool(
         "Store a new memory (lesson learned, insight, observation, rule, pattern, etc.) tied to the current evaluation.",
         addNewMemory(memory::String) = begin
-            history_index = history_count(assistant.store) + 1
-            mem = Vo.addNewMemory(assistant.store, memory; history_index=history_index)
+            eval_id = Agentif.CURRENT_EVALUATION_ID[]
+            eval_id_str = eval_id === nothing ? nothing : string(eval_id)
+            mem = Vo.addNewMemory(assistant.store, memory; eval_id=eval_id_str)
             return JSON.json(mem)
         end,
     )
@@ -758,19 +674,12 @@ function build_tools(assistant::AgentAssistant)
             return string(removed)
         end,
     )
-    getHistoryAtIndex_tool = @tool(
-        "Get a history entry (past \"turn\" of messages between Vo and the user) by 1-based index.",
-        getHistoryAtIndex(index::Int64) = begin
-            entry = Vo.getHistoryAtIndex(assistant.store, index)
-            return JSON.json(entry)
-        end,
-    )
-    searchHistory_tool = @tool(
-        "Search history entries (past \"turn\" of messages between Vo and the user) by keywords (space-separated) and return matching entries. Matches if any keyword is found.",
-        searchHistory(keywords::String, limit::Union{Nothing, Int}=nothing, offset::Union{Nothing, Int}=nothing) = begin
+    search_session_tool = @tool(
+        "Search session entries (past turns between Vo and the user) by keywords (space-separated) and return matching entries. Matches if any keyword is found.",
+        search_session(keywords::String, limit::Union{Nothing, Int}=nothing, offset::Union{Nothing, Int}=nothing) = begin
             limit_value = limit === nothing ? 10 : limit
             offset_value = offset === nothing ? 0 : offset
-            results = Vo.searchHistory(assistant.store, keywords; limit=limit_value, offset=offset_value)
+            results = Vo.search_session(assistant, keywords; limit=limit_value, offset=offset_value)
             return JSON.json(results)
         end,
     )
@@ -795,51 +704,6 @@ function build_tools(assistant::AgentAssistant)
             return string(removed)
         end,
     )
-    listJobs_tool = @tool(
-        "List scheduled jobs (prompts that will be evaluated on a cron schedule).",
-        listJobs() = begin
-            jobs = Vo.listJobs(assistant.scheduler)
-            summaries = [job_summary(job) for job in jobs]
-            return JSON.json(summaries)
-        end,
-    )
-    addJob_tool = @tool(
-        """Add a scheduled job that evaluates a prompt. Supports both recurring cron schedules and one-time executions.
-
-        Parameters:
-        - schedule: Either a cron expression (e.g., "0 9 * * *" for daily at 9 AM) OR an ISO 8601 DateTime string (e.g., "2025-02-03T14:30:00Z" or "2025-02-03T14:30:00+02:00") for one-time future execution (interpreted as UTC)
-        - run_once: If true, job will only execute once even with a cron schedule (sets max_executions=1)
-        - max_executions: Maximum number of times the job can execute (overrides run_once if set)
-        - expires_at: ISO 8601 DateTime string for when the job should expire/be disabled (separate from schedule time, interpreted as UTC)
-        
-        Examples:
-        - Recurring daily: addJob(name="daily-check", prompt="Check status", schedule="0 9 * * *")
-        - One-time future: addJob(name="reminder", prompt="Remind me", schedule="2025-02-03T14:30:00Z")
-        - Recurring but only once: addJob(name="one-time", prompt="Run once", schedule="0 9 * * *", run_once=true)
-        - One-time with expiration: addJob(name="temp-job", prompt="Do task", schedule="2025-02-03T14:30:00Z", expires_at="2025-02-04T00:00:00Z")""",
-        addJob(name::Union{Nothing,String}, prompt::String, schedule::String, enabled::Bool=true, run_once::Bool=false, max_executions::Union{Nothing,Int}=nothing, expires_at::Union{Nothing,String}=nothing) = begin
-            job_name = normalize_text(name)
-            job_name === nothing && (job_name = string(UUIDs.uuid4()))
-            # Parse expires_at if provided
-            expires_at_dt = nothing
-            if expires_at !== nothing && !isempty(strip(expires_at))
-                try
-                    expires_at_dt = parse_iso8601_utc(expires_at)
-                catch e
-                    throw(ArgumentError("Invalid expires_at format. Use ISO 8601 (e.g., '2026-02-02T20:00:00Z' or '2026-02-02T20:00:00+02:00'): $(sprint(showerror, e))"))
-                end
-            end
-            job = addJob!(assistant, job_name, prompt, schedule; enabled=enabled, run_once=run_once, max_executions=max_executions, expires_at=expires_at_dt)
-            return JSON.json(job_summary(job))
-        end,
-    )
-    removeJob_tool = @tool(
-        "Remove a scheduled job (prompt) by name.",
-        removeJob(name::String) = begin
-            removed = removeJob!(assistant, name)
-            return string(removed)
-        end,
-    )
     getToolsGuide_tool = @tool(
         "Get the current tool usage guide (best practices and patterns for using tools effectively).",
         getToolsGuide() = begin
@@ -858,7 +722,7 @@ function build_tools(assistant::AgentAssistant)
         sendMessage(content::String, channel::Union{Nothing, String}=nothing) = begin
             # Write to the assistant's output stream
             println(assistant.output, "\n[Vo] ", content)
-            # Log to history as a proactive message
+            # Log as a proactive message
             @info "[vo] Proactive message sent" channel content_length=length(content)
             return "sent"
         end,
@@ -890,12 +754,6 @@ function build_tools(assistant::AgentAssistant)
         "Reload Vo's configuration from disk. Refreshes identity, user profile, bootstrap, tools guide, and heartbeat tasks from their files. Use after manual edits to workspace files.",
         reloadConfig() = begin
             store = assistant.store
-            if store isa FileStore
-                # Re-read all workspace files from disk
-                lock(store.lock) do
-                    store.history_indexed = false  # Force re-index on next access
-                end
-            end
             # Refresh skill registry
             registry = get_skills_registry(store)
             return "reloaded"
@@ -921,20 +779,16 @@ function build_tools(assistant::AgentAssistant)
         addNewMemory_tool,
         searchMemories_tool,
         forgetMemory_tool,
-        getHistoryAtIndex_tool,
-        searchHistory_tool,
+        search_session_tool,
         getSkills_tool,
         addNewSkill_tool,
         forgetSkill_tool,
-        listJobs_tool,
-        addJob_tool,
-        removeJob_tool,
     ]
+    include_scheduler && append!(tools, build_scheduler_tools(assistant))
     append!(tools, LLMTools.create_long_running_process_tool(assistant.config.base_dir))
     append!(tools, LLMTools.web_tools())  # web_fetch and web_search
     append!(tools, LLMTools.qmd_tools(assistant.config.base_dir))  # qmd_index and qmd_search for semantic search
     registry = get_skills_registry(assistant.store)
     !isempty(registry.skills) && push!(tools, Agentif.create_skill_loader_tool(registry))
-    push!(tools, LLMTools.create_subagent_tool(assistant))
     return tools
 end
