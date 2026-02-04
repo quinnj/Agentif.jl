@@ -2,12 +2,8 @@ using HTTP
 using JSON
 using UUIDs
 
-# SSEEvent compatibility - HTTP 1.10+ removed direct SSE export
-# Define minimal struct for callback compatibility
-struct SSEEvent
-    data::Vector{UInt8}
-end
-Base.String(e::SSEEvent) = String(e.data)
+# HTTP.jl provides HTTP.SSE.SSEEvent with data::String field
+# SSE callbacks receive (event) — HTTP.jl's wrap_callback handles the stream argument
 
 toolcall_debug_enabled() = get(ENV, "AGENTIF_DEBUG_TOOLCALLS", "") != ""
 
@@ -464,7 +460,7 @@ function openai_codex_event_callback(
         return f(MessageUpdateEvent(:assistant, assistant_message, :text, delta, item_id))
     end
 
-    return function (http_stream, event::SSEEvent)
+    return function (event)
         data = String(event.data)
         strip_data = strip(data)
         isempty(strip_data) && return
@@ -878,7 +874,7 @@ function openai_completions_event_callback(
         latest_finish::Base.RefValue{Union{Nothing, String}},
         tool_call_accumulators::Dict{Int, ToolCallAccumulator},
     )
-    return function (http_stream, event::SSEEvent)
+    return function (event)
         data = String(event.data)
         if toolcall_debug_enabled() && (occursin("tool_call", data) || occursin("tool_calls", data))
             toolcall_debug("openai-completions sse raw tool chunk"; preview = toolcall_preview(data, limit = 500))
@@ -1226,7 +1222,7 @@ function anthropic_event_callback(
         tool_name_reverse_map::Dict{String, String},
     )
     stop_on_tool_call = get(ENV, "AGENTIF_STOP_ON_TOOL_CALL", "") != ""
-    return function (http_stream, event::SSEEvent)
+    return function (event)
         local parsed
         try
             parsed = JSON.parse(String(event.data), AnthropicMessages.StreamEvent)
@@ -1525,7 +1521,7 @@ function google_generative_event_callback(
         latest_finish::Base.RefValue{Union{Nothing, String}},
         seen_call_ids::Set{String},
     )
-    return function (http_stream, event::SSEEvent)
+    return function (event)
         data = String(event.data)
         if data == "[DONE]"
             if started[] && !ended[]
@@ -1790,7 +1786,7 @@ function google_gemini_cli_event_callback(
         seen_call_ids::Set{String},
         debug_stream::Bool,
     )
-    return function (http_stream, event::SSEEvent)
+    return function (event)
         data = String(event.data)
         debug_stream && @info "gemini-cli stream event" length = length(data)
         if data == "[DONE]"

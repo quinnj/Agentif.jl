@@ -554,14 +554,100 @@ function listJobs(scheduler::Tempus.Scheduler)
     return jobs
 end
 
-function addJob!(assistant, job_name, prompt, schedule; enabled::Bool=true)
+"""
+Convert a DateTime to a cron expression that matches that specific time.
+Cron format: second minute hour day month day_of_week
+"""
+function datetime_to_cron(dt::DateTime)
+    second = Dates.second(dt)
+    minute = Dates.minute(dt)
+    hour = Dates.hour(dt)
+    day = Dates.day(dt)
+    month = Dates.month(dt)
+    # day_of_week = * (matches any day)
+    return "$second $minute $hour $day $month *"
+end
+
+"""
+Parse an ISO 8601 DateTime string and return a UTC DateTime.
+Accepts "Z" or timezone offsets like "+02:00" or "-0500".
+If no timezone is provided, the value is interpreted as UTC.
+"""
+function parse_iso8601_utc(s::AbstractString)
+    s_str = String(strip(s))
+    isempty(s_str) && throw(ArgumentError("DateTime string cannot be empty"))
+    m = match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)(Z|[+-]\d{2}:?\d{2})?$", s_str)
+    m === nothing && throw(ArgumentError("Invalid DateTime format: $(s_str). Use ISO 8601 format (e.g., '2026-02-02T20:00:00Z' or '2026-02-02T20:00:00+02:00')."))
+    base = m.captures[1]
+    tz = m.captures[2]
+    dt = Dates.DateTime(base)
+    if tz === nothing || tz == "" || tz == "Z"
+        return dt
+    end
+    sign = tz[1] == '-' ? -1 : 1
+    if occursin(':', tz)
+        hours = parse(Int, tz[2:3])
+        minutes = parse(Int, tz[5:6])
+    else
+        hours = parse(Int, tz[2:3])
+        minutes = parse(Int, tz[4:5])
+    end
+    (0 <= hours <= 23 && 0 <= minutes <= 59) || throw(ArgumentError("Invalid timezone offset in DateTime: $(s_str)."))
+    offset = Dates.Hour(hours) + Dates.Minute(minutes)
+    return dt - sign * offset
+end
+
+function addJob!(assistant, job_name, prompt, schedule; enabled::Bool=true, expires_at::Union{Nothing, DateTime}=nothing, max_executions::Union{Nothing, Int}=nothing, run_once::Bool=false)
     isempty(strip(prompt)) && throw(ArgumentError("prompt cannot be empty"))
-    isempty(strip(schedule)) && throw(ArgumentError("schedule cannot be empty"))
-    job = Tempus.Job(() -> begin
-        a = get_current_assistant()
-        a === nothing && return nothing  # Assistant was closed
-        Agentif.evaluate(a, prompt)
-    end, job_name, schedule)
+    schedule_str = String(strip(schedule))
+    isempty(schedule_str) && throw(ArgumentError("schedule cannot be empty"))
+    cron_schedule = nothing
+    schedule_dt = nothing
+    now_utc = Dates.now(Dates.UTC)
+    # Check if schedule is a DateTime string or cron expression
+    if occursin('T', schedule_str)
+        # Schedule is a DateTime - parse it and convert to cron
+        try
+            schedule_dt = parse_iso8601_utc(schedule_str)
+        catch e
+            throw(ArgumentError("Invalid schedule DateTime format: $(schedule_str). Use ISO 8601 (e.g., '2026-02-02T20:00:00Z' or '2026-02-02T20:00:00+02:00'): $(sprint(showerror, e))"))
+        end
+        schedule_dt <= now_utc && throw(ArgumentError("schedule must be in the future (UTC); got $(schedule_str)"))
+        cron_schedule = datetime_to_cron(schedule_dt)
+        # For DateTime schedules, automatically set max_executions=1 (one-time)
+        if max_executions === nothing
+            max_executions = 1
+        end
+    else
+        # Schedule is a cron expression
+        cron_schedule = schedule_str
+        # If run_once is true, set max_executions=1
+        if run_once && max_executions === nothing
+            max_executions = 1
+        end
+    end
+    # Validate expires_at is in the future if provided
+    if expires_at !== nothing && expires_at <= now_utc
+        throw(ArgumentError("expires_at must be in the future"))
+    end
+    if schedule_dt !== nothing && expires_at !== nothing && expires_at <= schedule_dt
+        throw(ArgumentError("expires_at must be after the scheduled execution time"))
+    end
+    # If schedule_dt was provided and expires_at wasn't, set expires_at slightly after execution
+    if schedule_dt !== nothing && expires_at === nothing
+        expires_at = schedule_dt + Dates.Minute(5)
+    end
+    job = Tempus.Job(
+        () -> begin
+            a = get_current_assistant()
+            a === nothing && return nothing  # Assistant was closed
+            Agentif.evaluate(a, prompt)
+        end,
+        job_name,
+        cron_schedule;
+        max_executions=max_executions,
+        expires_at=expires_at
+    )
     push!(assistant.scheduler, job)
     enabled || Tempus.disableJob!(assistant.scheduler.store, job)
     return job
@@ -718,11 +804,32 @@ function build_tools(assistant::AgentAssistant)
         end,
     )
     addJob_tool = @tool(
-        "Add a scheduled job that evaluates a prompt on a cron schedule.",
-        addJob(name::Union{Nothing,String}, prompt::String, schedule::String, enabled::Bool=true) = begin
+        """Add a scheduled job that evaluates a prompt. Supports both recurring cron schedules and one-time executions.
+
+        Parameters:
+        - schedule: Either a cron expression (e.g., "0 9 * * *" for daily at 9 AM) OR an ISO 8601 DateTime string (e.g., "2025-02-03T14:30:00Z" or "2025-02-03T14:30:00+02:00") for one-time future execution (interpreted as UTC)
+        - run_once: If true, job will only execute once even with a cron schedule (sets max_executions=1)
+        - max_executions: Maximum number of times the job can execute (overrides run_once if set)
+        - expires_at: ISO 8601 DateTime string for when the job should expire/be disabled (separate from schedule time, interpreted as UTC)
+        
+        Examples:
+        - Recurring daily: addJob(name="daily-check", prompt="Check status", schedule="0 9 * * *")
+        - One-time future: addJob(name="reminder", prompt="Remind me", schedule="2025-02-03T14:30:00Z")
+        - Recurring but only once: addJob(name="one-time", prompt="Run once", schedule="0 9 * * *", run_once=true)
+        - One-time with expiration: addJob(name="temp-job", prompt="Do task", schedule="2025-02-03T14:30:00Z", expires_at="2025-02-04T00:00:00Z")""",
+        addJob(name::Union{Nothing,String}, prompt::String, schedule::String, enabled::Bool=true, run_once::Bool=false, max_executions::Union{Nothing,Int}=nothing, expires_at::Union{Nothing,String}=nothing) = begin
             job_name = normalize_text(name)
             job_name === nothing && (job_name = string(UUIDs.uuid4()))
-            job = addJob!(assistant, job_name, prompt, schedule; enabled=enabled)
+            # Parse expires_at if provided
+            expires_at_dt = nothing
+            if expires_at !== nothing && !isempty(strip(expires_at))
+                try
+                    expires_at_dt = parse_iso8601_utc(expires_at)
+                catch e
+                    throw(ArgumentError("Invalid expires_at format. Use ISO 8601 (e.g., '2026-02-02T20:00:00Z' or '2026-02-02T20:00:00+02:00'): $(sprint(showerror, e))"))
+                end
+            end
+            job = addJob!(assistant, job_name, prompt, schedule; enabled=enabled, run_once=run_once, max_executions=max_executions, expires_at=expires_at_dt)
             return JSON.json(job_summary(job))
         end,
     )

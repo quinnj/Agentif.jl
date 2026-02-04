@@ -22,6 +22,7 @@ JSON = {path = "../../JSON"}
 JSONSchema = {path = "../../JSONSchema"}
 PtySessions = {path = "../../PtySessions"}
 Encid = {path = "../../Encid"}
+HTTP = {path = "~/.julia/packages/HTTP/na214"}
 
 [compat]
 Encid = "1.0.0"

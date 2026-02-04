@@ -26,6 +26,7 @@ export getHistoryAtIndex, appendHistory, searchHistory
 export SkillMetadata, getSkills, addNewSkill, forgetSkill
 export listJobs, addJob!, removeJob!
 export enable_markdown_rendering, disable_markdown_rendering
+export run_telegram_bot
 
 const TRIGGER_PROMPT = ScopedValue{Union{String, Nothing}}(nothing)
 const DEFAULT_IDENTITY = read(joinpath(@__DIR__, "soul_template.md"), String)
@@ -504,10 +505,9 @@ end
 function build_scheduler(store::AbstractAssistantStore)
     if store isa FileStore
         path = joinpath(store.root, SCHEDULER_STORE_FILENAME)
-        isfile(path) && rm(path; force = true)
-        return Tempus.Scheduler(Tempus.FileStore(path))
+        return Tempus.Scheduler(Tempus.FileStore(path); logging=false)
     end
-    return Tempus.Scheduler(Tempus.InMemoryStore())
+    return Tempus.Scheduler(Tempus.InMemoryStore(); logging=false)
 end
 
 function AgentAssistant(;
@@ -785,7 +785,19 @@ function build_prompt(assistant::AgentAssistant; trigger_prompt::Union{Nothing, 
     relevant_memories = get_relevant_memories(assistant, history_entries)
 
     io = IOBuffer()
-    print(io, "You are Vo.\n\n## Identity & Purpose\n")
+    local_time = Dates.now()
+    offset_minutes = local_utc_offset_minutes(local_time)
+    offset_str = format_utc_offset(offset_minutes)
+    utc_time = Dates.now(Dates.UTC)
+    local_time_str = Dates.format(local_time, "yyyy-mm-dd HH:MM:SS")
+    utc_time_str = Dates.format(utc_time, "yyyy-mm-dd HH:MM:SS")
+    local_day = Dates.dayname(local_time)
+    utc_day = Dates.dayname(utc_time)
+
+    print(io, "You are Vo.\n\n## Current Date & Time\n")
+    print(io, "Local time: ", local_time_str, " (", local_day, ", UTC", offset_str, ").\n")
+    print(io, "UTC time: ", utc_time_str, " (", utc_day, ").\n\n")
+    print(io, "## Identity & Purpose\n")
     print(io, identity, "\n")
 
     # Check for active personality mode overlay
@@ -886,7 +898,6 @@ function build_error_state(input::String, error_text::String)
 end
 
 function Agentif.get_agent(assistant::AgentAssistant)
-    ensure_initialized!(assistant)
     prompt = build_prompt(assistant)
     tools = build_tools(assistant)
     tool_names = available_tool_names(tools)
@@ -1147,6 +1158,16 @@ end
 
 # include("vo_repl_mode.jl")
 
+"""
+    run_telegram_bot(; use_polling=true, kwargs...)
+
+Start a Telegram bot that forwards messages to the current Vo `AgentAssistant`
+and streams responses back. Requires `using Telegram` to activate the extension.
+
+See `VoTelegramExt` for implementation details.
+"""
+function run_telegram_bot end
+
 function is_test_mode()
     # Check environment variable for explicit skip
     Base.get(ENV, "VO_SKIP_INIT", "") == "1" && return true
@@ -1162,6 +1183,12 @@ end
 
 function __init__()
     is_test_mode() && return
+    Base.get(ENV, "VO_AUTO_RUN", "") == "1" || return
+    init!()
+    return
+end
+
+function init!()
     agent = AgentAssistant()
     CURRENT_ASSISTANT[] = agent
     run!(agent)

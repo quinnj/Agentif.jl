@@ -10,7 +10,7 @@ function openai_responses_event_callback(
         response_usage::Base.RefValue{Union{Nothing, OpenAIResponses.Usage}},
         response_status::Base.RefValue{Union{Nothing, String}},
     )
-    return function (http_stream, event::SSEEvent)
+    return function (event)
         local parsed
         try
             parsed = JSON.parse(String(event.data), OpenAIResponses.StreamEvent)

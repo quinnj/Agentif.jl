@@ -11,7 +11,7 @@ parameters(::AgentTool{F, T}) where {F, T} = T
 @kwarg mutable struct PendingToolCall
     const call_id::String
     const name::String
-    const arguments::String
+    arguments::String
     approved::Union{Nothing, Bool} = nothing
     rejected_reason::Union{Nothing, String} = nothing
 end
