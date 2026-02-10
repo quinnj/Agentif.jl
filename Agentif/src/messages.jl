@@ -58,9 +58,16 @@ end
     is_error::Bool
 end
 
+@kwarg struct CompactionSummaryMessage <: AgentMessage
+    summary::String
+    tokens_before::Int
+    compacted_at::Float64
+end
+
 const AGENT_MESSAGE_TYPE_USER = "user"
 const AGENT_MESSAGE_TYPE_ASSISTANT = "assistant"
 const AGENT_MESSAGE_TYPE_TOOL_RESULT = "tool_result"
+const AGENT_MESSAGE_TYPE_COMPACTION_SUMMARY = "compaction_summary"
 
 TextContent(text::String) = TextContent(; text)
 ThinkingContent(thinking::String) = ThinkingContent(; thinking)
@@ -90,6 +97,7 @@ end
 message_text(msg::UserMessage) = content_text(msg.content)
 message_text(msg::AssistantMessage) = content_text(msg.content)
 message_text(msg::ToolResultMessage) = content_text(msg.content)
+message_text(msg::CompactionSummaryMessage) = msg.summary
 
 message_thinking(msg::AssistantMessage) = content_thinking(msg.content)
 
@@ -172,6 +180,12 @@ JSON.lower(x::ToolResultMessage) = (;
     content = x.content,
     is_error = x.is_error,
 )
+JSON.lower(x::CompactionSummaryMessage) = (;
+    type = AGENT_MESSAGE_TYPE_COMPACTION_SUMMARY,
+    summary = x.summary,
+    tokens_before = x.tokens_before,
+    compacted_at = x.compacted_at,
+)
 
 JSON.@choosetype ContentBlock x -> begin
     block_type = x.type[]
@@ -195,6 +209,8 @@ JSON.@choosetype AgentMessage x -> begin
         return AssistantMessage
     elseif msg_type == AGENT_MESSAGE_TYPE_TOOL_RESULT
         return ToolResultMessage
+    elseif msg_type == AGENT_MESSAGE_TYPE_COMPACTION_SUMMARY
+        return CompactionSummaryMessage
     end
     throw(ArgumentError("Unknown agent message type: $(msg_type)"))
 end
@@ -245,6 +261,7 @@ end
     pending_tool_calls::Vector{PendingToolCall} = PendingToolCall[]
     most_recent_stop_reason::Union{Nothing, Symbol} = nothing
     session_id::Union{Nothing, String} = nothing
+    last_compaction::Union{Nothing, CompactionSummaryMessage} = nothing
 end
 
 function set!(dest::AgentState, source::AgentState)
@@ -254,5 +271,6 @@ function set!(dest::AgentState, source::AgentState)
     dest.pending_tool_calls = source.pending_tool_calls
     dest.most_recent_stop_reason = source.most_recent_stop_reason
     dest.session_id = source.session_id
+    dest.last_compaction = source.last_compaction
     return
 end

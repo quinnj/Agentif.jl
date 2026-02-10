@@ -226,6 +226,8 @@ function codex_input_from_message(msg::AgentMessage)
                 "output" => output,
             ),
         ]
+    elseif msg isa CompactionSummaryMessage
+        return Any[Dict("role" => "user", "content" => [Dict("type" => "input_text", "text" => "[Previous conversation summary]\n\n$(msg.summary)")])]
     end
     return Any[]
 end

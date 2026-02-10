@@ -174,6 +174,8 @@ function anthropic_message_from_agent(msg::AgentMessage, tool_name_map::Dict{Str
     elseif msg isa ToolResultMessage
         block = anthropic_tool_result_block(msg)
         return AnthropicMessages.Message(; role = "user", content = AnthropicMessages.ContentBlock[block])
+    elseif msg isa CompactionSummaryMessage
+        return AnthropicMessages.Message(; role = "user", content = "[Previous conversation summary]\n\n$(msg.summary)")
     end
     throw(ArgumentError("unsupported message: $(typeof(msg))"))
 end

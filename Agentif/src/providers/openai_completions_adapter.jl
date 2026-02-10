@@ -72,6 +72,63 @@ function openai_completions_supports_reasoning_effort(model::Model)
     return compat.supportsReasoningEffort
 end
 
+function openai_completions_use_reasoning_split(model::Model)
+    base_url = model.baseUrl
+    return model.provider == "minimax" || occursin("minimax.io", base_url) || occursin("minimaxi.com", base_url)
+end
+
+function openai_completions_reasoning_details_from_signature(signature::Union{Nothing, String})
+    signature === nothing && return nothing
+    isempty(signature) && return nothing
+    parsed = try
+        JSON.parse(signature)
+    catch
+        nothing
+    end
+    return parsed isa AbstractVector ? parsed : nothing
+end
+
+function openai_completions_reasoning_details_from_blocks(blocks::Vector{ThinkingContent})
+    signature = blocks[1].thinkingSignature
+    parsed = openai_completions_reasoning_details_from_signature(signature)
+    parsed !== nothing && return parsed
+    text = join((b.thinking for b in blocks), "\n\n")
+    return [Dict("text" => text)]
+end
+
+function openai_completions_reasoning_text(details)
+    if details isa AbstractVector
+        parts = String[]
+        for item in details
+            if item isa AbstractDict
+                text = get(item, "text", nothing)
+                text isa AbstractString && push!(parts, String(text))
+            elseif item isa AbstractString
+                push!(parts, String(item))
+            end
+        end
+        return join(parts, "")
+    elseif details isa AbstractDict
+        text = get(details, "text", nothing)
+        return text isa AbstractString ? String(text) : ""
+    end
+    return ""
+end
+
+function openai_completions_append_thinking_with_details!(assistant_message::AssistantMessage, details)
+    text = openai_completions_reasoning_text(details)
+    isempty(text) && return
+    signature = JSON.json(details)
+    if isempty(assistant_message.content) || !(assistant_message.content[end] isa ThinkingContent)
+        push!(assistant_message.content, ThinkingContent(; thinking = text, thinkingSignature = signature))
+    else
+        block = assistant_message.content[end]
+        block.thinking *= text
+        block.thinkingSignature = signature
+    end
+    return
+end
+
 function openai_completions_build_tools(tools::Vector{AgentTool}; force_empty::Bool = false)
     isempty(tools) && return force_empty ? OpenAICompletions.Tool[] : nothing
     provider_tools = OpenAICompletions.Tool[]
@@ -148,7 +205,12 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             push!(messages, OpenAICompletions.Message(; role = "assistant", content = "I have processed the tool results."))
         end
 
-        if msg isa UserMessage
+        if msg isa CompactionSummaryMessage
+            push!(messages, OpenAICompletions.Message(; role = "user", content = "[Previous conversation summary]\n\n$(msg.summary)"))
+            last_role = "user"
+            i += 1
+            continue
+        elseif msg isa UserMessage
             parts = OpenAICompletions.ContentPart[]
             for block in msg.content
                 if block isa TextContent
@@ -192,21 +254,25 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             end
 
             non_empty_thinking = [b for b in thinking_blocks if !isempty(strip(b.thinking))]
-            if !isempty(non_empty_thinking) && compat.requiresThinkingAsText
-                thinking_text = join((b.thinking for b in non_empty_thinking), "\n\n")
-                if assistant_msg.content === nothing || assistant_msg.content === ""
-                    assistant_msg.content = OpenAICompletions.ContentPart[OpenAICompletions.ContentPart(; type = "text", text = thinking_text)]
-                elseif assistant_msg.content isa String
-                    assistant_msg.content = thinking_text * assistant_msg.content
+            if !isempty(non_empty_thinking)
+                if openai_completions_use_reasoning_split(model)
+                    assistant_msg.reasoning_details = openai_completions_reasoning_details_from_blocks(non_empty_thinking)
+                elseif compat.requiresThinkingAsText
+                    thinking_text = join((b.thinking for b in non_empty_thinking), "\n\n")
+                    if assistant_msg.content === nothing || assistant_msg.content === ""
+                        assistant_msg.content = OpenAICompletions.ContentPart[OpenAICompletions.ContentPart(; type = "text", text = thinking_text)]
+                    elseif assistant_msg.content isa String
+                        assistant_msg.content = thinking_text * assistant_msg.content
+                    else
+                        pushfirst!(assistant_msg.content, OpenAICompletions.ContentPart(; type = "text", text = thinking_text))
+                    end
                 else
-                    pushfirst!(assistant_msg.content, OpenAICompletions.ContentPart(; type = "text", text = thinking_text))
-                end
-            elseif !isempty(non_empty_thinking)
-                signature = non_empty_thinking[1].thinkingSignature
-                if signature !== nothing && !isempty(signature)
-                    extra = assistant_msg.extra === nothing ? Dict{String, Any}() : assistant_msg.extra
-                    extra[signature] = join((b.thinking for b in non_empty_thinking), "\n")
-                    assistant_msg.extra = extra
+                    signature = non_empty_thinking[1].thinkingSignature
+                    if signature !== nothing && !isempty(signature)
+                        extra = assistant_msg.extra === nothing ? Dict{String, Any}() : assistant_msg.extra
+                        extra[signature] = join((b.thinking for b in non_empty_thinking), "\n")
+                        assistant_msg.extra = extra
+                    end
                 end
             end
 
@@ -326,6 +392,9 @@ function openai_completions_event_callback(
         tool_call_accumulators::Dict{Int, ToolCallAccumulator},
         abort::Abort,
     )
+    reasoning_buffer = ""
+    leading_whitespace = ""
+    saw_text = false
     return function (stream, event)
         maybe_abort!(abort, stream)
         data = String(event.data)
@@ -354,13 +423,71 @@ function openai_completions_event_callback(
         isempty(chunk.choices) && return
         choice = chunk.choices[1]
         delta = choice.delta
-        if delta.content !== nothing
+        if delta.content !== nothing && !isempty(delta.content)
+            content_str = delta.content
+            if all(isspace, content_str)
+                if !saw_text
+                    leading_whitespace *= content_str
+                    return
+                end
+            else
+                if !isempty(leading_whitespace)
+                    if !started[]
+                        started[] = true
+                        f(MessageStartEvent(:assistant, assistant_message))
+                    end
+                    append_text!(assistant_message, leading_whitespace)
+                    f(MessageUpdateEvent(:assistant, assistant_message, :text, leading_whitespace, nothing))
+                    leading_whitespace = ""
+                    saw_text = true
+                end
+            end
             if !started[]
                 started[] = true
                 f(MessageStartEvent(:assistant, assistant_message))
             end
-            append_text!(assistant_message, delta.content)
-            f(MessageUpdateEvent(:assistant, assistant_message, :text, delta.content, nothing))
+            append_text!(assistant_message, content_str)
+            f(MessageUpdateEvent(:assistant, assistant_message, :text, content_str, nothing))
+            saw_text = true
+        end
+        if delta.reasoning_details !== nothing
+            if !started[]
+                started[] = true
+                f(MessageStartEvent(:assistant, assistant_message))
+            end
+            details = delta.reasoning_details
+            details_vec = details isa AbstractVector ? details : Any[details]
+            new_text_parts = String[]
+            for detail in details_vec
+                detail isa AbstractDict || continue
+                text = get(detail, "text", nothing)
+                text isa AbstractString || continue
+                text_str = String(text)
+                if startswith(text_str, reasoning_buffer)
+                    if isempty(reasoning_buffer)
+                        push!(new_text_parts, text_str)
+                    else
+                        start_idx = lastindex(reasoning_buffer) + 1
+                        start_idx <= lastindex(text_str) && push!(new_text_parts, text_str[start_idx:end])
+                    end
+                else
+                    push!(new_text_parts, text_str)
+                end
+                reasoning_buffer = text_str
+            end
+            new_text = join(new_text_parts, "")
+            if !isempty(new_text)
+                if isempty(assistant_message.content) || !(assistant_message.content[end] isa ThinkingContent)
+                    push!(assistant_message.content, ThinkingContent(; thinking = new_text, thinkingSignature = JSON.json(details_vec)))
+                else
+                    block = assistant_message.content[end]
+                    block.thinking *= new_text
+                    block.thinkingSignature = JSON.json(details_vec)
+                end
+                f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, new_text, nothing))
+            elseif !isempty(assistant_message.content) && assistant_message.content[end] isa ThinkingContent
+                assistant_message.content[end].thinkingSignature = JSON.json(details_vec)
+            end
         end
         for field in (:reasoning_content, :reasoning, :reasoning_text)
             value = getfield(delta, field)

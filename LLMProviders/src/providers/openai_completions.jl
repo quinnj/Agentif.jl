@@ -108,6 +108,7 @@ end
     reasoning_content::Union{Nothing, String} = nothing
     reasoning::Union{Nothing, String} = nothing
     reasoning_text::Union{Nothing, String} = nothing
+    reasoning_details::Union{Nothing, Any} = nothing
     tool_calls::Union{Nothing, Vector{StreamToolCallDelta}} = nothing
     name::Union{Nothing, String} = nothing
     audio_content::Union{Nothing, String} = nothing
@@ -149,6 +150,7 @@ end
     stream_options::Union{Nothing, Any} = nothing
     reasoning_effort::Union{Nothing, String} = nothing
     thinking::Union{Nothing, Any} = nothing
+    reasoning_split::Union{Nothing, Bool} = nothing
     max_tokens::Union{Nothing, Int} = nothing
     max_completion_tokens::Union{Nothing, Int} = nothing
     temperature::Union{Nothing, Float64} = nothing

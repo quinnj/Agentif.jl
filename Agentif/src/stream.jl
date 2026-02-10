@@ -80,7 +80,9 @@ function transform_messages(messages::Vector{AgentMessage}, model::Model; normal
     tool_call_id_map = Dict{String, String}()
     transformed = AgentMessage[]
     for msg in messages
-        if msg isa UserMessage
+        if msg isa CompactionSummaryMessage
+            push!(transformed, msg)
+        elseif msg isa UserMessage
             push!(transformed, msg)
         elseif msg isa ToolResultMessage
             call_id = get(() -> msg.call_id, tool_call_id_map, msg.call_id)
@@ -334,6 +336,15 @@ function stream(
             thinking_type = reasoning_effort_value === nothing ? "disabled" : "enabled"
             stream_kw = merge(stream_kw, (; thinking = Dict("type" => thinking_type)))
         end
+        if openai_completions_use_reasoning_split(model)
+            if haskey(stream_kw, :reasoningSplit) && !haskey(stream_kw, :reasoning_split)
+                reasoning_split_value = stream_kw[:reasoningSplit]
+                stream_kw = merge(Base.structdiff(stream_kw, (; reasoningSplit = nothing)), (; reasoning_split = reasoning_split_value))
+            end
+            if !haskey(stream_kw, :reasoning_split)
+                stream_kw = merge(stream_kw, (; reasoning_split = true))
+            end
+        end
 
         max_tokens_value = nothing
         if haskey(stream_kw, :maxTokens)
@@ -450,6 +461,9 @@ function stream(
                 push!(reasoning_parts, value)
             end
             isempty(reasoning_parts) || append_thinking!(assistant_message, join(reasoning_parts, "\n\n"))
+            if choice.message.reasoning_details !== nothing
+                openai_completions_append_thinking_with_details!(assistant_message, choice.message.reasoning_details)
+            end
             text = message_text(assistant_message)
             if !isempty(text)
                 f(MessageStartEvent(:assistant, assistant_message))

@@ -18,13 +18,18 @@ include("agent.jl")
 include("session.jl")
 include("input_guardrail.jl")
 include("stream.jl")
+include("compaction.jl")
+include("channels.jl")
 include("middleware.jl")
 
 # Exports
 export Agent, Abort, abort!, isaborted, AgentHandler, AgentMiddleware
 export evaluate, stream, build_default_handler
-export steer_middleware, tool_call_middleware, queue_middleware, session_middleware
-export input_guardrail_middleware, skills_middleware
+export steer_middleware, tool_call_middleware, queue_middleware, evaluate_middleware, session_middleware
+export input_guardrail_middleware, skills_middleware, compaction_middleware, channel_middleware
+export AbstractChannel, CURRENT_CHANNEL
+export start_streaming, append_to_stream, finish_streaming, send_message, close_channel
+export CompactionConfig, CompactionSummaryMessage, compact!
 export with_prompt, with_tools
 export CURRENT_EVALUATION_ID, CURRENT_TURN_ID
 export Model, getModel, getProviders, getModels, calculateCost
@@ -37,7 +42,7 @@ export AgentEvaluateStartEvent, AgentEvaluateEndEvent, AgentErrorEvent
 export TurnStartEvent, TurnEndEvent
 export MessageStartEvent, MessageUpdateEvent, MessageEndEvent
 export ToolCallRequestEvent, ToolExecutionStartEvent, ToolExecutionEndEvent
-export AgentMessage, UserMessage, AssistantMessage, AgentToolCall, ToolResultMessage
+export AgentMessage, UserMessage, AssistantMessage, AgentToolCall, ToolResultMessage, CompactionSummaryMessage
 export message_text, message_thinking
 export AgentState, Usage
 export SessionStore, InMemorySessionStore, FileSessionStore

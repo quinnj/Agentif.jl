@@ -4,58 +4,40 @@ using Agentif
 using LLMTools
 using Dates
 using JSON
+using LocalSearch
 using Logging
-using Qmd
+using SHA
+using SQLite
 using Tempus
 using UUIDs
 using ScopedValues
 
-export AbstractAssistantStore, FileStore, InMemoryStore
 export AgentAssistant, AssistantConfig
 export search_session
 export AssistantMessage, UserMessage
 export run!, evaluate, @a_str
 export getIdentityAndPurpose, setIdentityAndPurpose!
-export getUserProfile, setUserProfile!
-export getBootstrap, setBootstrap!
 export getHeartbeatTasks, setHeartbeatTasks!, trigger_event_heartbeat!
-export getToolsGuide, setToolsGuide!
 export addNewMemory, searchMemories, forgetMemory
 export SkillMetadata, getSkills, addNewSkill, forgetSkill
 export listJobs, addJob!, removeJob!
+export ReplChannel
 export run_telegram_bot
 
 const TRIGGER_PROMPT = ScopedValue{Union{String, Nothing}}(nothing)
 const DEFAULT_IDENTITY = read(joinpath(@__DIR__, "soul_template.md"), String)
-const DEFAULT_USER_PROFILE = read(joinpath(@__DIR__, "user_template.md"), String)
-const DEFAULT_BOOTSTRAP = read(joinpath(@__DIR__, "bootstrap_template.md"), String)
-const DEFAULT_TOOLS_GUIDE = read(joinpath(@__DIR__, "tools_template.md"), String)
 const DEFAULT_SESSION_CONTEXT_LIMIT = 10
 const DEFAULT_MEMORY_CONTEXT_LIMIT = 6
 const ENV_AGENT_PROVIDER = "VO_AGENT_PROVIDER"
 const ENV_AGENT_MODEL = "VO_AGENT_MODEL"
 const ENV_AGENT_API_KEY = "VO_AGENT_API_KEY"
-const IDENTITY_FILENAME = "identity.md"
-const USER_PROFILE_FILENAME = "user.md"
-const BOOTSTRAP_FILENAME = "bootstrap.md"
-const MODES_DIRNAME = "modes"
-const DEFAULT_MODES_DIR = joinpath(@__DIR__, "default_modes")
-const MEMORIES_FILENAME = "memories.jsonl"
-const SESSION_DIRNAME = "sessions"
-const SESSION_ID_FILENAME = "session_id"
-const SKILLS_DIRNAME = "skills"
-const SCHEDULER_STORE_FILENAME = "scheduler.bin"
 const HEARTBEAT_JOB_NAME = "heartbeat"
-const TOOLS_GUIDE_FILENAME = "tools.md"
-const HEARTBEAT_TASKS_FILENAME = "heartbeat.md"
 const DEFAULT_HEARTBEAT_TASKS = ""
 const HEARTBEAT_START_HOUR = 6
 const HEARTBEAT_END_HOUR = 23
 const HEARTBEAT_MINUTE = 0
 const DEFAULT_HEARTBEAT_INTERVAL_MINUTES = 30
-const DATABASE_FILENAME = "vo.sqlite"
-const QMD_COLLECTION_NAME = "vo_data"
-const QMD_COLLECTION_PATTERN = "**/*.{md,jsonl}"
+const SESSION_STALE_SECONDS = 3600  # 1 hour
 
 const SkillMetadata = Agentif.SkillMetadata
 
@@ -65,12 +47,11 @@ struct Memory
     eval_id::Union{Nothing, String}
 end
 
-struct PersonalityMode
-    name::String
-    content::String
-    chance::Float64       # 0.0-1.0, probability of activating when eligible
-    active_start::Int     # Hour (0-23), -1 = no constraint
-    active_end::Int       # Hour (0-23), -1 = no constraint
+const MEMORY_TIMESTAMP_FORMAT = dateformat"yyyy-mm-dd HH:MM:SS"
+
+function format_memory_timestamp(unix_time::Float64)
+    dt = Dates.unix2datetime(unix_time)
+    return string(Dates.format(dt, MEMORY_TIMESTAMP_FORMAT), "Z")
 end
 
 Base.@kwdef struct AssistantConfig
@@ -84,56 +65,140 @@ Base.@kwdef struct AssistantConfig
     heartbeat_interval_minutes::Int = DEFAULT_HEARTBEAT_INTERVAL_MINUTES
 end
 
-abstract type AbstractAssistantStore end
-mutable struct FileStore <: AbstractAssistantStore
-    root::String
-    lock::ReentrantLock
-    identity_path::String
-    user_profile_path::String
-    bootstrap_path::String
-    tools_guide_path::String
-    heartbeat_tasks_path::String
-    memories_path::String
-    session_id_path::String
-    sessions_dir::String
-    skills_dir::String
-    modes_dir::String
-end
-
-mutable struct InMemoryStore <: AbstractAssistantStore
-    lock::ReentrantLock
-    identity::String
-    user_profile::String
-    bootstrap::String
-    tools_guide::String
-    heartbeat_tasks::String
-    memories::Vector{Memory}
-    skills_dir::String
-    modes_dir::String
-    skills_registry::Agentif.SkillRegistry
-end
-
-# Global ref to the single assistant instance (Vo only runs one assistant at a time)
-# Job closures capture nothing - they just access this global ref at execution time
+# Global ref to the single assistant instance
 const CURRENT_ASSISTANT = Ref{Any}(nothing)
 
 function get_current_assistant()
     return CURRENT_ASSISTANT[]
 end
 
-mutable struct AgentAssistant{S <: AbstractAssistantStore, T <: IO}
-    store::S
-    session_store::Union{Nothing, Agentif.SessionStore}
-    session_id::Union{Nothing, String}
+# --- SQLite Schema ---
+
+function init_schema!(db::SQLite.DB)
+    SQLite.execute(db, "PRAGMA journal_mode=WAL")
+    SQLite.execute(db, "PRAGMA synchronous=NORMAL")
+    SQLite.execute(db, "PRAGMA foreign_keys=ON")
+    SQLite.execute(db, "PRAGMA busy_timeout=5000")
+
+    SQLite.execute(db, """
+        CREATE TABLE IF NOT EXISTS kv_store (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    SQLite.execute(db, """
+        CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            eval_id TEXT
+        )
+    """)
+    SQLite.execute(db, """
+        CREATE TABLE IF NOT EXISTS skills (
+            name TEXT PRIMARY KEY,
+            description TEXT NOT NULL,
+            content TEXT NOT NULL
+        )
+    """)
+    SQLite.execute(db, """
+        CREATE TABLE IF NOT EXISTS channel_sessions (
+            channel_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            last_activity REAL NOT NULL
+        )
+    """)
+    SQLite.execute(db, """
+        CREATE TABLE IF NOT EXISTS session_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            entry_id TEXT,
+            created_at REAL NOT NULL,
+            messages TEXT NOT NULL,
+            is_compaction INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    SQLite.execute(db, """
+        CREATE INDEX IF NOT EXISTS idx_session_entries_session
+        ON session_entries(session_id, id)
+    """)
+end
+
+# --- SQLiteSessionStore ---
+
+struct SQLiteSessionStore <: Agentif.SessionStore
+    db::SQLite.DB
+    search_store::Union{Nothing, LocalSearch.Store}
+end
+
+function Agentif.session_entry_count(store::SQLiteSessionStore, session_id::String)
+    row = SQLite.DBInterface.execute(store.db,
+        "SELECT COUNT(*) as n FROM session_entries WHERE session_id = ?", (session_id,))
+    r = iterate(row)
+    return r === nothing ? 0 : r[1].n
+end
+
+function Agentif.session_entries(store::SQLiteSessionStore, session_id::String; start::Int=1, limit::Int=typemax(Int))
+    offset = max(0, start - 1)
+    rows = SQLite.DBInterface.execute(store.db,
+        "SELECT entry_id, created_at, messages, is_compaction FROM session_entries WHERE session_id = ? ORDER BY id ASC LIMIT ? OFFSET ?",
+        (session_id, limit, offset))
+    entries = Agentif.SessionEntry[]
+    for row in rows
+        # Reconstruct SessionEntry JSON and parse via Agentif's JSON.@choosetype
+        entry_json = JSON.json(Dict(
+            "id" => row.entry_id === missing ? nothing : row.entry_id,
+            "created_at" => Float64(row.created_at),
+            "messages" => JSON.parse(row.messages),
+            "is_compaction" => row.is_compaction == 1,
+        ))
+        push!(entries, JSON.parse(entry_json, Agentif.SessionEntry))
+    end
+    return entries
+end
+
+function Agentif.load_session(store::SQLiteSessionStore, session_id::String)
+    entries = Agentif.session_entries(store, session_id)
+    state = Agentif.AgentState()
+    state.session_id = session_id
+    for entry in entries
+        Agentif.apply_session_entry!(state, entry)
+    end
+    return state
+end
+
+function Agentif.append_session_entry!(store::SQLiteSessionStore, session_id::String, entry::Agentif.SessionEntry)
+    messages_json = JSON.json(entry.messages)
+    SQLite.execute(store.db,
+        "INSERT INTO session_entries (session_id, entry_id, created_at, messages, is_compaction) VALUES (?, ?, ?, ?, ?)",
+        (session_id, entry.id, entry.created_at, messages_json, entry.is_compaction ? 1 : 0))
+    # Index session text into LocalSearch
+    if store.search_store !== nothing
+        text = session_entry_search_text(entry)
+        if !isempty(strip(text))
+            doc_id = "session:$(session_id):$(something(entry.id, string(entry.created_at)))"
+            try
+                LocalSearch.load!(store.search_store, text; id=doc_id, title="session")
+            catch err
+                @debug "Failed to index session entry" exception=err
+            end
+        end
+    end
+    return nothing
+end
+
+# --- AgentAssistant ---
+
+mutable struct AgentAssistant
+    db::SQLite.DB
+    search_store::Union{Nothing, LocalSearch.Store}
+    session_store::SQLiteSessionStore
     scheduler::Tempus.Scheduler
-    lock::ReentrantLock
     config::AssistantConfig
-    output::T
     initialized::Bool
-    watcher_state::Union{Nothing, Qmd.Watcher.WatcherState}
-    @atomic evaluating::Bool                      # true while an evaluation is in progress (#8: in-flight check)
-    last_heartbeat_hash::UInt64                    # hash of last heartbeat response (#9: dedup)
-    last_heartbeat_time::Float64                   # unix time of last heartbeat delivery (#9: dedup)
+    @atomic evaluating::Bool
+    last_heartbeat_hash::UInt64
+    last_heartbeat_time::Float64
 end
 
 function normalize_text(value::Union{Nothing, AbstractString})
@@ -143,20 +208,39 @@ function normalize_text(value::Union{Nothing, AbstractString})
     return String(cleaned)
 end
 
-"""
-Check if a bootstrap document still has unchecked items (`- [ ]`).
-"""
-bootstrap_has_unchecked(text::AbstractString) = occursin("- [ ]", text)
+function normalize_memory_text(value::AbstractString)
+    cleaned = replace(strip(String(value)), r"\s+" => " ")
+    isempty(cleaned) && throw(ArgumentError("memory cannot be empty"))
+    return cleaned
+end
 
-"""
-Parse a keywords string into a list of lowercase keywords for searching.
-"""
+function append_prompt(prompt::AbstractString, section::AbstractString)
+    section_clean = strip(String(section))
+    isempty(section_clean) && return String(prompt)
+    isempty(strip(String(prompt))) && return section_clean
+    return string(prompt, "\n\n", section_clean)
+end
+
+function insert_memories_section(prompt::AbstractString, mem_section::AbstractString)
+    mem_clean = strip(String(mem_section))
+    isempty(mem_clean) && return String(prompt)
+    marker = "\n## Trigger Prompt\n"
+    idx = findfirst(marker, prompt)
+    idx === nothing && return append_prompt(prompt, mem_clean)
+    before = prompt[1:(first(idx) - 1)]
+    after = prompt[first(idx):end]
+    combined = append_prompt(before, mem_clean)
+    return combined * after
+end
+
+function append_tools(agent::Agentif.Agent, new_tools::Vector{Agentif.AgentTool})
+    isempty(new_tools) && return agent
+    tools = isempty(agent.tools) ? new_tools : vcat(agent.tools, new_tools)
+    return Agentif.with_tools(agent, tools)
+end
+
 parse_keywords(keywords::String)::Vector{String} = [lowercase(k) for k in split(strip(keywords); keepempty = false)]
 
-"""
-Check if text contains any of the given keywords.
-Returns true if keywords list is empty (matches everything) or if any keyword is found.
-"""
 function matches_keywords(text::String, keywords::Vector{String})::Bool
     isempty(keywords) && return true
     text_lower = lowercase(text)
@@ -166,9 +250,6 @@ function matches_keywords(text::String, keywords::Vector{String})::Bool
     return false
 end
 
-"""
-Apply limit to results, returning first `limit` items or all if limit is nothing.
-"""
 function apply_limit(results::Vector{T}, limit::Union{Nothing, Int}) where {T}
     limit === nothing && return results
     length(results) <= limit && return results
@@ -226,163 +307,247 @@ function resolve_provider_overrides(provider::String, model_id::Union{Nothing, S
     return provider_value, model_id_value, api_key_value
 end
 
-function ensure_file(path::String)
-    isfile(path) && return nothing
-    mkpath(dirname(path))
-    touch(path)
-    return nothing
+include("tools.jl")
+include("channels.jl")
+
+# --- KV helpers ---
+
+function kv_get(db::SQLite.DB, key::String, default::String="")
+    row = iterate(SQLite.DBInterface.execute(db, "SELECT value FROM kv_store WHERE key = ?", (key,)))
+    return row === nothing ? default : String(row[1].value)
 end
 
-function write_atomic(path::String, content::String)
-    dir = dirname(path)
-    isdir(dir) || mkpath(dir)
-    tmp_path = path * "." * string(UUIDs.uuid4()) * ".tmp"
-    open(tmp_path, "w") do io
-        write(io, content)
-    end
-    mv(tmp_path, path; force = true)
-    return nothing
+function kv_set!(db::SQLite.DB, key::String, value::String)
+    SQLite.execute(db, "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)", (key, value))
 end
 
-function write_jsonl_atomic(path::String, entries)
-    dir = dirname(path)
-    isdir(dir) || mkpath(dir)
-    tmp_path = path * "." * string(UUIDs.uuid4()) * ".tmp"
-    open(tmp_path, "w") do io
-        for entry in entries
-            write(io, JSON.json(entry))
-            write(io, "\n")
+# --- Identity & Heartbeat (backed by kv_store) ---
+
+function getIdentityAndPurpose(db::SQLite.DB)
+    cleaned = normalize_text(kv_get(db, "identity", ""))
+    cleaned === nothing && return DEFAULT_IDENTITY
+    return cleaned
+end
+getIdentityAndPurpose(a::AgentAssistant) = getIdentityAndPurpose(a.db)
+
+function setIdentityAndPurpose!(db::SQLite.DB, text::String)
+    kv_set!(db, "identity", text)
+end
+setIdentityAndPurpose!(a::AgentAssistant, text::String) = setIdentityAndPurpose!(a.db, text)
+
+function getHeartbeatTasks(db::SQLite.DB)
+    return kv_get(db, "heartbeat_tasks", DEFAULT_HEARTBEAT_TASKS)
+end
+getHeartbeatTasks(a::AgentAssistant) = getHeartbeatTasks(a.db)
+
+function setHeartbeatTasks!(db::SQLite.DB, text::String)
+    kv_set!(db, "heartbeat_tasks", text)
+end
+setHeartbeatTasks!(a::AgentAssistant, text::String) = setHeartbeatTasks!(a.db, text)
+
+# --- Memories (backed by memories table + LocalSearch) ---
+
+function addNewMemory(db::SQLite.DB, memory::String; eval_id::Union{Nothing, String}=nothing, search_store::Union{Nothing, LocalSearch.Store}=nothing)
+    text = normalize_memory_text(memory)
+    created_at = time()
+    eval_id_str = eval_id === nothing ? nothing : string(eval_id)
+    SQLite.execute(db, "INSERT INTO memories (memory, created_at, eval_id) VALUES (?, ?, ?)", (text, created_at, eval_id_str))
+    mem = Memory(text, created_at, eval_id_str)
+    # Index into LocalSearch
+    if search_store !== nothing
+        try
+            doc_id = "memory:$(bytes2hex(sha256(text))[1:16])"
+            LocalSearch.load!(search_store, text; id=doc_id, title="memory")
+        catch err
+            @debug "Failed to index memory" exception=err
         end
     end
-    mv(tmp_path, path; force = true)
-    return nothing
+    return mem
 end
 
-function append_jsonl(path::String, entry)
-    dir = dirname(path)
-    isdir(dir) || mkpath(dir)
-    open(path, "a") do io
-        write(io, JSON.json(entry))
-        write(io, "\n")
-    end
-    return nothing
+function load_all_memories(db::SQLite.DB)
+    rows = SQLite.DBInterface.execute(db, "SELECT memory, created_at, eval_id FROM memories ORDER BY created_at DESC")
+    return Memory[Memory(String(r.memory), Float64(r.created_at), r.eval_id === missing ? nothing : String(r.eval_id)) for r in rows]
 end
 
-function FileStore(root::String)
-    abs_root = abspath(root)
-    store = FileStore(
-        abs_root,
-        ReentrantLock(),
-        joinpath(abs_root, IDENTITY_FILENAME),
-        joinpath(abs_root, USER_PROFILE_FILENAME),
-        joinpath(abs_root, BOOTSTRAP_FILENAME),
-        joinpath(abs_root, TOOLS_GUIDE_FILENAME),
-        joinpath(abs_root, HEARTBEAT_TASKS_FILENAME),
-        joinpath(abs_root, MEMORIES_FILENAME),
-        joinpath(abs_root, SESSION_ID_FILENAME),
-        joinpath(abs_root, SESSION_DIRNAME),
-        joinpath(abs_root, SKILLS_DIRNAME),
-        joinpath(abs_root, MODES_DIRNAME),
-    )
-    initialize_store!(store)
-    return store
+"""Batch-lookup Memory structs from SQLite by exact text, preserving the input order."""
+function lookup_memories_by_text(db::SQLite.DB, texts::Vector{String})
+    isempty(texts) && return Memory[]
+    placeholders = join(fill("?", length(texts)), ", ")
+    rows = SQLite.DBInterface.execute(db,
+        "SELECT memory, created_at, eval_id FROM memories WHERE memory IN ($placeholders)", texts)
+    # Index by text for fast lookup
+    by_text = Dict{String, Memory}()
+    for r in rows
+        by_text[String(r.memory)] = Memory(String(r.memory), Float64(r.created_at), r.eval_id === missing ? nothing : String(r.eval_id))
+    end
+    # Return in original order (LocalSearch relevance ranking)
+    return Memory[by_text[t] for t in texts if haskey(by_text, t)]
 end
 
-function InMemoryStore(; identity::String = DEFAULT_IDENTITY, user_profile::String = DEFAULT_USER_PROFILE, bootstrap::String = DEFAULT_BOOTSTRAP)
-    skills_dir = mktempdir()
-    modes_dir = mktempdir()
-    registry = Agentif.create_skill_registry([skills_dir]; warn = false)
-    store = InMemoryStore(ReentrantLock(), identity, user_profile, bootstrap, DEFAULT_TOOLS_GUIDE, DEFAULT_HEARTBEAT_TASKS, Memory[], skills_dir, modes_dir, registry)
-    finalizer(store) do s
-        isdir(s.skills_dir) && rm(s.skills_dir; recursive = true, force = true)
-        isdir(s.modes_dir) && rm(s.modes_dir; recursive = true, force = true)
+function searchMemories(db::SQLite.DB, keywords::String; limit::Union{Nothing, Int}=nothing, search_store::Union{Nothing, LocalSearch.Store}=nothing)
+    limit_value = limit === nothing ? 10 : limit
+    # Try LocalSearch if available — results contain the full original memory text
+    if search_store !== nothing && !isempty(strip(keywords))
+        try
+            results = LocalSearch.search(search_store, keywords; limit=limit_value)
+            memory_results = filter(r -> startswith(r.id, "memory:"), results)
+            if !isempty(memory_results)
+                return lookup_memories_by_text(db, [r.text for r in memory_results])
+            end
+        catch err
+            @debug "LocalSearch memory search failed, falling back to keyword search" exception=err
+        end
     end
-    return store
+    # Fallback: keyword search in SQLite
+    keywords_list = parse_keywords(keywords)
+    all_memories = load_all_memories(db)
+    results = filter(m -> matches_keywords(m.memory, keywords_list), all_memories)
+    return apply_limit(results, limit)
 end
 
-function initialize_store!(store::FileStore)
-    mkpath(store.root)
-    if !isfile(store.identity_path)
-        write_atomic(store.identity_path, DEFAULT_IDENTITY)
+function forgetMemory(db::SQLite.DB, memory::String; search_store::Union{Nothing, LocalSearch.Store}=nothing)
+    result = SQLite.DBInterface.execute(db, "SELECT COUNT(*) as n FROM memories WHERE memory = ?", (memory,))
+    row = iterate(result)
+    count = row === nothing ? 0 : row[1].n
+    SQLite.execute(db, "DELETE FROM memories WHERE memory = ?", (memory,))
+    # Remove from LocalSearch
+    if search_store !== nothing && count > 0
+        try
+            doc_id = "memory:$(bytes2hex(sha256(memory))[1:16])"
+            Base.delete!(search_store, doc_id)
+        catch err
+            @debug "Failed to remove memory from search index" exception=err
+        end
     end
-    if !isfile(store.user_profile_path)
-        write_atomic(store.user_profile_path, DEFAULT_USER_PROFILE)
+    return count
+end
+
+# --- Skills (backed by skills table) ---
+
+function getSkills(db::SQLite.DB)
+    rows = SQLite.DBInterface.execute(db, "SELECT name, description FROM skills ORDER BY name")
+    return SkillMetadata[Agentif.SkillMetadata(String(r.name), String(r.description), nothing, nothing, Dict{String,String}(), nothing, "", "") for r in rows]
+end
+
+function addNewSkill(db::SQLite.DB, content::AbstractString)
+    text = String(content)
+    isempty(strip(text)) && throw(ArgumentError("skill content cannot be empty"))
+    name, description = parse_skill_metadata(text)
+    SQLite.execute(db, "INSERT OR REPLACE INTO skills (name, description, content) VALUES (?, ?, ?)", (name, description, text))
+    return Agentif.SkillMetadata(name, description, nothing, nothing, Dict{String,String}(), nothing, "", "")
+end
+
+function forgetSkill(db::SQLite.DB, name::AbstractString)
+    result = SQLite.DBInterface.execute(db, "SELECT COUNT(*) as n FROM skills WHERE name = ?", (String(name),))
+    row = iterate(result)
+    count = row === nothing ? 0 : row[1].n
+    SQLite.execute(db, "DELETE FROM skills WHERE name = ?", (String(name),))
+    return count
+end
+
+function parse_skill_metadata(content::AbstractString)
+    fields = Agentif.parse_frontmatter(content)
+    name = get(() -> nothing, fields, "name")
+    description = get(() -> nothing, fields, "description")
+    name === nothing && throw(ArgumentError("skill content missing name"))
+    description === nothing && throw(ArgumentError("skill content missing description"))
+    Agentif.validate_skill_name(name)
+    return String(name), String(description)
+end
+
+function get_skills_registry(db::SQLite.DB)
+    rows = SQLite.DBInterface.execute(db, "SELECT name, description, content FROM skills ORDER BY name")
+    skills = Dict{String, Agentif.SkillMetadata}()
+    loaded = Dict{String, String}()
+    for r in rows
+        name = String(r.name)
+        skills[name] = Agentif.SkillMetadata(name, String(r.description), nothing, nothing, Dict{String,String}(), nothing, "", "")
+        loaded[name] = String(r.content)
     end
-    if !isfile(store.bootstrap_path)
-        write_atomic(store.bootstrap_path, DEFAULT_BOOTSTRAP)
+    registry = Agentif.SkillRegistry(skills, loaded)
+    return registry
+end
+
+# --- Channel-Session Mapping ---
+
+"""
+    channel_id(ch) -> String
+
+Return a stable identifier for the channel.
+"""
+channel_id(::Agentif.AbstractChannel) = "default"
+channel_id(ch::ReplChannel) = "repl"
+
+"""
+    resolve_session!(db, chan_id) -> String
+
+Return the active session_id for the given channel. Creates a new session
+(and optionally bridges context) if the last activity is stale (>1hr).
+"""
+function resolve_session!(db::SQLite.DB, chan_id::String)
+    now = time()
+    row = iterate(SQLite.DBInterface.execute(db,
+        "SELECT session_id, last_activity FROM channel_sessions WHERE channel_id = ?", (chan_id,)))
+    if row !== nothing
+        session_id = String(row[1].session_id)
+        last_activity = Float64(row[1].last_activity)
+        if (now - last_activity) < SESSION_STALE_SECONDS
+            # Session still active — update activity timestamp
+            SQLite.execute(db, "UPDATE channel_sessions SET last_activity = ? WHERE channel_id = ?", (now, chan_id))
+            return session_id
+        end
+        # Session stale — rotate
+        old_session_id = session_id
+    else
+        old_session_id = nothing
     end
-    if !isfile(store.tools_guide_path)
-        write_atomic(store.tools_guide_path, DEFAULT_TOOLS_GUIDE)
-    end
-    ensure_file(store.heartbeat_tasks_path)
-    ensure_file(store.memories_path)
-    ensure_session_id!(store)
-    isdir(store.sessions_dir) || mkpath(store.sessions_dir)
-    isdir(store.skills_dir) || mkpath(store.skills_dir)
-    if !isdir(store.modes_dir)
-        mkpath(store.modes_dir)
-        # Seed default modes from package
-        if isdir(DEFAULT_MODES_DIR)
-            for f in readdir(DEFAULT_MODES_DIR)
-                endswith(f, ".md") || continue
-                src = joinpath(DEFAULT_MODES_DIR, f)
-                dst = joinpath(store.modes_dir, f)
-                isfile(dst) || cp(src, dst)
+    new_session_id = string(UUIDs.uuid4())
+    SQLite.execute(db, "INSERT OR REPLACE INTO channel_sessions (channel_id, session_id, last_activity) VALUES (?, ?, ?)",
+        (chan_id, new_session_id, now))
+    return new_session_id
+end
+
+"""
+    bridge_context(db, old_session_id) -> String
+
+Build a brief context bridge from the previous session's recent messages.
+"""
+function bridge_context(db::SQLite.DB, session_id::String)
+    rows = SQLite.DBInterface.execute(db,
+        "SELECT messages FROM session_entries WHERE session_id = ? ORDER BY id DESC LIMIT 3", (session_id,))
+    parts = String[]
+    for row in rows
+        msgs = JSON.parse(row.messages)
+        for m in msgs
+            if get(m, "type", "") == "user"
+                content = get(m, "content", [])
+                for c in content
+                    if get(c, "type", "") == "text"
+                        text = get(c, "text", "")
+                        !isempty(text) && push!(parts, "User: " * text)
+                    end
+                end
+            elseif get(m, "type", "") == "assistant"
+                content = get(m, "content", [])
+                for c in content
+                    if get(c, "type", "") == "text"
+                        text = get(c, "text", "")
+                        !isempty(text) && push!(parts, "Vo: " * text)
+                    end
+                end
             end
         end
     end
-    return nothing
+    isempty(parts) && return ""
+    return "## Previous Session Context\n" * join(reverse(parts), "\n") * "\n"
 end
 
-function initialize_store!(store::InMemoryStore)
-    isdir(store.skills_dir) || mkpath(store.skills_dir)
-    return nothing
-end
-
-function load_session_id(store::FileStore)
-    isfile(store.session_id_path) || return nothing
-    id = strip(read(store.session_id_path, String))
-    isempty(id) && return nothing
-    return id
-end
-
-function ensure_session_id!(store::FileStore)
-    id = load_session_id(store)
-    if id === nothing
-        id = string(Agentif.new_session_id())
-        write_atomic(store.session_id_path, id)
-    end
-    return id
-end
-
-function ensure_initialized!(assistant::AgentAssistant)
-    lock(assistant.lock) do
-        assistant.initialized && return nothing
-        initialize_store!(assistant.store)
-        assistant.initialized = true
-    end
-    return nothing
-end
-
-function session_entry_count(assistant::AgentAssistant)
-    store = assistant.session_store
-    sid = assistant.session_id
-    (store === nothing || sid === nothing) && return 0
-    return Agentif.session_entry_count(store, sid)
-end
-
-function list_session_entries(assistant::AgentAssistant, start::Int, limit::Int)
-    store = assistant.session_store
-    sid = assistant.session_id
-    (store === nothing || sid === nothing) && return SessionEntry[]
-    return Agentif.session_entries(store, sid; start, limit)
-end
-
-include("tools.jl")
+# --- Job helpers ---
 
 function job_summary(job::Tempus.Job)
     enabled = !Tempus.isdisabled(job)
-    schedule_str = job.schedule === nothing ? "" : string(job.schedule)
+    schedule_str = job.schedule === nothing ? "" : strip(string(job.schedule), '"')
     return (; name = job.name, schedule = schedule_str, enabled = enabled)
 end
 
@@ -392,8 +557,6 @@ function local_utc_offset_minutes(now_local::DateTime = Dates.now())
 end
 
 function heartbeat_schedule(offset_minutes::Int, interval_minutes::Int=DEFAULT_HEARTBEAT_INTERVAL_MINUTES)
-    # Generate cron minute field for the given interval
-    # e.g. interval=60 → "0", interval=30 → "0,30", interval=15 → "0,15,30,45"
     interval_minutes = clamp(interval_minutes, 1, 60)
     base = mod(HEARTBEAT_MINUTE - offset_minutes, 60)
     minutes = Int[]
@@ -423,7 +586,6 @@ function heartbeat_prompt(local_time::DateTime, offset_minutes::Int, heartbeat_t
     last_heartbeat = Dates.hour(local_time) == HEARTBEAT_END_HOUR
     has_tasks = !isempty(strip(heartbeat_tasks))
 
-    # Build skill-aware checklist (#19)
     skill_section = if !isempty(skill_names)
         skill_list = join(["  - `$(s)`" for s in skill_names], "\n")
         """
@@ -434,7 +596,6 @@ function heartbeat_prompt(local_time::DateTime, offset_minutes::Int, heartbeat_t
         "- Check for any available skills that surface recent or upcoming items (email, calendar, messaging, news)."
     end
 
-    # Build pending tasks section (#6)
     tasks_section = if has_tasks
         """
 
@@ -469,16 +630,11 @@ function heartbeat_prompt(local_time::DateTime, offset_minutes::Int, heartbeat_t
     """
 end
 
-function build_scheduler(store::AbstractAssistantStore)
-    if store isa FileStore
-        path = joinpath(store.root, SCHEDULER_STORE_FILENAME)
-        return Tempus.Scheduler(Tempus.FileStore(path); logging=false)
-    end
-    return Tempus.Scheduler(Tempus.InMemoryStore(); logging=false)
-end
+# --- Constructor ---
 
 function AgentAssistant(;
-        data_dir::Union{Nothing, String} = nothing,
+        db::Union{Nothing, SQLite.DB} = nothing,
+        db_path::Union{Nothing, String} = nothing,
         provider::Union{Nothing, String} = nothing,
         model_id::Union{Nothing, String} = nothing,
         api_key::Union{Nothing, String} = nothing,
@@ -487,18 +643,53 @@ function AgentAssistant(;
         base_dir::String = pwd(),
         enable_heartbeat::Bool = true,
         heartbeat_interval_minutes::Int = DEFAULT_HEARTBEAT_INTERVAL_MINUTES,
-        output::IO = stdout
+        embed = nothing,  # pass LocalSearch embed option (nothing=BM25 only, :default=vector+BM25)
     )
-    data_dir = data_dir === nothing ? Base.get(ENV, "VO_DATA_DIR", nothing) : data_dir
-    if data_dir === nothing
-        store = InMemoryStore()
-        scheduler = Tempus.Scheduler(Tempus.InMemoryStore())
+    # Resolve database
+    if db !== nothing
+        sqlite_db = db
+    elseif db_path !== nothing
+        sqlite_db = SQLite.DB(db_path)
     else
-        store = FileStore(data_dir)
-        scheduler = build_scheduler(store)
+        # Check env
+        env_path = Base.get(ENV, "VO_DATA_DIR", nothing)
+        if env_path !== nothing && !isempty(env_path)
+            mkpath(env_path)
+            sqlite_db = SQLite.DB(joinpath(env_path, "vo.sqlite"))
+        else
+            sqlite_db = SQLite.DB()  # in-memory
+        end
     end
-    session_store = store isa FileStore ? Agentif.FileSessionStore(store.sessions_dir) : Agentif.InMemorySessionStore()
-    session_id = store isa FileStore ? ensure_session_id!(store) : string(Agentif.new_session_id())
+
+    init_schema!(sqlite_db)
+
+    # Create LocalSearch store on the same DB path for search
+    db_file = sqlite_db.file
+    search_store = if !isempty(db_file) && db_file != ":memory:"
+        # Use a separate LocalSearch DB in the same directory
+        search_path = db_file * ".search"
+        try
+            LocalSearch.Store(search_path; embed=embed === nothing ? nothing : embed)
+        catch err
+            @warn "Failed to initialize LocalSearch" exception=err
+            nothing
+        end
+    else
+        try
+            LocalSearch.Store(; embed=embed === nothing ? nothing : embed)
+        catch err
+            @warn "Failed to initialize in-memory LocalSearch" exception=err
+            nothing
+        end
+    end
+
+    session_store = SQLiteSessionStore(sqlite_db, search_store)
+
+    # Create Tempus scheduler backed by SQLite
+    tempus_store = Tempus.SQLiteStore(sqlite_db)
+    scheduler = Tempus.Scheduler(tempus_store; logging=false)
+
+    # Resolve provider/model/key
     provider_value = provider === nothing ? get_env_with_fallback(ENV_AGENT_PROVIDER, "ANTHROPIC_PROVIDER", "anthropic") : provider
     model_id_value = model_id === nothing ? get_env_with_fallback(ENV_AGENT_MODEL, "ANTHROPIC_MODEL", nothing) : model_id
     api_key_value = resolve_api_key(provider_value, api_key)
@@ -525,234 +716,187 @@ function AgentAssistant(;
     model = Agentif.getModel(config.provider, config.model_id)
     model === nothing && error("Unknown model provider=$(config.provider) model_id=$(config.model_id)")
     assistant = AgentAssistant(
-        store,
+        sqlite_db,
+        search_store,
         session_store,
-        session_id,
         scheduler,
-        ReentrantLock(),
         config,
-        output,
-        false,
-        nothing,  # watcher_state
-        false,    # evaluating (in-flight flag)
+        true,     # initialized
+        false,    # evaluating
         UInt64(0),# last_heartbeat_hash
         0.0,      # last_heartbeat_time
     )
-    # Set as current assistant so job closures can access it without capturing the full object
     CURRENT_ASSISTANT[] = assistant
     return assistant
 end
 
-"""
-Build a context query string from recent session entries for memory retrieval.
-"""
-function build_memory_query(session_entries::Vector{SessionEntry}; max_chars::Int=500)
-    isempty(session_entries) && return ""
+# --- Session helpers ---
 
-    # Collect recent user messages and assistant responses
+function session_entry_count(assistant::AgentAssistant, session_id::String)
+    return Agentif.session_entry_count(assistant.session_store, session_id)
+end
+
+function list_session_entries(assistant::AgentAssistant, session_id::String, start::Int, limit::Int)
+    return Agentif.session_entries(assistant.session_store, session_id; start, limit)
+end
+
+function recent_session_entries(assistant::AgentAssistant, session_id::String)
+    entry_count = session_entry_count(assistant, session_id)
+    start_index = max(1, entry_count - assistant.config.session_context_limit + 1)
+    return entry_count == 0 ? Agentif.SessionEntry[] : list_session_entries(assistant, session_id, start_index, assistant.config.session_context_limit)
+end
+
+function session_entry_summary(entry::Agentif.SessionEntry)
+    user = ""
+    assistant = ""
+    for msg in entry.messages
+        if msg isa Agentif.UserMessage
+            user = Agentif.message_text(msg)
+        elseif msg isa Agentif.AssistantMessage
+            assistant = Agentif.message_text(msg)
+        end
+    end
+    return user, assistant
+end
+
+function session_entry_search_text(entry::Agentif.SessionEntry)
+    parts = String[]
+    for msg in entry.messages
+        if msg isa Agentif.UserMessage
+            push!(parts, Agentif.message_text(msg))
+        elseif msg isa Agentif.AssistantMessage
+            push!(parts, Agentif.message_text(msg))
+            thinking = Agentif.message_thinking(msg)
+            !isempty(thinking) && push!(parts, thinking)
+        elseif msg isa Agentif.ToolResultMessage
+            push!(parts, Agentif.message_text(msg))
+        end
+    end
+    return join(parts, "\n")
+end
+
+function search_session(assistant::AgentAssistant, keywords::String; limit::Union{Nothing, Int}=nothing, offset::Int=0, session_id::Union{Nothing, String}=nothing)
+    limit_value = limit === nothing ? 10 : max(limit, 0)
+    limit_value == 0 && return Dict{String,Any}[]
+    # Try LocalSearch first
+    if assistant.search_store !== nothing && !isempty(strip(keywords))
+        try
+            results = LocalSearch.search(assistant.search_store, keywords; limit=(limit_value + offset) * 3)
+            session_prefix = session_id === nothing ? "session:" : "session:$(session_id):"
+            session_results = filter(r -> startswith(r.id, session_prefix), results)
+            if !isempty(session_results)
+                if offset > 0
+                    offset >= length(session_results) && return Dict{String,Any}[]
+                    session_results = session_results[(offset + 1):end]
+                end
+                length(session_results) > limit_value && (session_results = session_results[1:limit_value])
+                return [Dict("path" => r.id, "score" => r.score, "snippet" => r.text) for r in session_results]
+            end
+        catch err
+            @debug "LocalSearch session search failed" exception=err
+        end
+    end
+    # Fallback: keyword search in session_entries
+    sid = session_id
+    if sid === nothing
+        # Search across all sessions
+        keywords_list = parse_keywords(keywords)
+        results = Dict{String,Any}[]
+        rows = SQLite.DBInterface.execute(assistant.db, "SELECT messages FROM session_entries ORDER BY id DESC LIMIT ?", (limit_value + offset,))
+        seen = 0
+        for row in rows
+            msgs = JSON.parse(row.messages)
+            text = join([get(c, "text", "") for m in msgs for c in get(m, "content", []) if get(c, "type", "") == "text"], " ")
+            if matches_keywords(text, keywords_list)
+                if seen >= offset
+                    push!(results, Dict("path" => "session", "score" => 1.0, "snippet" => text))
+                end
+                seen += 1
+                length(results) >= limit_value && break
+            end
+        end
+        return results
+    else
+        keywords_list = parse_keywords(keywords)
+        results = Dict{String,Any}[]
+        entries = Agentif.session_entries(assistant.session_store, sid)
+        seen = 0
+        for entry in entries
+            text = session_entry_search_text(entry)
+            if matches_keywords(text, keywords_list)
+                if seen >= offset
+                    push!(results, Dict("path" => "session", "score" => 1.0, "snippet" => text))
+                end
+                seen += 1
+                length(results) >= limit_value && break
+            end
+        end
+        return results
+    end
+end
+
+# --- Memory middleware ---
+
+function build_memory_query(session_entries::Vector{Agentif.SessionEntry}; max_chars::Int=500)
+    isempty(session_entries) && return ""
     parts = String[]
     total_chars = 0
-
-    # Process entries in reverse (most recent first)
     for entry in reverse(session_entries)
         user_text, assistant_text = session_entry_summary(entry)
-
-        # Add user message (prioritize user context)
         if !isempty(user_text) && total_chars < max_chars
             push!(parts, user_text)
             total_chars += length(user_text)
         end
-
-        # Add assistant response keywords if space allows
         if !isempty(assistant_text) && total_chars < max_chars
-            # Take first 100 chars of assistant response
             snippet = length(assistant_text) > 100 ? assistant_text[1:100] : assistant_text
             push!(parts, snippet)
             total_chars += length(snippet)
         end
-
         total_chars >= max_chars && break
     end
-
     return join(parts, " ")
 end
 
-"""
-Retrieve memories relevant to the current conversation context using semantic search.
-Falls back to recent memories if semantic search is unavailable.
-"""
-function get_relevant_memories(assistant::AgentAssistant, session_entries::Vector{SessionEntry})
-    store = assistant.store
+function get_relevant_memories(assistant::AgentAssistant, session_entries::Vector{Agentif.SessionEntry})
     limit = assistant.config.memory_context_limit
     limit <= 0 && return Memory[]
-
-    # Build context query from recent session entries
     context_query = build_memory_query(session_entries)
-
-    # Try semantic search if we have context and Qmd is available
-    if !isempty(context_query)
-        db_path = get_database_path(store)
-        if db_path !== nothing && isfile(db_path)
-            try
-                # Search memories using Qmd semantic search
-                result = LLMTools.qmd_search(context_query; limit=limit * 2, search_mode=:combined)
-                if result["success"] && !isempty(result["results"])
-                    # Load all memories and match against semantic results
-                    all_memories = load_all_memories(store)
-                    isempty(all_memories) && return Memory[]
-
-                    # Score memories with weighted relevance + recency
-                    scored_memories = Tuple{Memory, Float64}[]
-                    result_snippets = [(r["snippet"], r["score"]) for r in result["results"]]
-                    now_unix = time()
-                    # Find time range for normalization
-                    oldest = minimum(m.createdAt for m in all_memories)
-                    time_range = max(now_unix - oldest, 1.0)
-
-                    for mem in all_memories
-                        mem_lower = lowercase(mem.memory)
-                        best_relevance = 0.0
-
-                        for (snippet, score) in result_snippets
-                            snippet_lower = lowercase(snippet)
-                            if occursin(mem_lower, snippet_lower) || occursin(snippet_lower, mem_lower)
-                                best_relevance = max(best_relevance, score)
-                            end
-                        end
-
-                        if best_relevance > 0.0
-                            # Weighted combination: 70% relevance, 30% recency
-                            recency = (mem.createdAt - oldest) / time_range  # 0.0 (oldest) to 1.0 (newest)
-                            combined = 0.7 * best_relevance + 0.3 * recency
-                            push!(scored_memories, (mem, combined))
-                        end
-                    end
-
-                    if !isempty(scored_memories)
-                        sort!(scored_memories; by=x -> -x[2])
-                        return [m for (m, _) in scored_memories[1:min(limit, length(scored_memories))]]
-                    end
-                end
-            catch err
-                @debug "Semantic memory retrieval failed, falling back to keyword search" exception=err
+    # Try LocalSearch — results are already relevance-ranked and contain full memory text
+    if !isempty(context_query) && assistant.search_store !== nothing
+        try
+            results = LocalSearch.search(assistant.search_store, context_query; limit=limit)
+            memory_results = filter(r -> startswith(r.id, "memory:"), results)
+            if !isempty(memory_results)
+                memories = lookup_memories_by_text(assistant.db, [r.text for r in memory_results])
+                !isempty(memories) && return memories
             end
+        catch err
+            @debug "LocalSearch memory retrieval failed" exception=err
         end
     end
-
-    # Fallback: return most recent memories that match any keywords from context
-    if !isempty(context_query)
-        keywords = split(context_query)
-        # Filter to meaningful keywords (length > 3)
-        keywords = filter(k -> length(k) > 3, keywords)
-        if !isempty(keywords)
-            # Search with first few keywords
-            keyword_str = join(keywords[1:min(5, length(keywords))], " ")
-            results = searchMemories(store, keyword_str; limit=limit, semantic=false)
-            !isempty(results) && return results
-        end
-    end
-
-    # Ultimate fallback: return most recent memories
-    all_memories = load_all_memories(store)
-    sort!(all_memories; by=m -> m.createdAt, rev=true)
+    # Fallback: most recent memories
+    all_memories = load_all_memories(assistant.db)
     return all_memories[1:min(limit, length(all_memories))]
 end
 
-"""
-Parse a personality mode from a markdown file with frontmatter.
-Expected format:
-```
----
-name: casual
-chance: 0.15
-active_start: 17
-active_end: 23
----
-Mode content here...
-```
-"""
-function parse_personality_mode(path::String)
-    text = read(path, String)
-    # Parse frontmatter between --- delimiters
-    m = match(r"^---\s*\n(.*?)\n---\s*\n(.*)"s, text)
-    m === nothing && return nothing
-    frontmatter = m.captures[1]
-    content = strip(String(m.captures[2]))
-    isempty(content) && return nothing
-
-    name = ""
-    chance = 0.0
-    active_start = -1
-    active_end = -1
-    for line in split(frontmatter, "\n")
-        kv = split(strip(line), ":", limit=2)
-        length(kv) != 2 && continue
-        key = strip(kv[1])
-        val = strip(kv[2])
-        if key == "name"
-            name = val
-        elseif key == "chance"
-            chance = parse(Float64, val)
-        elseif key == "active_start"
-            active_start = parse(Int, val)
-        elseif key == "active_end"
-            active_end = parse(Int, val)
-        end
-    end
-    isempty(name) && return nothing
-    return PersonalityMode(name, content, chance, active_start, active_end)
-end
-
-function list_personality_modes(store::AbstractAssistantStore)
-    dir = store isa FileStore ? store.modes_dir : store.modes_dir
-    isdir(dir) || return PersonalityMode[]
-    modes = PersonalityMode[]
-    for f in readdir(dir)
-        endswith(f, ".md") || continue
-        mode = parse_personality_mode(joinpath(dir, f))
-        mode !== nothing && push!(modes, mode)
-    end
-    return modes
-end
-
-"""
-Check all personality modes and return one if conditions match (time window + random chance).
-Returns nothing if no mode activates.
-"""
-function resolve_active_mode(store::AbstractAssistantStore)
-    modes = list_personality_modes(store)
-    isempty(modes) && return nothing
-    hour = Dates.hour(Dates.now())
-    eligible = PersonalityMode[]
-    for mode in modes
-        # Check time window
-        if mode.active_start >= 0 && mode.active_end >= 0
-            if mode.active_start <= mode.active_end
-                (hour < mode.active_start || hour >= mode.active_end) && continue
-            else  # wraps midnight, e.g. 22-6
-                (hour < mode.active_start && hour >= mode.active_end) && continue
-            end
-        end
-        push!(eligible, mode)
-    end
-    isempty(eligible) && return nothing
-    # Roll dice for each eligible mode
-    for mode in eligible
-        rand() < mode.chance && return mode
-    end
-    return nothing
-end
-
-function build_prompt(assistant::AgentAssistant; trigger_prompt::Union{Nothing, String} = TRIGGER_PROMPT[])
-    identity = getIdentityAndPurpose(assistant.store)
-    user_profile = getUserProfile(assistant.store)
-    entry_count = session_entry_count(assistant)
-    start_index = max(1, entry_count - assistant.config.session_context_limit + 1)
-    session_entries = entry_count == 0 ? SessionEntry[] : list_session_entries(assistant, start_index, assistant.config.session_context_limit)
-
-    # Retrieve relevant memories based on conversation context
+function build_relevant_memories_section(assistant::AgentAssistant, session_entries::Vector{Agentif.SessionEntry})
     relevant_memories = get_relevant_memories(assistant, session_entries)
+    isempty(relevant_memories) && return ""
+    io = IOBuffer()
+    print(io, "## Relevant Memories\n")
+    print(io, "The following memories may be relevant to the current conversation:\n")
+    for mem in relevant_memories
+        timestamp = Dates.unix2datetime(mem.createdAt)
+        date_str = Dates.format(timestamp, "yyyy-mm-dd HH:MM")
+        print(io, "- [", date_str, "] ", mem.memory, "\n")
+    end
+    return String(take!(io))
+end
 
+# --- Prompt building ---
+
+function build_base_prompt(assistant::AgentAssistant; trigger_prompt::Union{Nothing, String}=TRIGGER_PROMPT[], session_id::Union{Nothing, String}=nothing, bridge::String="")
+    identity = getIdentityAndPurpose(assistant)
     io = IOBuffer()
     local_time = Dates.now()
     offset_minutes = local_utc_offset_minutes(local_time)
@@ -769,50 +913,8 @@ function build_prompt(assistant::AgentAssistant; trigger_prompt::Union{Nothing, 
     print(io, "## Identity & Purpose\n")
     print(io, identity, "\n")
 
-    # Check for active personality mode overlay
-    active_mode = resolve_active_mode(assistant.store)
-    if active_mode !== nothing
-        print(io, "\n## Active Personality Mode: ", active_mode.name, "\n")
-        print(io, active_mode.content, "\n")
-    end
-
-    # Inject user profile
-    print(io, "\n## User Profile\n")
-    print(io, user_profile, "\n")
-
-    # Inject bootstrap checklist if onboarding is still in progress
-    bootstrap = getBootstrap(assistant.store)
-    if bootstrap_has_unchecked(bootstrap)
-        print(io, "\n## Onboarding\n")
-        print(io, "You are still learning about this user. Use natural conversation to fill in the gaps below. Don't interrogate — weave questions into helpful interactions. When you learn something, check it off here and update the user profile.\n\n")
-        print(io, bootstrap, "\n")
-    end
-
-    # Inject tools guide
-    tools_guide = getToolsGuide(assistant.store)
-    if !isempty(strip(tools_guide))
-        print(io, "\n## Tool Usage Guide\n")
-        print(io, tools_guide, "\n")
-    end
-
-    # Inject relevant memories
-    if !isempty(relevant_memories)
-        print(io, "\n## Relevant Memories\n")
-        print(io, "The following memories may be relevant to the current conversation:\n")
-        for mem in relevant_memories
-            # Format timestamp
-            timestamp = Dates.unix2datetime(mem.createdAt)
-            date_str = Dates.format(timestamp, "yyyy-mm-dd HH:MM")
-            print(io, "- [", date_str, "] ", mem.memory, "\n")
-        end
-    end
-
-    if !isempty(session_entries)
-        print(io, "\n## Recent Session\n")
-        for entry in session_entries
-            user_text, assistant_text = session_entry_summary(entry)
-            print(io, "- User: ", user_text, "\n  Vo: ", assistant_text, "\n")
-        end
+    if !isempty(bridge)
+        print(io, "\n", bridge)
     end
     if trigger_prompt !== nothing
         print(io, "\n## Trigger Prompt\n", trigger_prompt, "\n")
@@ -820,62 +922,12 @@ function build_prompt(assistant::AgentAssistant; trigger_prompt::Union{Nothing, 
     return String(take!(io))
 end
 
-function session_entry_summary(entry::SessionEntry)
-    user = ""
-    assistant = ""
-    for msg in entry.messages
-        if msg isa Agentif.UserMessage
-            user = Agentif.message_text(msg)
-        elseif msg isa Agentif.AssistantMessage
-            assistant = Agentif.message_text(msg)
-        end
-    end
-    return user, assistant
-end
-
-function session_entry_search_text(entry::SessionEntry)
-    parts = String[]
-    for msg in entry.messages
-        if msg isa Agentif.UserMessage
-            push!(parts, Agentif.message_text(msg))
-        elseif msg isa Agentif.AssistantMessage
-            push!(parts, Agentif.message_text(msg))
-            thinking = Agentif.message_thinking(msg)
-            !isempty(thinking) && push!(parts, thinking)
-        elseif msg isa Agentif.ToolResultMessage
-            push!(parts, Agentif.message_text(msg))
-        end
-    end
-    return lowercase(join(parts, "\n"))
-end
-
-function search_session(assistant::AgentAssistant, keywords::String; limit::Union{Nothing, Int} = nothing, offset::Int = 0)
-    keywords_list = parse_keywords(keywords)
-    matches = SessionEntry[]
-    store = assistant.session_store
-    sid = assistant.session_id
-    (store === nothing || sid === nothing) && return matches
-    entries = Agentif.session_entries(store, sid)
-    seen = 0
-    for entry in entries
-        text = session_entry_search_text(entry)
-        if matches_keywords(text, keywords_list)
-            if seen >= offset
-                push!(matches, entry)
-            end
-            seen += 1
-            if limit !== nothing && length(matches) >= limit
-                break
-            end
-        end
-    end
-    return matches
-end
+# --- Build error state ---
 
 function build_error_state(input::String, error_text::String)
     messages = Agentif.AgentMessage[]
     push!(messages, Agentif.UserMessage(input))
-    push!(messages, Agentif.AssistantMessage(; provider = "local", api = "local", model = "local", content = Agentif.AssistantContentBlock[Agentif.TextContent(error_text)]))
+    push!(messages, Agentif.AssistantMessage(; provider="local", api="local", model="local", content=Agentif.AssistantContentBlock[Agentif.TextContent(error_text)]))
     usage = Agentif.Usage()
     pending = Agentif.PendingToolCall[]
     return Agentif.AgentState(;
@@ -887,212 +939,114 @@ function build_error_state(input::String, error_text::String)
     )
 end
 
-function base_agent(assistant::AgentAssistant)
+# --- Agent & Middleware ---
+
+function base_agent(assistant::AgentAssistant; session_id::Union{Nothing, String}=nothing, bridge::String="")
     model = Agentif.getModel(assistant.config.provider, assistant.config.model_id)
     model === nothing && error("Unknown model provider=$(assistant.config.provider) model_id=$(assistant.config.model_id)")
+    prompt = build_base_prompt(assistant; session_id=session_id, bridge=bridge)
     return Agentif.Agent(
         id = "vo",
         name = "Vo",
-        prompt = "",
+        prompt = prompt,
         model = model,
         apikey = assistant.config.api_key,
         tools = Agentif.AgentTool[],
     )
 end
 
-function handle_event!(assistant::AgentAssistant, event::Agentif.AgentEvent)
-    return if event isa Agentif.AgentEvaluateStartEvent
-        @debug "[vo] AgentEvaluateStartEvent received"
-        @atomic assistant.evaluating = true
-        lock(assistant.lock) # ensure only one evaluation happens at a time (mostly user inputs vs. scheduled prompts)
-    elseif event isa Agentif.AgentEvaluateEndEvent
-        try
-            @atomic assistant.evaluating = false
-        finally
-            unlock(assistant.lock)
-        end
-    elseif event isa Agentif.MessageUpdateEvent
-        # Write directly to avoid any terminal width-based wrapping
-        @debug "[vo] MessageUpdateEvent" delta_len = length(event.delta) output_type = typeof(assistant.output)
-        write(assistant.output, event.delta)
-    elseif event isa Agentif.MessageEndEvent
-        @debug "[vo] MessageEndEvent"
-        println(assistant.output)
+function memory_middleware(agent_handler::Agentif.AgentHandler, assistant::AgentAssistant, session_id::String)
+    return function (f, agent::Agentif.Agent, state::Agentif.AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+        entries = recent_session_entries(assistant, session_id)
+        mem_section = build_relevant_memories_section(assistant, entries)
+        prompt = insert_memories_section(agent.prompt, mem_section)
+        agent_with_prompt = Agentif.with_prompt(agent, prompt)
+        agent_with_tools = append_tools(agent_with_prompt, build_memory_tools(assistant))
+        return agent_handler(f, agent_with_tools, state, current_input, abort; kw...)
     end
 end
 
-function memory_middleware(agent_handler::Agentif.AgentHandler, assistant::AgentAssistant)
+function manage_skills_middleware(agent_handler::Agentif.AgentHandler, assistant::AgentAssistant)
     return function (f, agent::Agentif.Agent, state::Agentif.AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
-        prompt = build_prompt(assistant)
-        return agent_handler(f, Agentif.with_prompt(agent, prompt), state, current_input, abort; kw...)
-    end
-end
-
-function tools_middleware(agent_handler::Agentif.AgentHandler, assistant::AgentAssistant)
-    return function (f, agent::Agentif.Agent, state::Agentif.AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
-        tools = build_tools(assistant; include_scheduler = false)
-        return agent_handler(f, Agentif.with_tools(agent, tools), state, current_input, abort; kw...)
+        agent_with_tools = append_tools(agent, build_manage_skills_tools(assistant))
+        registry = get_skills_registry(assistant.db)
+        !isempty(registry.skills) && (agent_with_tools = append_tools(agent_with_tools, Agentif.AgentTool[Agentif.create_skill_loader_tool(registry)]))
+        return agent_handler(f, agent_with_tools, state, current_input, abort; kw...)
     end
 end
 
 function scheduler_middleware(agent_handler::Agentif.AgentHandler, assistant::AgentAssistant)
     return function (f, agent::Agentif.Agent, state::Agentif.AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
-        scheduler_tools = build_scheduler_tools(assistant)
-        tools = isempty(agent.tools) ? scheduler_tools : vcat(agent.tools, scheduler_tools)
-        agent_with_tools = Agentif.with_tools(agent, tools)
-        subagent_tool = LLMTools.create_subagent_tool(agent_with_tools)
-        tools = vcat(tools, [subagent_tool])
-        agent_with_tools = Agentif.with_tools(agent, tools)
+        agent_with_tools = append_tools(agent, build_scheduler_tools(assistant))
         return agent_handler(f, agent_with_tools, state, current_input, abort; kw...)
     end
 end
 
-function build_handler(assistant::AgentAssistant)
-    handler = Agentif.stream
+function assistant_tools_middleware(agent_handler::Agentif.AgentHandler, assistant::AgentAssistant)
+    return function (f, agent::Agentif.Agent, state::Agentif.AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+        agent_with_tools = append_tools(agent, build_assistant_tools(assistant))
+        subagent_tool = LLMTools.create_subagent_tool(agent_with_tools)
+        agent_with_tools = append_tools(agent_with_tools, Agentif.AgentTool[subagent_tool])
+        return agent_handler(f, agent_with_tools, state, current_input, abort; kw...)
+    end
+end
+
+function build_handler(assistant::AgentAssistant; session_id::String, channel::Union{Nothing, Agentif.AbstractChannel}=nothing)
+    registry = get_skills_registry(assistant.db)
+    handler = Agentif.build_default_handler(;
+        base_handler = Agentif.stream,
+        session_store = assistant.session_store,
+        session_id = session_id,
+        skill_registry = registry,
+        channel = channel,
+    )
+    handler = assistant_tools_middleware(handler, assistant)
     handler = scheduler_middleware(handler, assistant)
-    handler = tools_middleware(handler, assistant)
-    handler = memory_middleware(handler, assistant)
+    handler = manage_skills_middleware(handler, assistant)
+    handler = memory_middleware(handler, assistant, session_id)
     return handler
 end
 
-evaluate(assistant::AgentAssistant, input::Agentif.AgentTurnInput; abort::Agentif.Abort = Agentif.Abort(), kw...) = evaluate(identity, assistant, input; abort, kw...)
+# --- Evaluate ---
 
-function evaluate(f::Function, assistant::AgentAssistant, input::Agentif.AgentTurnInput; abort::Agentif.Abort = Agentif.Abort(), kw...)
-    ensure_initialized!(assistant)
-    agent = base_agent(assistant)
+evaluate(assistant::AgentAssistant, input::Agentif.AgentTurnInput; abort::Agentif.Abort=Agentif.Abort(), channel::Union{Nothing, Agentif.AbstractChannel}=nothing, kw...) =
+    evaluate(identity, assistant, input; abort, channel, kw...)
+
+function evaluate(f::Function, assistant::AgentAssistant, input::Agentif.AgentTurnInput; abort::Agentif.Abort=Agentif.Abort(), channel::Union{Nothing, Agentif.AbstractChannel}=nothing, kw...)
+    chan = channel === nothing ? ReplChannel(devnull) : channel
+    chan_id = channel_id(chan)
+    session_id = resolve_session!(assistant.db, chan_id)
+
+    # Check if this is a rotated session and build bridge context
+    bridge = ""
+    row = iterate(SQLite.DBInterface.execute(assistant.db,
+        "SELECT session_id FROM channel_sessions WHERE channel_id = ?", (chan_id,)))
+    # Bridge context only on brand new sessions with no entries yet
+    if session_entry_count(assistant, session_id) == 0
+        # Find the previous session for this channel to bridge from
+        prev_rows = SQLite.DBInterface.execute(assistant.db,
+            "SELECT DISTINCT session_id FROM session_entries WHERE session_id != ? ORDER BY id DESC LIMIT 1", (session_id,))
+        prev = iterate(prev_rows)
+        if prev !== nothing
+            bridge = bridge_context(assistant.db, String(prev[1].session_id))
+        end
+    end
+
+    agent = base_agent(assistant; session_id=session_id, bridge=bridge)
     state = Agentif.AgentState()
-    handler = build_handler(assistant)
-    registry = get_skills_registry(assistant.store)
-    function event_cb(event)
-        handle_event!(assistant, event)
-        f(event)
-    end
-    return Agentif.evaluate(
-        event_cb,
-        agent,
-        input;
-        state,
-        base_handler = handler,
-        session_store = assistant.session_store,
-        session_id = assistant.session_id,
-        skill_registry = registry,
-        abort,
-        kw...,
-    )
-end
-
-function run!(assistant::AgentAssistant)
-    ensure_initialized!(assistant)
-    # Register heartbeat job in the store BEFORE starting the scheduler,
-    # so Tempus.run! picks it up from the store at startup.
-    # We can't use push! here because the scheduler loop isn't running yet
-    # and push! acquires scheduler.lock which deadlocks on single-threaded Julia.
-    assistant.config.enable_heartbeat && ensure_heartbeat!(assistant)
-    Tempus.run!(assistant.scheduler)
-    # Start Qmd watcher for semantic search
-    start_qmd_watcher!(assistant)
-    @info "AgentAssistant initialized" provider = assistant.config.provider model = assistant.config.model_id
-    return nothing
-end
-
-function get_database_path(store::FileStore)
-    return joinpath(store.root, DATABASE_FILENAME)
-end
-
-function get_database_path(store::InMemoryStore)
-    return nothing  # In-memory stores don't use SQLite
-end
-
-function start_qmd_watcher!(assistant::AgentAssistant)
-    store = assistant.store
-    store isa InMemoryStore && return nothing  # Skip for in-memory stores
-
-    data_dir = store.root
-    db_path = get_database_path(store)
-
-    # Set the LLMTools store path so qmd_* tools use our database
-    LLMTools.qmd_set_store_path(db_path)
-
-    # Ensure Qmd collection exists for the data directory
+    handler = build_handler(assistant; session_id=session_id, channel=channel)
+    @atomic assistant.evaluating = true
     try
-        existing = Qmd.Collections.get_collection(QMD_COLLECTION_NAME)
-        if existing === nothing || existing.path != data_dir
-            existing !== nothing && Qmd.Collections.remove(QMD_COLLECTION_NAME)
-            Qmd.Collections.add(QMD_COLLECTION_NAME, data_dir; pattern=QMD_COLLECTION_PATTERN)
-        end
-
-        # Index only the vo_data collection (not all collections, which may include
-        # stale entries pointing to deleted temp directories)
-        collection = Qmd.Collections.get_collection(QMD_COLLECTION_NAME)
-        local_store = Qmd.Store.open_store(db_path)
-        try
-            Qmd.Indexer.index_collection(local_store, collection)
-        finally
-            Qmd.Store.close(local_store)
-        end
-
-        # Start watching for changes (non-blocking)
-        assistant.watcher_state = Qmd.start_watching(;
-            debounce_ms=500,
-            store_path=db_path,
-            on_error=(collection, err) -> @warn "Qmd watcher error" collection exception=err
-        )
-        @debug "Qmd watcher started for" data_dir
-    catch err
-        @warn "Failed to start Qmd watcher" exception=(err, catch_backtrace())
+        return handler(f, agent, state, input, abort; kw...)
+    finally
+        @atomic assistant.evaluating = false
     end
-    return nothing
 end
 
-function stop_qmd_watcher!(assistant::AgentAssistant)
-    if assistant.watcher_state !== nothing
-        try
-            Qmd.stop_watching()
-            assistant.watcher_state = nothing
-            @debug "Qmd watcher stopped"
-        catch err
-            @warn "Failed to stop Qmd watcher" exception=(err, catch_backtrace())
-        end
-    end
-    return nothing
-end
+# --- Heartbeat ---
 
-function Base.close(assistant::AgentAssistant)
-    # Clear global ref if this is the current assistant
-    CURRENT_ASSISTANT[] === assistant && (CURRENT_ASSISTANT[] = nothing)
-    lock(assistant.lock) do
-        try
-            # Only close scheduler if it's actually running to avoid hanging
-            assistant.scheduler.running && Tempus.close(assistant.scheduler)
-        catch err
-            @warn "Failed to close scheduler" exception = (err, catch_backtrace())
-        end
-        # Stop Qmd watcher
-        stop_qmd_watcher!(assistant)
-    end
-    return nothing
-end
-
-function sync_scheduled_jobs!(assistant::AgentAssistant)
-    for job in listJobs(assistant.scheduler)
-        sync_job!(assistant, job)
-    end
-    return nothing
-end
-
-function sync_job!(assistant::AgentAssistant, job::Tempus.Job)
-    Tempus.purgeJob!(assistant.scheduler.store, job.name)
-    Tempus.isdisabled(job) && return nothing
-    push!(assistant.scheduler, job)
-    return nothing
-end
-
-"""
-Check if heartbeat.md has actionable content (non-empty, non-comment-only).
-"""
-function heartbeat_has_tasks(store::AbstractAssistantStore)
-    tasks = getHeartbeatTasks(store)
-    # Strip comments (lines starting with #) and whitespace
+function heartbeat_has_tasks(assistant::AgentAssistant)
+    tasks = getHeartbeatTasks(assistant)
     for line in split(tasks, "\n")
         stripped = strip(line)
         isempty(stripped) && continue
@@ -1108,37 +1062,27 @@ function execute_heartbeat!(assistant::AgentAssistant)
     if local_hour < HEARTBEAT_START_HOUR || local_hour > HEARTBEAT_END_HOUR
         return nothing
     end
-
-    # #8: Skip if an evaluation is currently in progress (don't interrupt active conversation)
     if @atomic assistant.evaluating
         @debug "[vo] Heartbeat skipped: evaluation in progress"
         return nothing
     end
-
     first_heartbeat = local_hour == HEARTBEAT_START_HOUR
     last_heartbeat = local_hour == HEARTBEAT_END_HOUR
-    has_tasks = heartbeat_has_tasks(assistant.store)
-
-    # #11: Empty-check optimization — skip LLM call for mid-day heartbeats with nothing to do
+    has_tasks = heartbeat_has_tasks(assistant)
     if !first_heartbeat && !last_heartbeat && !has_tasks
         @debug "[vo] Heartbeat skipped: no pending tasks, not first/last"
         return nothing
     end
-
-    # Build heartbeat prompt with tasks and skill names
     offset_minutes = local_utc_offset_minutes(local_time)
-    heartbeat_tasks = getHeartbeatTasks(assistant.store)
+    heartbeat_tasks_str = getHeartbeatTasks(assistant)
     skill_names = try
-        skills = getSkills(assistant.store)
+        skills = getSkills(assistant.db)
         [s.name for s in skills]
     catch
         String[]
     end
-    prompt = heartbeat_prompt(local_time, offset_minutes, heartbeat_tasks, skill_names)
-
+    prompt = heartbeat_prompt(local_time, offset_minutes, heartbeat_tasks_str, skill_names)
     result_state = @with TRIGGER_PROMPT => prompt evaluate(assistant, "Evaluate heartbeat prompt")
-
-    # #9: Deduplication — skip delivery if response is identical to last heartbeat within 24h
     if result_state !== nothing
         response_text = ""
         for msg in result_state.messages
@@ -1155,7 +1099,6 @@ function execute_heartbeat!(assistant::AgentAssistant)
         assistant.last_heartbeat_hash = response_hash
         assistant.last_heartbeat_time = now_unix
     end
-
     return nothing
 end
 
@@ -1163,29 +1106,20 @@ function ensure_heartbeat!(assistant::AgentAssistant)
     offset_minutes = local_utc_offset_minutes()
     interval = assistant.config.heartbeat_interval_minutes
     schedule = heartbeat_schedule(offset_minutes, interval)
-    # Job closure captures nothing - looks up assistant from global ref at execution time
     job = Tempus.Job(
         () -> begin
             a = get_current_assistant()
-            a === nothing && return nothing  # Assistant was closed
+            a === nothing && return nothing
             execute_heartbeat!(a)
         end, HEARTBEAT_JOB_NAME, schedule
     )
-    # Add directly to store (not push!) so scheduler picks it up at startup.
-    # push! acquires scheduler.lock which deadlocks when scheduler loop isn't running
-    # or is holding the lock on single-threaded Julia.
     Tempus.purgeJob!(assistant.scheduler.store, job.name)
     Tempus.isdisabled(job) && return job
     Tempus.addJob!(assistant.scheduler.store, job)
     return job
 end
 
-"""
-Trigger an immediate heartbeat-like evaluation with a custom prompt.
-Used for exec completion events (#10) and other proactive notifications.
-"""
 function trigger_event_heartbeat!(assistant::AgentAssistant, event_prompt::String)
-    # Skip if evaluation in progress
     if @atomic assistant.evaluating
         @debug "[vo] Event heartbeat skipped: evaluation in progress"
         return nothing
@@ -1194,33 +1128,37 @@ function trigger_event_heartbeat!(assistant::AgentAssistant, event_prompt::Strin
     return nothing
 end
 
-# include("vo_repl_mode.jl")
+# --- Lifecycle ---
+
+function run!(assistant::AgentAssistant)
+    assistant.config.enable_heartbeat && ensure_heartbeat!(assistant)
+    Tempus.run!(assistant.scheduler)
+    @info "AgentAssistant initialized" provider=assistant.config.provider model=assistant.config.model_id
+    return nothing
+end
+
+function Base.close(assistant::AgentAssistant)
+    CURRENT_ASSISTANT[] === assistant && (CURRENT_ASSISTANT[] = nothing)
+    try
+        assistant.scheduler.running && Tempus.close(assistant.scheduler)
+    catch err
+        @warn "Failed to close scheduler" exception=(err, catch_backtrace())
+    end
+    return nothing
+end
+
+# --- Telegram bot stub ---
 
 """
     run_telegram_bot(; use_polling=true, kwargs...)
 
-Start a Telegram bot that forwards messages to the current Vo `AgentAssistant`
-and streams responses back. Requires `using Telegram` to activate the extension.
-
-See `VoTelegramExt` for implementation details.
+Start a Telegram bot. Requires `using Telegram` to activate the extension.
 """
 function run_telegram_bot end
 
-function is_test_mode()
-    # Check environment variable for explicit skip
-    Base.get(ENV, "VO_SKIP_INIT", "") == "1" && return true
-    # Check if running a test script (program file contains "test" or "runtests")
-    prog = string(Base.PROGRAM_FILE)
-    !isempty(prog) && occursin(r"(runtests|test)"i, prog) && return true
-    # Check ARGS for test file paths
-    for arg in ARGS
-        occursin(r"(runtests|test)"i, arg) && return true
-    end
-    return false
-end
+# --- REPL ---
 
 function __init__()
-    is_test_mode() && return
     Base.get(ENV, "VO_AUTO_RUN", "") == "1" || return
     init!()
     return
@@ -1238,7 +1176,7 @@ struct ReplResponse
 end
 
 function Base.show(io::IO, resp::ReplResponse)
-    return evaluate(get_current_assistant(), resp.input)
+    return evaluate(get_current_assistant(), resp.input; channel=ReplChannel(io))
 end
 
 macro a_str(input)

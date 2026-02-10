@@ -1,3 +1,6 @@
+const AgentHandler = Function
+const AgentMiddleware = Function
+
 @kwarg struct Agent
     id::Union{Nothing, String} = nothing
     name::Union{Nothing, String} = nothing
@@ -46,6 +49,14 @@ struct AbortEvaluation <: Exception
 end
 
 check_abort(abort::Abort) = isaborted(abort) && throw(AbortEvaluation())
+
+function last_assistant_message(state::AgentState)
+    for idx in length(state.messages):-1:1
+        msg = state.messages[idx]
+        msg isa AssistantMessage && return msg
+    end
+    return nothing
+end
 
 function append_turn_input!(state::AgentState, input::AgentTurnInput)
     if input isa String

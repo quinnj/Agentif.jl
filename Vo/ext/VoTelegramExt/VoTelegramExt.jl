@@ -10,21 +10,6 @@ using Logging
 
 Start a Telegram bot that forwards incoming messages to the current Vo
 `AgentAssistant` and streams responses back via Telegram's `editMessageText`.
-
-Requires both `Vo` and `Telegram` to be loaded, and a Telegram client to be
-active (via `Telegram.with_telegram`).
-
-With `use_polling=true` (default), uses long-polling via `getUpdates`.
-Set `use_polling=false` for webhook mode (call `Telegram.set_webhook` first).
-
-# Example
-```julia
-using Vo, Telegram
-
-Telegram.with_telegram(ENV["TELEGRAM_BOT_TOKEN"]) do
-    Vo.run_telegram_bot()
-end
-```
 """
 function Vo.run_telegram_bot(;
         use_polling::Bool = true,
@@ -35,20 +20,13 @@ function Vo.run_telegram_bot(;
         secret_token::Union{String, Nothing} = nothing,
         error_handler::Union{Function, Nothing} = nothing,
         allowed_updates::Union{Vector{String}, Nothing} = nothing)
-    # Check if assistant is set before starting
     assistant = Vo.get_current_assistant()
     if assistant === nothing
-        @warn "VoTelegramExt: No assistant is currently active. Create one with `Vo.AgentAssistant()` before running the bot."
-        @info "VoTelegramExt: Example usage:" 
-        @info "  using Vo, Telegram"
-        @info "  assistant = Vo.AgentAssistant()"
-        @info "  Telegram.with_telegram(ENV[\"TELEGRAM_BOT_TOKEN\"]) do"
-        @info "      Vo.run_telegram_bot()"
-        @info "  end"
+        @warn "VoTelegramExt: No assistant is currently active."
     else
         @info "VoTelegramExt: Starting bot with assistant (provider=$(assistant.config.provider), model=$(assistant.config.model_id))"
     end
-    
+
     if use_polling
         @info "VoTelegramExt: Starting polling mode (timeout=$(timeout)s)"
         Telegram.run_polling(_handle_update; timeout, allowed_updates, error_handler)
@@ -58,15 +36,51 @@ function Vo.run_telegram_bot(;
     end
 end
 
+# TelegramChannel — streams responses to a Telegram chat
+mutable struct TelegramChannel <: Agentif.AbstractChannel
+    chat_id::Any
+    sm::Union{Nothing, Telegram.StreamingMessage}
+end
+TelegramChannel(chat_id) = TelegramChannel(chat_id, nothing)
+
+function Agentif.start_streaming(ch::TelegramChannel)
+    if ch.sm === nothing
+        ch.sm = Telegram.send_streaming_message(ch.chat_id)
+    end
+    return ch.sm
+end
+
+function Agentif.append_to_stream(::TelegramChannel, sm::Telegram.StreamingMessage, delta::AbstractString)
+    Telegram.append!(sm, delta)
+end
+
+function Agentif.finish_streaming(::TelegramChannel, ::Telegram.StreamingMessage)
+    return nothing
+end
+
+function Agentif.close_channel(ch::TelegramChannel, sm::Telegram.StreamingMessage)
+    Telegram.finish!(sm)
+    ch.sm = nothing
+end
+
+function Agentif.send_message(ch::TelegramChannel, msg)
+    Telegram.send_message(ch.chat_id, string(msg))
+end
+
+# Channel ID for session mapping — Vo.channel_id dispatch
+function Vo.channel_id(ch::TelegramChannel)
+    return "telegram:$(ch.chat_id)"
+end
+
 function _handle_update(update::Telegram.Update)
     @debug "VoTelegramExt: Received update" update_id=update.update_id
-    
+
     msg = update.message
     if msg === nothing
         @debug "VoTelegramExt: Update has no message, skipping"
         return
     end
-    
+
     text = msg.text
     if text === nothing || isempty(text)
         @debug "VoTelegramExt: Message has no text, skipping" chat_id=msg.chat.id
@@ -75,32 +89,19 @@ function _handle_update(update::Telegram.Update)
 
     chat_id = msg.chat.id
     @info "VoTelegramExt: Processing message" chat_id=chat_id text_length=length(text)
-    
+
     assistant = Vo.get_current_assistant()
     if assistant === nothing
-        @warn "VoTelegramExt: No assistant active, sending error message" chat_id=chat_id
-        Telegram.send_message(chat_id, "No assistant is currently active. Please create an assistant first with `Vo.AgentAssistant()`.")
+        @warn "VoTelegramExt: No assistant active" chat_id=chat_id
+        Telegram.send_message(chat_id, "No assistant is currently active.")
         return
     end
 
-    @debug "VoTelegramExt: Starting evaluation" chat_id=chat_id assistant_provider=assistant.config.provider
-    sm = Telegram.send_streaming_message(chat_id)
     try
-        Vo.evaluate(assistant, text) do event
-            if event isa Agentif.MessageUpdateEvent && event.kind == :text
-                Telegram.append!(sm, event.delta)
-            end
-        end
-        @debug "VoTelegramExt: Evaluation completed" chat_id=chat_id
+        ch = TelegramChannel(chat_id)
+        Vo.evaluate(assistant, text; channel=ch)
     catch e
         @error "VoTelegramExt: evaluation error" chat_id=chat_id exception=(e, catch_backtrace())
-        sm.buffer = "Sorry, an error occurred while processing your message."
-    finally
-        try
-            Telegram.finish!(sm)
-        catch e
-            @error "VoTelegramExt: Error finishing streaming message" chat_id=chat_id exception=(e, catch_backtrace())
-        end
     end
 end
 

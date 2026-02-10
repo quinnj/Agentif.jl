@@ -32,7 +32,10 @@ function google_gemini_cli_build_contents(agent::Agent, state::AgentState, input
 
     contents = GoogleGeminiCli.Content[]
     for msg in normalized
-        if msg isa UserMessage
+        if msg isa CompactionSummaryMessage
+            push!(contents, GoogleGeminiCli.Content(; role = "user", parts = [GoogleGeminiCli.Part(; text = "[Previous conversation summary]\n\n$(msg.summary)")]))
+            continue
+        elseif msg isa UserMessage
             parts = GoogleGeminiCli.Part[]
             for block in msg.content
                 if block isa TextContent

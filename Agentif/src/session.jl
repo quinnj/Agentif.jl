@@ -4,9 +4,10 @@ abstract type SessionStore end
     id::Union{Nothing, String} = nothing
     created_at::Float64 = time()
     messages::Vector{AgentMessage} = AgentMessage[]
+    is_compaction::Bool = false
 end
 
-JSON.lower(x::SessionEntry) = (; id = x.id, created_at = x.created_at, messages = x.messages)
+JSON.lower(x::SessionEntry) = (; id = x.id, created_at = x.created_at, messages = x.messages, is_compaction = x.is_compaction)
 
 mutable struct InMemorySessionStore <: SessionStore
     lock::ReentrantLock
@@ -42,6 +43,9 @@ function session_path(store::FileSessionStore, session_id::String)
 end
 
 function apply_session_entry!(state::AgentState, entry::SessionEntry)
+    if entry.is_compaction
+        empty!(state.messages)
+    end
     append!(state.messages, entry.messages)
     for msg in entry.messages
         msg isa AssistantMessage || continue

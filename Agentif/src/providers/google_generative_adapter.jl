@@ -32,7 +32,10 @@ function google_generative_build_contents(agent::Agent, state::AgentState, input
 
     contents = GoogleGenerativeAI.Content[]
     for msg in normalized
-        if msg isa UserMessage
+        if msg isa CompactionSummaryMessage
+            push!(contents, GoogleGenerativeAI.Content(; role = "user", parts = [GoogleGenerativeAI.Part(; text = "[Previous conversation summary]\n\n$(msg.summary)")]))
+            continue
+        elseif msg isa UserMessage
             parts = GoogleGenerativeAI.Part[]
             for block in msg.content
                 if block isa TextContent

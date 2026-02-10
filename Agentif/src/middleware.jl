@@ -1,14 +1,3 @@
-const AgentHandler = Function
-const AgentMiddleware = Function
-
-function last_assistant_message(state::AgentState)
-    for idx in length(state.messages):-1:1
-        msg = state.messages[idx]
-        msg isa AssistantMessage && return msg
-    end
-    return nothing
-end
-
 function drain_channel!(channel::Channel{AgentTurnInput})
     inputs = AgentTurnInput[]
     while isready(channel)
@@ -83,17 +72,54 @@ function queue_middleware(agent_handler::AgentHandler, message_queue::Union{Noth
     end
 end
 
+function evaluate_middleware(agent_handler::AgentHandler)
+    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)
+        evaluate_id = UID8()
+        f(AgentEvaluateStartEvent(evaluate_id))
+        result_state = nothing
+        try
+            result_state = @with CURRENT_EVALUATION_ID => evaluate_id begin
+                agent_handler(f, agent, state, current_input, abort; kw...)
+            end
+            return result_state
+        catch e
+            if e isa AbortEvaluation
+                return result_state === nothing ? state : result_state
+            end
+            if e isa CapturedException && e.ex isa AbortEvaluation
+                return result_state === nothing ? state : result_state
+            end
+            rethrow()
+        finally
+            f(AgentEvaluateEndEvent(evaluate_id, result_state))
+        end
+    end
+end
+
 function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, SessionStore}; session_id::Union{Nothing, String} = nothing)
+    sid_ref = Ref{Union{Nothing, String}}(session_id)
     return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; session_id::Union{Nothing, String} = nothing, kw...)
         store === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
-        sid = session_id === nothing ? new_session_id() : ensure_session_id(session_id)
+        sid = session_id === nothing ? sid_ref[] : ensure_session_id(session_id)
+        sid === nothing && (sid = new_session_id())
+        sid_ref[] = sid
         current_state = load_session(store, sid)
         current_state.session_id = sid
         start_idx = length(current_state.messages)
         current_state = agent_handler(f, agent, current_state, current_input, abort; kw...)
-        if length(current_state.messages) > start_idx
-            eval_id = CURRENT_EVALUATION_ID[]
-            entry_id = eval_id === nothing ? nothing : string(eval_id)
+        eval_id = CURRENT_EVALUATION_ID[]
+        entry_id = eval_id === nothing ? nothing : string(eval_id)
+        if current_state.last_compaction !== nothing
+            # Compaction happened: write full state as compaction entry
+            entry = SessionEntry(;
+                id = entry_id,
+                created_at = time(),
+                messages = copy(current_state.messages),
+                is_compaction = true,
+            )
+            append_session_entry!(store, sid, entry)
+            current_state.last_compaction = nothing
+        elseif length(current_state.messages) > start_idx
             new_messages = current_state.messages[(start_idx + 1):end]
             entry = SessionEntry(; id = entry_id, created_at = time(), messages = new_messages)
             append_session_entry!(store, sid, entry)
@@ -118,6 +144,7 @@ function input_guardrail_middleware(agent_handler::AgentHandler, guardrail::Unio
         (guardrail === nothing || guardrail === false) && return agent_handler(f, agent, state, current_input, abort; kw...)
         text = guardrail_input_text(current_input)
         text === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
+        apikey_override = input_guardrail_apikey === nothing ? agent.apikey : input_guardrail_apikey
 
         guardrail_future = Future{Bool}() do
             # should we try-catch this block and @warn + return false?
@@ -129,10 +156,12 @@ function input_guardrail_middleware(agent_handler::AgentHandler, guardrail::Unio
                 return try; JSON.parse(last_assistant_message(result_state).text, ValidUserInput).valid_user_input; catch; false; end
             end
         end
-        return agent_handler(agent, state, current_input, abort; kw...) do event
+        result_state = agent_handler(function (event)
             wait(guardrail_future) || throw(InvalidInputError(text))
             f(event)
-        end
+        end, agent, state, current_input, abort; kw...)
+        wait(guardrail_future) || throw(InvalidInputError(text))
+        return result_state
     end
 end
 
@@ -148,19 +177,26 @@ end
 function build_default_handler(
         ;
         base_handler::AgentHandler = stream,
+        compaction_config::Union{Nothing, CompactionConfig} = nothing,
         steer_queue::Union{Nothing, Channel{AgentTurnInput}} = nothing,
         message_queue::Union{Nothing, Channel{AgentTurnInput}} = nothing,
         session_store::Union{Nothing, SessionStore} = nothing,
         session_id::Union{Nothing, String} = nothing,
         input_guardrail::Union{Nothing, Bool, Function} = nothing,
         skill_registry::Union{Nothing, SkillRegistry} = nothing,
+        channel::Union{Nothing, AbstractChannel} = nothing,
     )
     handler = base_handler
+    if compaction_config !== nothing
+        handler = compaction_middleware(handler, compaction_config)
+    end
     handler = steer_middleware(handler, steer_queue)
+    handler = channel_middleware(handler, channel)
     handler = tool_call_middleware(handler)
     handler = session_middleware(handler, session_store; session_id)
     handler = input_guardrail_middleware(handler, input_guardrail)
     handler = skills_middleware(handler, skill_registry)
+    handler = evaluate_middleware(handler)
     handler = queue_middleware(handler, message_queue)
     return handler
 end
@@ -173,33 +209,17 @@ function evaluate(
         input::AgentTurnInput;
         state::AgentState = AgentState(),
         base_handler::AgentHandler = stream,
+        compaction_config::Union{Nothing, CompactionConfig} = nothing,
         steer_queue::Union{Nothing, Channel{AgentTurnInput}} = nothing,
         message_queue::Union{Nothing, Channel{AgentTurnInput}} = nothing,
         session_store::Union{Nothing, SessionStore} = nothing,
         session_id::Union{Nothing, String} = nothing,
         input_guardrail::Union{Nothing, Bool, Function} = nothing,
         skill_registry::Union{Nothing, SkillRegistry} = nothing,
+        channel::Union{Nothing, AbstractChannel} = nothing,
         abort::Abort = Abort(),
         kw...,
     )
-    evaluate_id = UID8()
-    f(AgentEvaluateStartEvent(evaluate_id))
-    result_state = nothing
-    handler = build_default_handler(; base_handler, steer_queue, message_queue, session_store, session_id, input_guardrail, skill_registry)
-    try
-        result_state = @with CURRENT_EVALUATION_ID => evaluate_id begin
-            handler(f, agent, state, input, abort; kw...)
-        end
-        return result_state
-    catch e
-        if e isa AbortEvaluation
-            return result_state === nothing ? state : result_state
-        end
-        if e isa CapturedException && e.ex isa AbortEvaluation
-            return result_state === nothing ? state : result_state
-        end
-        rethrow()
-    finally
-        f(AgentEvaluateEndEvent(evaluate_id, result_state))
-    end
+    handler = build_default_handler(; base_handler, compaction_config, steer_queue, message_queue, session_store, session_id, input_guardrail, skill_registry, channel)
+    return handler(f, agent, state, input, abort; kw...)
 end
