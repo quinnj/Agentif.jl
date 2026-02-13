@@ -11,14 +11,12 @@ JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 LLMProviders = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 PtySessions = "581b29ee-4021-4243-bea3-a8421693f905"
-Qmd = "80d76a79-6984-4019-9967-cf331f2deafb"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [sources]
 Agentif = {path = "../Agentif"}
 LLMProviders = {path = "../LLMProviders"}
 PtySessions = {path = "../../PtySessions"}
-Qmd = {path = "../../QMD"}
 
 [compat]
 Agentif = "1"

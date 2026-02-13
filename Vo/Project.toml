@@ -11,19 +11,20 @@ JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 LLMTools = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
 LocalSearch = "3edf9609-13f2-4288-b0a3-8bd6d521158e"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
 PtySessions = "581b29ee-4021-4243-bea3-a8421693f905"
-ScopedValues = "7e506255-f358-4e82-b7e4-beb19740aa63"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
+ScopedValues = "7e506255-f358-4e82-b7e4-beb19740aa63"
 Tempus = "e6262be2-5787-4bdc-bc3f-4b5a3442fa30"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [sources]
 Agentif = {path = "../Agentif"}
+HTTP = {path = "/Users/jacob.quinn/.julia/packages/HTTP/na214"}
+JSON = {path = "../../JSON"}
 LLMTools = {path = "../LLMTools"}
 LocalSearch = {path = "../../LocalSearch"}
-JSON = {path = "../../JSON"}
-HTTP = {path = "/Users/jacob.quinn/.julia/packages/HTTP/na214"}
 PtySessions = {path = "../../PtySessions"}
 Tempus = {path = "../../Tempus"}
 
