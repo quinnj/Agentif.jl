@@ -3,6 +3,7 @@ module AgentifSignalExt
 using Signal
 import Agentif
 using Logging
+using ScopedValues: @with
 
 export run_signal_bot
 
@@ -30,10 +31,14 @@ function run_signal_bot(handler::Function;
 end
 
 # SignalChannel — streams responses to a Signal conversation
+# Note: Signal has no concept of "public" groups — all groups are private.
 mutable struct SignalChannel <: Agentif.AbstractChannel
     recipient::String
     client::Signal.Client
     sm::Union{Nothing, Signal.StreamingMessage}
+    user_id::String
+    user_name::String
+    is_group_chat::Bool
 end
 
 function Agentif.start_streaming(ch::SignalChannel)
@@ -72,6 +77,20 @@ function Agentif.channel_id(ch::SignalChannel)
     return "signal:$(ch.recipient)"
 end
 
+function Agentif.is_group(ch::SignalChannel)
+    return ch.is_group_chat
+end
+
+function Agentif.is_private(ch::SignalChannel)
+    # Signal groups are always private (no public channel concept)
+    return true
+end
+
+function Agentif.get_current_user(ch::SignalChannel)
+    isempty(ch.user_id) && return nothing
+    return Agentif.ChannelUser(ch.user_id, ch.user_name)
+end
+
 function _handle_envelope(handler::Function, envelope::Signal.Envelope)
     dm = envelope.dataMessage
     dm === nothing && return
@@ -79,21 +98,29 @@ function _handle_envelope(handler::Function, envelope::Signal.Envelope)
     text = dm.message
     (text === nothing || isempty(text)) && return
 
+    # Extract user identity
+    user_id = envelope.sourceNumber !== nothing ? string(envelope.sourceNumber) :
+              envelope.source !== nothing ? string(envelope.source) : ""
+    user_name = envelope.sourceName !== nothing ? string(envelope.sourceName) : user_id
+
     # Determine reply target: group or direct
-    recipient = if dm.groupInfo !== nothing && dm.groupInfo.groupId !== nothing
+    is_group_chat = dm.groupInfo !== nothing && dm.groupInfo.groupId !== nothing
+    recipient = if is_group_chat
         Signal.group_recipient(dm.groupInfo.groupId)
     else
-        source = envelope.sourceNumber !== nothing ? envelope.sourceNumber : envelope.source
-        source === nothing && return
-        source
+        isempty(user_id) && return
+        user_id
     end
 
-    @info "AgentifSignalExt: Processing message" recipient=recipient text_length=length(text)
+    # Detect direct ping: DM (non-group) is always direct; Signal has no @mention concept
+    direct_ping = !is_group_chat
+
+    @info "AgentifSignalExt: Processing message" recipient=recipient user_id=user_id is_group=is_group_chat direct_ping=direct_ping text_length=length(text)
 
     try
-        ch = SignalChannel(recipient, Signal._get_client(), nothing)
+        ch = SignalChannel(recipient, Signal._get_client(), nothing, user_id, user_name, is_group_chat)
         Agentif.with_channel(ch) do
-            handler(text)
+            @with Agentif.DIRECT_PING => direct_ping handler(text)
         end
     catch e
         @error "AgentifSignalExt: handler error" recipient=recipient exception=(e, catch_backtrace())

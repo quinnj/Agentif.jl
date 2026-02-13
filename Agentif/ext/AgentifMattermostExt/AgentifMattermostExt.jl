@@ -4,6 +4,7 @@ using Mattermost
 using Mattermost: JSON
 import Agentif
 using Logging
+using ScopedValues: @with
 
 export run_mattermost_bot
 
@@ -18,10 +19,11 @@ function run_mattermost_bot(handler::Function;
         error_handler::Union{Function, Nothing} = nothing)
     me = Mattermost.get_me()
     bot_user_id = me.id
+    bot_username = me.username !== nothing ? lowercase(string(me.username)) : ""
     @info "AgentifMattermostExt: Bot user: $(me.username) ($(bot_user_id))"
 
     Mattermost.run_websocket(; error_handler) do event
-        _handle_event(handler, event, bot_user_id)
+        _handle_event(handler, event, bot_user_id, bot_username)
     end
 end
 
@@ -30,8 +32,11 @@ mutable struct MattermostChannel <: Agentif.AbstractChannel
     channel_id::String
     client::Mattermost.Client
     sm::Union{Nothing, Mattermost.StreamingMessage}
+    user_id::String
+    user_name::String
+    # "O" = open/public, "P" = private, "D" = DM, "G" = group DM
+    channel_type::String
 end
-MattermostChannel(channel_id) = MattermostChannel(channel_id, Mattermost._get_client(), nothing)
 
 function Agentif.start_streaming(ch::MattermostChannel)
     if ch.sm === nothing
@@ -69,7 +74,20 @@ function Agentif.channel_id(ch::MattermostChannel)
     return "mattermost:$(ch.channel_id)"
 end
 
-function _handle_event(handler::Function, event::Mattermost.WebSocketEvent, bot_user_id::String)
+function Agentif.is_group(ch::MattermostChannel)
+    return ch.channel_type in ("O", "P", "G")
+end
+
+function Agentif.is_private(ch::MattermostChannel)
+    return ch.channel_type != "O"
+end
+
+function Agentif.get_current_user(ch::MattermostChannel)
+    isempty(ch.user_id) && return nothing
+    return Agentif.ChannelUser(ch.user_id, ch.user_name)
+end
+
+function _handle_event(handler::Function, event::Mattermost.WebSocketEvent, bot_user_id::String, bot_username::String="")
     event.event == "posted" || return
     event.data === nothing && return
 
@@ -84,12 +102,26 @@ function _handle_event(handler::Function, event::Mattermost.WebSocketEvent, bot_
     (message === nothing || isempty(message)) && return
 
     channel_id = get(post_data, "channel_id", "")
-    @info "AgentifMattermostExt: Processing message" channel_id=channel_id user_id=user_id text_length=length(message)
+
+    # Extract user name from event data
+    user_name = get(event.data, "sender_name", "")
+    # Strip leading @ if present
+    if startswith(user_name, "@")
+        user_name = user_name[2:end]
+    end
+
+    # Extract channel type from event data
+    channel_type = get(event.data, "channel_type", "O")
+
+    # Detect direct ping: DM or @bot_username mention in text
+    direct_ping = channel_type == "D" || (!isempty(bot_username) && occursin("@" * bot_username, lowercase(message)))
+
+    @info "AgentifMattermostExt: Processing message" channel_id=channel_id channel_type=channel_type user_id=user_id direct_ping=direct_ping text_length=length(message)
 
     try
-        ch = MattermostChannel(channel_id)
+        ch = MattermostChannel(channel_id, Mattermost._get_client(), nothing, user_id, user_name, channel_type)
         Agentif.with_channel(ch) do
-            handler(message)
+            @with Agentif.DIRECT_PING => direct_ping handler(message)
         end
     catch e
         @error "AgentifMattermostExt: handler error" channel_id=channel_id exception=(e, catch_backtrace())

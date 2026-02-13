@@ -17,6 +17,7 @@ include("skills.jl")
 include("agent.jl")
 include("session.jl")
 include("input_guardrail.jl")
+include("output_guardrail.jl")
 include("stream.jl")
 include("compaction.jl")
 include("channels.jl")
@@ -27,8 +28,11 @@ export Agent, Abort, abort!, isaborted, AgentHandler, AgentMiddleware
 export evaluate, stream, build_default_handler
 export steer_middleware, tool_call_middleware, queue_middleware, evaluate_middleware, session_middleware
 export input_guardrail_middleware, skills_middleware, compaction_middleware, channel_middleware
-export AbstractChannel, CURRENT_CHANNEL, with_channel
+export AbstractChannel, CURRENT_CHANNEL, DIRECT_PING, with_channel, ChannelUser
 export start_streaming, append_to_stream, finish_streaming, send_message, close_channel, channel_id
+export is_group, is_private, get_current_user
+export OutputGuardrailAgent, DEFAULT_OUTPUT_GUARDRAIL_AGENT
+export build_output_guardrail_input, materialize_output_guardrail_agent
 export CompactionConfig, CompactionSummaryMessage, compact!
 export with_prompt, with_tools
 export CURRENT_EVALUATION_ID, CURRENT_TURN_ID

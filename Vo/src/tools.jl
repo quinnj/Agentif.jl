@@ -162,7 +162,9 @@ Use referenced_at for temporal anchoring when the memory references a specific t
         addNewMemory(memory::String, priority::Union{Nothing, String}=nothing, referenced_at::Union{Nothing, String}=nothing) = begin
             eval_id = Agentif.CURRENT_EVALUATION_ID[]
             eval_id_str = eval_id === nothing ? nothing : string(eval_id)
-            mem = Vo.addNewMemory(assistant.db, memory; eval_id=eval_id_str, priority=priority, referenced_at=referenced_at, search_store=assistant.search_store)
+            ch = Agentif.CURRENT_CHANNEL[]
+            chan_id = ch !== nothing ? Agentif.channel_id(ch) : nothing
+            mem = Vo.addNewMemory(assistant.db, memory; eval_id=eval_id_str, priority=priority, referenced_at=referenced_at, search_store=assistant.search_store, channel_id=chan_id)
             return JSON.json(mem)
         end,
     )
@@ -170,7 +172,14 @@ Use referenced_at for temporal anchoring when the memory references a specific t
         "Search memories by keywords (space-separated). Use this PROACTIVELY at the start of conversations and whenever a topic comes up that you might have prior context on. Don't ask the user to repeat themselves — search first.",
         searchMemories(keywords::String, limit::Union{Nothing, Int}=nothing) = begin
             limit_value = limit === nothing ? 10 : limit
-            results = Vo.searchMemories(assistant.db, keywords; limit=limit_value, search_store=assistant.search_store)
+            ch = Agentif.CURRENT_CHANNEL[]
+            ac = if ch !== nothing
+                chan_id = Agentif.channel_id(ch)
+                Vo.accessible_channel_ids(assistant.db, chan_id)
+            else
+                nothing
+            end
+            results = Vo.searchMemories(assistant.db, keywords; limit=limit_value, search_store=assistant.search_store, accessible_channels=ac)
             return JSON.json(results)
         end,
     )
@@ -255,14 +264,14 @@ end
 
 function build_assistant_tools(assistant::AgentAssistant)
     setIdentityAndPurpose_tool = @tool(
-        "Update Vo's identity and purpose with new content.",
+        "Update the assistant's identity and purpose with new content.",
         setIdentityAndPurpose(content::String) = begin
             setIdentityAndPurpose!(assistant, content)
             return "updated"
         end,
     )
     getIdentityAndPurpose_tool = @tool(
-        "Get Vo's current identity and purpose.",
+        "Get the assistant's current identity and purpose.",
         getIdentityAndPurpose() = begin
             return Vo.getIdentityAndPurpose(assistant)
         end,
@@ -303,11 +312,18 @@ function build_assistant_tools(assistant::AgentAssistant)
         end,
     )
     search_session_tool = @tool(
-        "Search session entries (past turns between Vo and the user) using semantic search and return matching snippets.",
+        "Search session entries (past conversations) using semantic search and return matching snippets.",
         search_session(keywords::String, limit::Union{Nothing, Int}=nothing, offset::Union{Nothing, Int}=nothing) = begin
             limit_value = limit === nothing ? 10 : limit
             offset_value = offset === nothing ? 0 : offset
-            results = Vo.search_session(assistant, keywords; limit=limit_value, offset=offset_value)
+            ch = Agentif.CURRENT_CHANNEL[]
+            ac = if ch !== nothing
+                chan_id = Agentif.channel_id(ch)
+                Vo.accessible_channel_ids(assistant.db, chan_id)
+            else
+                nothing
+            end
+            results = Vo.search_session(assistant, keywords; limit=limit_value, offset=offset_value, accessible_channels=ac)
             return JSON.json(results)
         end,
     )
@@ -325,16 +341,32 @@ function build_assistant_tools(assistant::AgentAssistant)
         end,
     )
     tools = Agentif.AgentTool[
-        setIdentityAndPurpose_tool,
-        getIdentityAndPurpose_tool,
-        getHeartbeatTasks_tool,
-        setHeartbeatTasks_tool,
         analyzeImage_tool,
         search_session_tool,
         get_date_and_time_tool,
     ]
-    append!(tools, build_document_tools(assistant))
-    append!(tools, LLMTools.create_long_running_process_tool(assistant.config.base_dir))
-    append!(tools, LLMTools.web_tools())
+    # Admin-gated tools: identity/purpose/heartbeat only available to admins (or when no admins configured)
+    cfg = assistant.config
+    is_admin = if isempty(cfg.admins)
+        true  # No admin list = everyone is admin
+    else
+        ch = Agentif.CURRENT_CHANNEL[]
+        user = ch !== nothing ? Agentif.get_current_user(ch) : nothing
+        if user !== nothing
+            user.id in cfg.admins
+        else
+            # No user identity: admin if not in a group chat (REPL, DM without identity)
+            ch === nothing || !Agentif.is_group(ch)
+        end
+    end
+    if is_admin
+        push!(tools, setIdentityAndPurpose_tool)
+        push!(tools, getIdentityAndPurpose_tool)
+        push!(tools, getHeartbeatTasks_tool)
+        push!(tools, setHeartbeatTasks_tool)
+    end
+    cfg.documents && append!(tools, build_document_tools(assistant))
+    cfg.pty_tools && append!(tools, LLMTools.create_long_running_process_tool(cfg.base_dir))
+    cfg.web_tools && append!(tools, LLMTools.web_tools())
     return tools
 end

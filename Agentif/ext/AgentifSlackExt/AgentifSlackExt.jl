@@ -3,6 +3,7 @@ module AgentifSlackExt
 using Slack
 import Agentif
 using Logging
+using ScopedValues: @with
 
 export run_slack_bot
 
@@ -32,6 +33,9 @@ mutable struct SlackChannel <: Agentif.AbstractChannel
     thread_ts::String
     web_client::Slack.WebClient
     sm::Union{Nothing, Slack.ChatStream}
+    user_id::String
+    # "channel" = public, "group" = private channel, "im" = DM, "mpim" = multi-party DM
+    channel_type::String
 end
 
 function Agentif.start_streaming(ch::SlackChannel)
@@ -71,6 +75,20 @@ function Agentif.channel_id(ch::SlackChannel)
     return "slack:$(ch.channel)"
 end
 
+function Agentif.is_group(ch::SlackChannel)
+    return ch.channel_type in ("channel", "group", "mpim")
+end
+
+function Agentif.is_private(ch::SlackChannel)
+    # "channel" = public; everything else (DM, private channel, multi-party DM) is private
+    return ch.channel_type != "channel"
+end
+
+function Agentif.get_current_user(ch::SlackChannel)
+    isempty(ch.user_id) && return nothing
+    return Agentif.ChannelUser(ch.user_id, ch.user_id)  # name requires users.info API call
+end
+
 function _handle_request(handler::Function, request::Slack.SocketModeRequest, web_client::Slack.WebClient)
     request.type == "events_api" || return
 
@@ -96,12 +114,18 @@ function _handle_request(handler::Function, request::Slack.SocketModeRequest, we
     thread_ts = event.thread_ts !== nothing ? event.thread_ts : event.ts
     thread_ts === nothing && return
 
-    @info "AgentifSlackExt: Processing message" channel=channel text_length=length(text)
+    user_id = event.user !== nothing ? string(event.user) : ""
+    channel_type = event.channel_type !== nothing ? string(event.channel_type) : "channel"
+
+    # Detect direct ping: app_mention event or DM
+    direct_ping = event isa Slack.SlackAppMentionEvent || channel_type == "im"
+
+    @info "AgentifSlackExt: Processing message" channel=channel user_id=user_id channel_type=channel_type direct_ping=direct_ping text_length=length(text)
 
     try
-        ch = SlackChannel(channel, thread_ts, web_client, nothing)
+        ch = SlackChannel(channel, thread_ts, web_client, nothing, user_id, channel_type)
         Agentif.with_channel(ch) do
-            handler(text)
+            @with Agentif.DIRECT_PING => direct_ping handler(text)
         end
     catch e
         @error "AgentifSlackExt: handler error" channel=channel exception=(e, catch_backtrace())

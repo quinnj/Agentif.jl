@@ -46,8 +46,9 @@ struct Memory
     eval_id::Union{Nothing, String}
     priority::String  # "high", "medium", "low"
     referenced_at::Union{Nothing, String}  # ISO date or natural language temporal anchor
+    channel_id::Union{Nothing, String}
 end
-Memory(memory::String, createdAt::Float64, eval_id::Union{Nothing, String}) = Memory(memory, createdAt, eval_id, "medium", nothing)
+Memory(memory::String, createdAt::Float64, eval_id::Union{Nothing, String}) = Memory(memory, createdAt, eval_id, "medium", nothing, nothing)
 
 const MEMORY_TIMESTAMP_FORMAT = dateformat"yyyy-mm-dd HH:MM:SS"
 
@@ -57,6 +58,7 @@ function format_memory_timestamp(unix_time::Float64)
 end
 
 Base.@kwdef struct AssistantConfig
+    name::String = "Vo"
     provider::String
     model_id::String
     api_key::String
@@ -65,6 +67,16 @@ Base.@kwdef struct AssistantConfig
     base_dir::String = pwd()
     enable_heartbeat::Bool = true
     heartbeat_interval_minutes::Int = DEFAULT_HEARTBEAT_INTERVAL_MINUTES
+    # Tool group flags
+    pty_tools::Bool = true
+    web_tools::Bool = true
+    scheduling::Bool = true
+    memories::Bool = true
+    skills::Bool = true
+    documents::Bool = true
+    # Admin user IDs (platform-specific). When non-empty, identity/purpose/heartbeat
+    # tools are only available if the current user's ID is in this list.
+    admins::Vector{String} = String[]
 end
 
 # Global ref to the single assistant instance
@@ -95,7 +107,8 @@ function init_schema!(db::SQLite.DB)
             created_at REAL NOT NULL,
             eval_id TEXT,
             priority TEXT NOT NULL DEFAULT 'medium',
-            referenced_at TEXT
+            referenced_at TEXT,
+            channel_id TEXT
         )
     """)
     SQLite.execute(db, """
@@ -109,7 +122,9 @@ function init_schema!(db::SQLite.DB)
         CREATE TABLE IF NOT EXISTS channel_sessions (
             channel_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
-            last_activity REAL NOT NULL
+            last_activity REAL NOT NULL,
+            is_group INTEGER NOT NULL DEFAULT 0,
+            is_private INTEGER NOT NULL DEFAULT 1
         )
     """)
     SQLite.execute(db, """
@@ -119,15 +134,16 @@ function init_schema!(db::SQLite.DB)
             entry_id TEXT,
             created_at REAL NOT NULL,
             messages TEXT NOT NULL,
-            is_compaction INTEGER NOT NULL DEFAULT 0
+            is_compaction INTEGER NOT NULL DEFAULT 0,
+            user_id TEXT
         )
     """)
     SQLite.execute(db, """
         CREATE INDEX IF NOT EXISTS idx_session_entries_session
         ON session_entries(session_id, id)
     """)
-    # Migrate existing memories table if missing new columns
-    migrate_memories_schema!(db)
+    # Migrate existing tables if missing new columns
+    migrate_schema!(db)
 end
 
 function migrate_memories_schema!(db::SQLite.DB)
@@ -141,6 +157,32 @@ function migrate_memories_schema!(db::SQLite.DB)
     end
     if "referenced_at" ∉ cols
         SQLite.execute(db, "ALTER TABLE memories ADD COLUMN referenced_at TEXT")
+    end
+    if "channel_id" ∉ cols
+        SQLite.execute(db, "ALTER TABLE memories ADD COLUMN channel_id TEXT")
+    end
+end
+
+function migrate_schema!(db::SQLite.DB)
+    migrate_memories_schema!(db)
+    # Migrate channel_sessions
+    cs_cols = Set{String}()
+    for row in SQLite.DBInterface.execute(db, "PRAGMA table_info(channel_sessions)")
+        push!(cs_cols, String(row.name))
+    end
+    if "is_group" ∉ cs_cols
+        SQLite.execute(db, "ALTER TABLE channel_sessions ADD COLUMN is_group INTEGER NOT NULL DEFAULT 0")
+    end
+    if "is_private" ∉ cs_cols
+        SQLite.execute(db, "ALTER TABLE channel_sessions ADD COLUMN is_private INTEGER NOT NULL DEFAULT 1")
+    end
+    # Migrate session_entries
+    se_cols = Set{String}()
+    for row in SQLite.DBInterface.execute(db, "PRAGMA table_info(session_entries)")
+        push!(se_cols, String(row.name))
+    end
+    if "user_id" ∉ se_cols
+        SQLite.execute(db, "ALTER TABLE session_entries ADD COLUMN user_id TEXT")
     end
 end
 
@@ -189,9 +231,13 @@ end
 
 function Agentif.append_session_entry!(store::SQLiteSessionStore, session_id::String, entry::Agentif.SessionEntry)
     messages_json = JSON.json(entry.messages)
+    # Tag with current user ID if available
+    ch = Agentif.CURRENT_CHANNEL[]
+    user = ch !== nothing ? Agentif.get_current_user(ch) : nothing
+    user_id = user !== nothing ? user.id : nothing
     SQLite.execute(store.db,
-        "INSERT INTO session_entries (session_id, entry_id, created_at, messages, is_compaction) VALUES (?, ?, ?, ?, ?)",
-        (session_id, entry.id, entry.created_at, messages_json, entry.is_compaction ? 1 : 0))
+        "INSERT INTO session_entries (session_id, entry_id, created_at, messages, is_compaction, user_id) VALUES (?, ?, ?, ?, ?, ?)",
+        (session_id, entry.id, entry.created_at, messages_json, entry.is_compaction ? 1 : 0, user_id))
     # Index session text into LocalSearch
     if store.search_store !== nothing
         text = session_entry_search_text(entry)
@@ -376,14 +422,14 @@ function validate_priority(p::Union{Nothing, String})
     return "medium"
 end
 
-function addNewMemory(db::SQLite.DB, memory::String; eval_id::Union{Nothing, String}=nothing, priority::Union{Nothing, String}=nothing, referenced_at::Union{Nothing, String}=nothing, search_store::Union{Nothing, LocalSearch.Store}=nothing)
+function addNewMemory(db::SQLite.DB, memory::String; eval_id::Union{Nothing, String}=nothing, priority::Union{Nothing, String}=nothing, referenced_at::Union{Nothing, String}=nothing, search_store::Union{Nothing, LocalSearch.Store}=nothing, channel_id::Union{Nothing, String}=nothing)
     text = normalize_memory_text(memory)
     created_at = time()
     eval_id_str = eval_id === nothing ? nothing : string(eval_id)
     pri = validate_priority(priority)
     ref_at = referenced_at === nothing ? nothing : strip(referenced_at)
-    SQLite.execute(db, "INSERT INTO memories (memory, created_at, eval_id, priority, referenced_at) VALUES (?, ?, ?, ?, ?)", (text, created_at, eval_id_str, pri, ref_at))
-    mem = Memory(text, created_at, eval_id_str, pri, ref_at)
+    SQLite.execute(db, "INSERT INTO memories (memory, created_at, eval_id, priority, referenced_at, channel_id) VALUES (?, ?, ?, ?, ?, ?)", (text, created_at, eval_id_str, pri, ref_at, channel_id))
+    mem = Memory(text, created_at, eval_id_str, pri, ref_at, channel_id)
     # Index into LocalSearch
     if search_store !== nothing
         try
@@ -403,11 +449,12 @@ function _row_to_memory(r)
         r.eval_id === missing ? nothing : String(r.eval_id),
         r.priority === missing ? "medium" : String(r.priority),
         r.referenced_at === missing ? nothing : String(r.referenced_at),
+        hasproperty(r, :channel_id) && r.channel_id !== missing ? String(r.channel_id) : nothing,
     )
 end
 
 function load_all_memories(db::SQLite.DB)
-    rows = SQLite.DBInterface.execute(db, "SELECT memory, created_at, eval_id, priority, referenced_at FROM memories ORDER BY created_at DESC")
+    rows = SQLite.DBInterface.execute(db, "SELECT memory, created_at, eval_id, priority, referenced_at, channel_id FROM memories ORDER BY created_at DESC")
     return Memory[_row_to_memory(r) for r in rows]
 end
 
@@ -416,7 +463,7 @@ function lookup_memories_by_text(db::SQLite.DB, texts::Vector{String})
     isempty(texts) && return Memory[]
     placeholders = join(fill("?", length(texts)), ", ")
     rows = SQLite.DBInterface.execute(db,
-        "SELECT memory, created_at, eval_id, priority, referenced_at FROM memories WHERE memory IN ($placeholders)", texts)
+        "SELECT memory, created_at, eval_id, priority, referenced_at, channel_id FROM memories WHERE memory IN ($placeholders)", texts)
     by_text = Dict{String, Memory}()
     for r in rows
         by_text[String(r.memory)] = _row_to_memory(r)
@@ -425,15 +472,19 @@ function lookup_memories_by_text(db::SQLite.DB, texts::Vector{String})
     return Memory[by_text[t] for t in texts if haskey(by_text, t)]
 end
 
-function searchMemories(db::SQLite.DB, keywords::String; limit::Union{Nothing, Int}=nothing, search_store::Union{Nothing, LocalSearch.Store}=nothing)
+function searchMemories(db::SQLite.DB, keywords::String; limit::Union{Nothing, Int}=nothing, search_store::Union{Nothing, LocalSearch.Store}=nothing, accessible_channels::Union{Nothing, Vector{String}}=nothing)
     limit_value = limit === nothing ? 10 : limit
     # Try LocalSearch if available — results contain the full original memory text
     if search_store !== nothing && !isempty(strip(keywords))
         try
-            results = LocalSearch.search(search_store, keywords; limit=limit_value)
+            results = LocalSearch.search(search_store, keywords; limit=limit_value * 3)  # over-fetch for post-filter
             memory_results = filter(r -> startswith(r.id, "memory:"), results)
             if !isempty(memory_results)
-                return lookup_memories_by_text(db, [r.text for r in memory_results])
+                memories = lookup_memories_by_text(db, [r.text for r in memory_results])
+                if accessible_channels !== nothing
+                    memories = filter(m -> m.channel_id === nothing || m.channel_id in accessible_channels, memories)
+                end
+                return apply_limit(memories, limit_value)
             end
         catch err
             @debug "LocalSearch memory search failed, falling back to keyword search" exception=err
@@ -443,6 +494,9 @@ function searchMemories(db::SQLite.DB, keywords::String; limit::Union{Nothing, I
     keywords_list = parse_keywords(keywords)
     all_memories = load_all_memories(db)
     results = filter(m -> matches_keywords(m.memory, keywords_list), all_memories)
+    if accessible_channels !== nothing
+        results = filter(m -> m.channel_id === nothing || m.channel_id in accessible_channels, results)
+    end
     return apply_limit(results, limit)
 end
 
@@ -514,12 +568,13 @@ end
 Agentif.channel_id(ch::ReplChannel) = "repl"
 
 """
-    resolve_session!(db, chan_id) -> String
+    resolve_session!(db, chan_id; is_group=false, is_private=true) -> String
 
 Return the active session_id for the given channel. Creates a new session
 (and optionally bridges context) if the last activity is stale (>1hr).
+Stores is_group/is_private metadata for cross-channel search scoping.
 """
-function resolve_session!(db::SQLite.DB, chan_id::String)
+function resolve_session!(db::SQLite.DB, chan_id::String; is_group::Bool=false, is_private::Bool=true)
     now = time()
     row = iterate(SQLite.DBInterface.execute(db,
         "SELECT session_id, last_activity FROM channel_sessions WHERE channel_id = ?", (chan_id,)))
@@ -527,8 +582,9 @@ function resolve_session!(db::SQLite.DB, chan_id::String)
         session_id = String(row[1].session_id)
         last_activity = Float64(row[1].last_activity)
         if (now - last_activity) < SESSION_STALE_SECONDS
-            # Session still active — update activity timestamp
-            SQLite.execute(db, "UPDATE channel_sessions SET last_activity = ? WHERE channel_id = ?", (now, chan_id))
+            # Session still active — update activity timestamp and metadata
+            SQLite.execute(db, "UPDATE channel_sessions SET last_activity = ?, is_group = ?, is_private = ? WHERE channel_id = ?",
+                (now, is_group ? 1 : 0, is_private ? 1 : 0, chan_id))
             return session_id
         end
         # Session stale — rotate
@@ -537,9 +593,26 @@ function resolve_session!(db::SQLite.DB, chan_id::String)
         old_session_id = nothing
     end
     new_session_id = string(UUIDs.uuid4())
-    SQLite.execute(db, "INSERT OR REPLACE INTO channel_sessions (channel_id, session_id, last_activity) VALUES (?, ?, ?)",
-        (chan_id, new_session_id, now))
+    SQLite.execute(db, "INSERT OR REPLACE INTO channel_sessions (channel_id, session_id, last_activity, is_group, is_private) VALUES (?, ?, ?, ?, ?)",
+        (chan_id, new_session_id, now, is_group ? 1 : 0, is_private ? 1 : 0))
     return new_session_id
+end
+
+"""
+    accessible_channel_ids(db, current_channel_id) -> Vector{String}
+
+Return channel IDs whose data is accessible from the current channel.
+Includes the current channel plus all public (non-private) channels.
+"""
+function accessible_channel_ids(db::SQLite.DB, current_channel_id::String)
+    ids = Set{String}()
+    push!(ids, current_channel_id)
+    # Add all public channels
+    rows = SQLite.DBInterface.execute(db, "SELECT channel_id FROM channel_sessions WHERE is_private = 0")
+    for row in rows
+        push!(ids, String(row.channel_id))
+    end
+    return collect(ids)
 end
 
 """
@@ -547,7 +620,7 @@ end
 
 Build a brief context bridge from the previous session's recent messages.
 """
-function bridge_context(db::SQLite.DB, session_id::String)
+function bridge_context(db::SQLite.DB, session_id::String; name::String="Vo")
     rows = SQLite.DBInterface.execute(db,
         "SELECT messages FROM session_entries WHERE session_id = ? ORDER BY id DESC LIMIT 3", (session_id,))
     parts = String[]
@@ -567,7 +640,7 @@ function bridge_context(db::SQLite.DB, session_id::String)
                 for c in content
                     if get(c, "type", "") == "text"
                         text = get(c, "text", "")
-                        !isempty(text) && push!(parts, "Vo: " * text)
+                        !isempty(text) && push!(parts, name * ": " * text)
                     end
                 end
             end
@@ -667,6 +740,7 @@ end
 # --- Constructor ---
 
 function AgentAssistant(;
+        name::String = "Vo",
         db::Union{Nothing, SQLite.DB} = nothing,
         db_path::Union{Nothing, String} = nothing,
         provider::Union{Nothing, String} = nothing,
@@ -678,6 +752,14 @@ function AgentAssistant(;
         enable_heartbeat::Bool = true,
         heartbeat_interval_minutes::Int = DEFAULT_HEARTBEAT_INTERVAL_MINUTES,
         embed = nothing,  # pass LocalSearch embed option (nothing=BM25 only, :default=vector+BM25)
+        # Tool group flags
+        pty_tools::Bool = true,
+        web_tools::Bool = true,
+        scheduling::Bool = true,
+        memories::Bool = true,
+        skills::Bool = true,
+        documents::Bool = true,
+        admins::Vector{String} = String[],
     )
     # Resolve database
     if db !== nothing
@@ -738,6 +820,7 @@ function AgentAssistant(;
         error("Missing API key. Set $(ENV_AGENT_API_KEY) or ANTHROPIC_API_KEY")
     end
     config = AssistantConfig(
+        name = name,
         provider = provider_value,
         model_id = model_id_value,
         api_key = api_key_value,
@@ -746,6 +829,13 @@ function AgentAssistant(;
         base_dir = base_dir,
         enable_heartbeat = enable_heartbeat,
         heartbeat_interval_minutes = heartbeat_interval_minutes,
+        pty_tools = pty_tools,
+        web_tools = web_tools,
+        scheduling = scheduling,
+        memories = memories,
+        skills = skills,
+        documents = documents,
+        admins = admins,
     )
     model = Agentif.getModel(config.provider, config.model_id)
     model === nothing && error("Unknown model provider=$(config.provider) model_id=$(config.model_id)")
@@ -809,15 +899,37 @@ function session_entry_search_text(entry::Agentif.SessionEntry)
     return join(parts, "\n")
 end
 
-function search_session(assistant::AgentAssistant, keywords::String; limit::Union{Nothing, Int}=nothing, offset::Int=0, session_id::Union{Nothing, String}=nothing)
+function search_session(assistant::AgentAssistant, keywords::String; limit::Union{Nothing, Int}=nothing, offset::Int=0, session_id::Union{Nothing, String}=nothing, accessible_channels::Union{Nothing, Vector{String}}=nothing)
     limit_value = limit === nothing ? 10 : max(limit, 0)
     limit_value == 0 && return Dict{String,Any}[]
+
+    # Build set of accessible session IDs from accessible channels
+    accessible_session_ids = if accessible_channels !== nothing
+        sids = Set{String}()
+        for ac_id in accessible_channels
+            row = iterate(SQLite.DBInterface.execute(assistant.db,
+                "SELECT session_id FROM channel_sessions WHERE channel_id = ?", (ac_id,)))
+            row !== nothing && push!(sids, String(row[1].session_id))
+        end
+        sids
+    else
+        nothing
+    end
+
     # Try LocalSearch first
     if assistant.search_store !== nothing && !isempty(strip(keywords))
         try
             results = LocalSearch.search(assistant.search_store, keywords; limit=(limit_value + offset) * 3)
             session_prefix = session_id === nothing ? "session:" : "session:$(session_id):"
             session_results = filter(r -> startswith(r.id, session_prefix), results)
+            # Filter by accessible sessions
+            if accessible_session_ids !== nothing
+                session_results = filter(r -> begin
+                    # Extract session_id from doc_id like "session:UUID:entry_id"
+                    parts = split(r.id, ":"; limit=3)
+                    length(parts) >= 2 && parts[2] in accessible_session_ids
+                end, session_results)
+            end
             if !isempty(session_results)
                 if offset > 0
                     offset >= length(session_results) && return Dict{String,Any}[]
@@ -833,12 +945,19 @@ function search_session(assistant::AgentAssistant, keywords::String; limit::Unio
     # Fallback: keyword search in session_entries
     sid = session_id
     if sid === nothing
-        # Search across all sessions
+        # Search across accessible sessions
         keywords_list = parse_keywords(keywords)
         results = Dict{String,Any}[]
-        rows = SQLite.DBInterface.execute(assistant.db, "SELECT messages FROM session_entries ORDER BY id DESC LIMIT ?", (limit_value + offset,))
+        query = if accessible_session_ids !== nothing && !isempty(accessible_session_ids)
+            placeholders = join(fill("?", length(accessible_session_ids)), ", ")
+            params = vcat(collect(accessible_session_ids), [limit_value + offset])
+            SQLite.DBInterface.execute(assistant.db,
+                "SELECT messages FROM session_entries WHERE session_id IN ($placeholders) ORDER BY id DESC LIMIT ?", params)
+        else
+            SQLite.DBInterface.execute(assistant.db, "SELECT messages FROM session_entries ORDER BY id DESC LIMIT ?", (limit_value + offset,))
+        end
         seen = 0
-        for row in rows
+        for row in query
             msgs = JSON.parse(row.messages)
             text = join([get(c, "text", "") for m in msgs for c in get(m, "content", []) if get(c, "type", "") == "text"], " ")
             if matches_keywords(text, keywords_list)
@@ -894,14 +1013,28 @@ end
 function get_relevant_memories(assistant::AgentAssistant, session_entries::Vector{Agentif.SessionEntry})
     limit = assistant.config.memory_context_limit
     limit <= 0 && return Memory[]
+
+    # Determine accessible channels for filtering
+    ch = Agentif.CURRENT_CHANNEL[]
+    ac = if ch !== nothing
+        chan_id = Agentif.channel_id(ch)
+        accessible_channel_ids(assistant.db, chan_id)
+    else
+        nothing
+    end
+
     context_query = build_memory_query(session_entries)
     # Try LocalSearch — results are already relevance-ranked and contain full memory text
     if !isempty(context_query) && assistant.search_store !== nothing
         try
-            results = LocalSearch.search(assistant.search_store, context_query; limit=limit)
+            results = LocalSearch.search(assistant.search_store, context_query; limit=limit * 3)
             memory_results = filter(r -> startswith(r.id, "memory:"), results)
             if !isempty(memory_results)
                 memories = lookup_memories_by_text(assistant.db, [r.text for r in memory_results])
+                if ac !== nothing
+                    memories = filter(m -> m.channel_id === nothing || m.channel_id in ac, memories)
+                end
+                memories = apply_limit(memories, limit)
                 !isempty(memories) && return memories
             end
         catch err
@@ -910,6 +1043,9 @@ function get_relevant_memories(assistant::AgentAssistant, session_entries::Vecto
     end
     # Fallback: most recent memories
     all_memories = load_all_memories(assistant.db)
+    if ac !== nothing
+        all_memories = filter(m -> m.channel_id === nothing || m.channel_id in ac, all_memories)
+    end
     return all_memories[1:min(limit, length(all_memories))]
 end
 
@@ -951,7 +1087,41 @@ end
 
 # --- Prompt building ---
 
-function build_base_prompt(assistant::AgentAssistant; trigger_prompt::Union{Nothing, String}=TRIGGER_PROMPT[], session_id::Union{Nothing, String}=nothing, bridge::String="")
+const GROUP_CHAT_PROMPT = """
+## Group Chat Guidelines
+
+You are participating in a **group chat** with multiple users. Messages are prefixed with `[Username]:` to identify the sender.
+
+### When to Respond
+- Respond when directly addressed by name or @-mention.
+- Respond when asked a question you can meaningfully answer.
+- Respond when you can correct a significant factual error.
+- Respond when you have unique, relevant information not yet mentioned.
+- Do NOT respond to every message. Silence is appropriate when users are conversing among themselves.
+- Do NOT echo, agree with, or restate what someone already said.
+
+### How to Respond
+- Keep responses concise — group chats favor brevity.
+- Address the specific user by name when replying to avoid ambiguity.
+- If multiple users ask different things, address each briefly or prioritize the most relevant.
+- Avoid interrupting ongoing human-to-human exchanges.
+- Never share information from private/DM conversations in the group.
+
+### Privacy
+- Memories and context from private DM sessions are NOT available here.
+- Only reference information from this group's history or public channels.
+"""
+
+const PRIVATE_GROUP_CHAT_ADDENDUM = """
+This is a **private** group chat. Content here should not be shared in public channels.
+"""
+
+const PUBLIC_GROUP_CHAT_ADDENDUM = """
+This is a **public** channel. Be mindful that responses are visible to everyone in the organization.
+Do not reference or reveal information from private conversations or DMs.
+"""
+
+function build_base_prompt(assistant::AgentAssistant; trigger_prompt::Union{Nothing, String}=TRIGGER_PROMPT[], session_id::Union{Nothing, String}=nothing, bridge::String="", is_group::Bool=false, is_private::Bool=true)
     identity = getIdentityAndPurpose(assistant)
     io = IOBuffer()
     local_time = Dates.now()
@@ -963,11 +1133,20 @@ function build_base_prompt(assistant::AgentAssistant; trigger_prompt::Union{Noth
     local_day = Dates.dayname(local_time)
     utc_day = Dates.dayname(utc_time)
 
-    print(io, "You are Vo.\n\n## Current Date & Time\n")
+    print(io, "You are ", assistant.config.name, ".\n\n## Current Date & Time\n")
     print(io, "Local time: ", local_time_str, " (", local_day, ", UTC", offset_str, ").\n")
     print(io, "UTC time: ", utc_time_str, " (", utc_day, ").\n\n")
     print(io, "## Identity & Purpose\n")
     print(io, identity, "\n")
+
+    if is_group
+        print(io, "\n", GROUP_CHAT_PROMPT)
+        if is_private
+            print(io, PRIVATE_GROUP_CHAT_ADDENDUM)
+        else
+            print(io, PUBLIC_GROUP_CHAT_ADDENDUM)
+        end
+    end
 
     if !isempty(bridge)
         print(io, "\n", bridge)
@@ -997,13 +1176,14 @@ end
 
 # --- Agent & Middleware ---
 
-function base_agent(assistant::AgentAssistant; session_id::Union{Nothing, String}=nothing, bridge::String="")
+function base_agent(assistant::AgentAssistant; session_id::Union{Nothing, String}=nothing, bridge::String="", is_group::Bool=false, is_private::Bool=true)
     model = Agentif.getModel(assistant.config.provider, assistant.config.model_id)
     model === nothing && error("Unknown model provider=$(assistant.config.provider) model_id=$(assistant.config.model_id)")
-    prompt = build_base_prompt(assistant; session_id=session_id, bridge=bridge)
+    prompt = build_base_prompt(assistant; session_id=session_id, bridge=bridge, is_group=is_group, is_private=is_private)
+    agent_name = assistant.config.name
     return Agentif.Agent(
-        id = "vo",
-        name = "Vo",
+        id = lowercase(agent_name),
+        name = agent_name,
         prompt = prompt,
         model = model,
         apikey = assistant.config.api_key,
@@ -1047,19 +1227,81 @@ function assistant_tools_middleware(agent_handler::Agentif.AgentHandler, assista
     end
 end
 
+function output_guard_middleware(agent_handler::Agentif.AgentHandler, assistant::AgentAssistant, channel::Agentif.AbstractChannel)
+    return function (f, agent::Agentif.Agent, state::Agentif.AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+        # Run agent without streaming (channel=nothing suppressed it in build_default_handler)
+        result_state = agent_handler(f, agent, state, current_input, abort; kw...)
+        # Extract the assistant's response text
+        response_text = ""
+        for msg in result_state.messages
+            if msg isa Agentif.AssistantMessage
+                response_text = Agentif.message_text(msg)
+            end
+        end
+        if isempty(response_text)
+            return result_state
+        end
+        # Skip output guard if the bot was directly pinged (extension-detected or name match)
+        if Agentif.DIRECT_PING[]
+            Agentif.send_message(channel, response_text)
+            return result_state
+        end
+        # Also check if input mentions the assistant name (universal fallback)
+        user_text = current_input isa String ? current_input : ""
+        if !isempty(user_text) && occursin(lowercase(assistant.config.name), lowercase(user_text))
+            Agentif.send_message(channel, response_text)
+            return result_state
+        end
+        if isempty(user_text)
+            return result_state
+        end
+        # Evaluate with output guard
+        guard_input = Agentif.build_output_guardrail_input(assistant.config.name, user_text, response_text)
+        guard_agent = Agentif.materialize_output_guardrail_agent(agent, Agentif.DEFAULT_OUTPUT_GUARDRAIL_AGENT)
+        try
+            guard_state = Agentif.evaluate(guard_agent, guard_input)
+            guard_text = ""
+            for msg in guard_state.messages
+                if msg isa Agentif.AssistantMessage
+                    guard_text = Agentif.message_text(msg)
+                end
+            end
+            should_send = occursin("true", lowercase(guard_text))
+            if should_send
+                Agentif.send_message(channel, response_text)
+            else
+                @debug "Output guard suppressed response" channel_id=Agentif.channel_id(channel)
+            end
+        catch err
+            # If guard fails, send the response (fail open)
+            @warn "Output guard evaluation failed, sending response" exception=err
+            Agentif.send_message(channel, response_text)
+        end
+        return result_state
+    end
+end
+
 function build_handler(assistant::AgentAssistant; session_id::String, channel::Union{Nothing, Agentif.AbstractChannel}=nothing)
-    registry = get_skills_registry(assistant.db)
+    cfg = assistant.config
+    is_group_chat = channel !== nothing && Agentif.is_group(channel)
+    registry = cfg.skills ? get_skills_registry(assistant.db) : Agentif.SkillRegistry(Dict{String,Agentif.SkillMetadata}(), Dict{String,String}())
+    # For group chats, suppress streaming by passing channel=nothing.
+    # The output guard will handle sending the message after evaluation.
     handler = Agentif.build_default_handler(;
         base_handler = Agentif.stream,
         session_store = assistant.session_store,
         session_id = session_id,
         skill_registry = registry,
-        channel = channel,
+        channel = is_group_chat ? nothing : channel,
     )
     handler = assistant_tools_middleware(handler, assistant)
-    handler = scheduler_middleware(handler, assistant)
-    handler = manage_skills_middleware(handler, assistant)
-    handler = memory_middleware(handler, assistant, session_id)
+    cfg.scheduling && (handler = scheduler_middleware(handler, assistant))
+    cfg.skills && (handler = manage_skills_middleware(handler, assistant))
+    cfg.memories && (handler = memory_middleware(handler, assistant, session_id))
+    # For group chats, wrap with output guard
+    if is_group_chat && channel !== nothing
+        handler = output_guard_middleware(handler, assistant, channel)
+    end
     return handler
 end
 
@@ -1076,7 +1318,17 @@ function evaluate(f::Function, assistant::AgentAssistant, input::Agentif.AgentTu
         cur !== nothing ? cur : ReplChannel(devnull)
     end
     chan_id = Agentif.channel_id(chan)
-    session_id = resolve_session!(assistant.db, chan_id)
+    chan_is_group = Agentif.is_group(chan)
+    chan_is_private = Agentif.is_private(chan)
+    session_id = resolve_session!(assistant.db, chan_id; is_group=chan_is_group, is_private=chan_is_private)
+
+    # Tag input with user identity for group chats
+    tagged_input = if chan_is_group && input isa String
+        user = Agentif.get_current_user(chan)
+        user !== nothing ? "[$(user.name)]: $input" : input
+    else
+        input
+    end
 
     # Check if this is a rotated session and build bridge context
     bridge = ""
@@ -1089,16 +1341,16 @@ function evaluate(f::Function, assistant::AgentAssistant, input::Agentif.AgentTu
             "SELECT DISTINCT session_id FROM session_entries WHERE session_id != ? ORDER BY id DESC LIMIT 1", (session_id,))
         prev = iterate(prev_rows)
         if prev !== nothing
-            bridge = bridge_context(assistant.db, String(prev[1].session_id))
+            bridge = bridge_context(assistant.db, String(prev[1].session_id); name=assistant.config.name)
         end
     end
 
-    agent = base_agent(assistant; session_id=session_id, bridge=bridge)
+    agent = base_agent(assistant; session_id=session_id, bridge=bridge, is_group=chan_is_group, is_private=chan_is_private)
     state = Agentif.AgentState()
     handler = build_handler(assistant; session_id=session_id, channel=chan)
     @atomic assistant.evaluating = true
     try
-        return handler(f, agent, state, input, abort; kw...)
+        return handler(f, agent, state, tagged_input, abort; kw...)
     finally
         @atomic assistant.evaluating = false
     end
@@ -1194,7 +1446,7 @@ end
 function run!(assistant::AgentAssistant)
     assistant.config.enable_heartbeat && ensure_heartbeat!(assistant)
     Tempus.run!(assistant.scheduler)
-    @info "AgentAssistant initialized" provider=assistant.config.provider model=assistant.config.model_id
+    @info "AgentAssistant initialized" name=assistant.config.name provider=assistant.config.provider model=assistant.config.model_id
     return nothing
 end
 
@@ -1216,8 +1468,8 @@ function __init__()
     return
 end
 
-function init!()
-    agent = AgentAssistant()
+function init!(; kwargs...)
+    agent = AgentAssistant(; kwargs...)
     CURRENT_ASSISTANT[] = agent
     run!(agent)
     return

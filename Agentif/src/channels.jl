@@ -1,6 +1,20 @@
 # AbstractChannel interface for routing agent output to different frontends
 abstract type AbstractChannel end
 
+# --- Channel user identity ---
+
+"""
+    ChannelUser(id, name)
+
+Represents the user who sent the current message on a channel.
+`id` is a platform-specific identifier (Slack user ID, phone number, etc.).
+`name` is a human-readable display name.
+"""
+struct ChannelUser
+    id::String
+    name::String
+end
+
 # Interface stubs - each channel type should implement these
 # start_streaming(ch) -> stream handle (e.g. IO, StreamingMessage)
 function start_streaming end
@@ -16,7 +30,48 @@ function close_channel end
 function channel_id end
 channel_id(::AbstractChannel) = "default"
 
+# --- Group/privacy/user interface ---
+# These have sensible defaults for backward compatibility (single-user DM behavior).
+
+"""
+    is_group(ch::AbstractChannel) -> Bool
+
+Whether this channel is a multi-user conversation (group chat, public channel, etc.).
+Default: `false` (DM/single-user behavior).
+"""
+function is_group end
+is_group(::AbstractChannel) = false
+
+"""
+    is_private(ch::AbstractChannel) -> Bool
+
+Whether this channel's data should be restricted from cross-channel search.
+Private channels (DMs, private groups) should not have their sessions, memories,
+or documents searchable from other channels.
+Default: `true` (conservative — data is private unless explicitly public).
+"""
+function is_private end
+is_private(::AbstractChannel) = true
+
+"""
+    get_current_user(ch::AbstractChannel) -> Union{Nothing, ChannelUser}
+
+Return the identity of the user who sent the current message.
+Default: `nothing` (no user identity available).
+"""
+function get_current_user end
+get_current_user(::AbstractChannel) = nothing
+
 const CURRENT_CHANNEL = ScopedValue{Union{AbstractChannel, Nothing}}(nothing)
+
+"""
+    DIRECT_PING
+
+ScopedValue{Bool} indicating whether the current message directly addresses the bot
+(e.g., @mention, DM, or name reference). Set by channel extensions.
+When `true`, the output guard middleware should skip evaluation and always send the response.
+"""
+const DIRECT_PING = ScopedValue{Bool}(false)
 
 """
     with_channel(f, ch::AbstractChannel)
