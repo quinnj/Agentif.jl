@@ -32,16 +32,15 @@ AgentifTelegramExt = "Telegram"
 
 [sources]
 LLMProviders = {path = "../LLMProviders"}
-JSON = {path = "../../JSON"}
-JSONSchema = {path = "../../JSONSchema"}
-PtySessions = {path = "../../PtySessions"}
-Encid = {path = "../../Encid"}
-HTTP = {path = "/Users/jacob.quinn/.julia/packages/HTTP/na214"}
-MSTeams = {path = "../../MSTeams"}
-Mattermost = {path = "../../Mattermost"}
-Signal = {path = "../../Signal"}
-Slack = {path = "../../Slack"}
-Telegram = {path = "../../Telegram"}
+Encid = {url = "https://github.com/JuliaServices/Encid.jl.git"}
+HTTP = {url = "https://github.com/JuliaWeb/HTTP.jl.git", rev = "master"}
+JSONSchema = {url = "https://github.com/JuliaIO/JSONSchema.jl.git"}
+MSTeams = {url = "https://github.com/quinnj/MSTeams.jl.git"}
+Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}
+PtySessions = {url = "https://github.com/quinnj/PtySessions.jl.git"}
+Signal = {url = "https://github.com/quinnj/Signal.jl.git"}
+Slack = {url = "https://github.com/quinnj/Slack.jl.git"}
+Telegram = {url = "https://github.com/quinnj/Telegram.jl.git"}
 
 [compat]
 Encid = "1.0.0"

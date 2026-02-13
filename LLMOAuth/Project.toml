@@ -10,7 +10,7 @@ JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 OAuth = "818da804-8b6f-40df-b4a5-e161c4d67f0f"
 
 [sources]
-OAuth = {path = "../../OAuth"}
+OAuth = {url = "https://github.com/JuliaServices/OAuth.jl.git"}
 
 [compat]
 HTTP = "1"

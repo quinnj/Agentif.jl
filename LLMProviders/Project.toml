@@ -11,8 +11,7 @@ StructUtils = "ec057cc2-7a8d-4b58-b3b3-92acb9f63b42"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [sources]
-JSON = {path = "../../JSON"}
-JSONSchema = {path = "../../JSONSchema"}
+JSONSchema = {url = "https://github.com/JuliaIO/JSONSchema.jl.git"}
 
 [compat]
 HTTP = "1"
