@@ -80,7 +80,7 @@ include("providers/google_generative_ai.jl")
 include("providers/google_gemini_cli.jl")
 
 # Exports
-export Model, getModel, getProviders, getModels, calculateCost
+export Model, getModel, getProviders, getModels, calculateCost, registerModel!, discover_models!
 export OpenAIResponses, OpenAICompletions, AnthropicMessages, GoogleGenerativeAI, GoogleGeminiCli
 export Future
 

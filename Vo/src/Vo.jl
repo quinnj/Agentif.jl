@@ -22,7 +22,6 @@ export addNewMemory, searchMemories, forgetMemory
 export SkillMetadata, getSkills, addNewSkill, forgetSkill
 export listJobs, addJob!, removeJob!
 export ReplChannel
-export run_telegram_bot
 
 const TRIGGER_PROMPT = ScopedValue{Union{String, Nothing}}(nothing)
 const DEFAULT_IDENTITY = read(joinpath(@__DIR__, "soul_template.md"), String)
@@ -45,7 +44,10 @@ struct Memory
     memory::String
     createdAt::Float64
     eval_id::Union{Nothing, String}
+    priority::String  # "high", "medium", "low"
+    referenced_at::Union{Nothing, String}  # ISO date or natural language temporal anchor
 end
+Memory(memory::String, createdAt::Float64, eval_id::Union{Nothing, String}) = Memory(memory, createdAt, eval_id, "medium", nothing)
 
 const MEMORY_TIMESTAMP_FORMAT = dateformat"yyyy-mm-dd HH:MM:SS"
 
@@ -91,7 +93,9 @@ function init_schema!(db::SQLite.DB)
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             memory TEXT NOT NULL,
             created_at REAL NOT NULL,
-            eval_id TEXT
+            eval_id TEXT,
+            priority TEXT NOT NULL DEFAULT 'medium',
+            referenced_at TEXT
         )
     """)
     SQLite.execute(db, """
@@ -122,6 +126,22 @@ function init_schema!(db::SQLite.DB)
         CREATE INDEX IF NOT EXISTS idx_session_entries_session
         ON session_entries(session_id, id)
     """)
+    # Migrate existing memories table if missing new columns
+    migrate_memories_schema!(db)
+end
+
+function migrate_memories_schema!(db::SQLite.DB)
+    # Check if priority column exists
+    cols = Set{String}()
+    for row in SQLite.DBInterface.execute(db, "PRAGMA table_info(memories)")
+        push!(cols, String(row.name))
+    end
+    if "priority" ∉ cols
+        SQLite.execute(db, "ALTER TABLE memories ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'")
+    end
+    if "referenced_at" ∉ cols
+        SQLite.execute(db, "ALTER TABLE memories ADD COLUMN referenced_at TEXT")
+    end
 end
 
 # --- SQLiteSessionStore ---
@@ -347,12 +367,23 @@ setHeartbeatTasks!(a::AgentAssistant, text::String) = setHeartbeatTasks!(a.db, t
 
 # --- Memories (backed by memories table + LocalSearch) ---
 
-function addNewMemory(db::SQLite.DB, memory::String; eval_id::Union{Nothing, String}=nothing, search_store::Union{Nothing, LocalSearch.Store}=nothing)
+const VALID_PRIORITIES = ("high", "medium", "low")
+
+function validate_priority(p::Union{Nothing, String})
+    p === nothing && return "medium"
+    lp = lowercase(strip(p))
+    lp in VALID_PRIORITIES && return lp
+    return "medium"
+end
+
+function addNewMemory(db::SQLite.DB, memory::String; eval_id::Union{Nothing, String}=nothing, priority::Union{Nothing, String}=nothing, referenced_at::Union{Nothing, String}=nothing, search_store::Union{Nothing, LocalSearch.Store}=nothing)
     text = normalize_memory_text(memory)
     created_at = time()
     eval_id_str = eval_id === nothing ? nothing : string(eval_id)
-    SQLite.execute(db, "INSERT INTO memories (memory, created_at, eval_id) VALUES (?, ?, ?)", (text, created_at, eval_id_str))
-    mem = Memory(text, created_at, eval_id_str)
+    pri = validate_priority(priority)
+    ref_at = referenced_at === nothing ? nothing : strip(referenced_at)
+    SQLite.execute(db, "INSERT INTO memories (memory, created_at, eval_id, priority, referenced_at) VALUES (?, ?, ?, ?, ?)", (text, created_at, eval_id_str, pri, ref_at))
+    mem = Memory(text, created_at, eval_id_str, pri, ref_at)
     # Index into LocalSearch
     if search_store !== nothing
         try
@@ -365,9 +396,19 @@ function addNewMemory(db::SQLite.DB, memory::String; eval_id::Union{Nothing, Str
     return mem
 end
 
+function _row_to_memory(r)
+    Memory(
+        String(r.memory),
+        Float64(r.created_at),
+        r.eval_id === missing ? nothing : String(r.eval_id),
+        r.priority === missing ? "medium" : String(r.priority),
+        r.referenced_at === missing ? nothing : String(r.referenced_at),
+    )
+end
+
 function load_all_memories(db::SQLite.DB)
-    rows = SQLite.DBInterface.execute(db, "SELECT memory, created_at, eval_id FROM memories ORDER BY created_at DESC")
-    return Memory[Memory(String(r.memory), Float64(r.created_at), r.eval_id === missing ? nothing : String(r.eval_id)) for r in rows]
+    rows = SQLite.DBInterface.execute(db, "SELECT memory, created_at, eval_id, priority, referenced_at FROM memories ORDER BY created_at DESC")
+    return Memory[_row_to_memory(r) for r in rows]
 end
 
 """Batch-lookup Memory structs from SQLite by exact text, preserving the input order."""
@@ -375,11 +416,10 @@ function lookup_memories_by_text(db::SQLite.DB, texts::Vector{String})
     isempty(texts) && return Memory[]
     placeholders = join(fill("?", length(texts)), ", ")
     rows = SQLite.DBInterface.execute(db,
-        "SELECT memory, created_at, eval_id FROM memories WHERE memory IN ($placeholders)", texts)
-    # Index by text for fast lookup
+        "SELECT memory, created_at, eval_id, priority, referenced_at FROM memories WHERE memory IN ($placeholders)", texts)
     by_text = Dict{String, Memory}()
     for r in rows
-        by_text[String(r.memory)] = Memory(String(r.memory), Float64(r.created_at), r.eval_id === missing ? nothing : String(r.eval_id))
+        by_text[String(r.memory)] = _row_to_memory(r)
     end
     # Return in original order (LocalSearch relevance ranking)
     return Memory[by_text[t] for t in texts if haskey(by_text, t)]
@@ -471,13 +511,7 @@ end
 
 # --- Channel-Session Mapping ---
 
-"""
-    channel_id(ch) -> String
-
-Return a stable identifier for the channel.
-"""
-channel_id(::Agentif.AbstractChannel) = "default"
-channel_id(ch::ReplChannel) = "repl"
+Agentif.channel_id(ch::ReplChannel) = "repl"
 
 """
     resolve_session!(db, chan_id) -> String
@@ -879,16 +913,38 @@ function get_relevant_memories(assistant::AgentAssistant, session_entries::Vecto
     return all_memories[1:min(limit, length(all_memories))]
 end
 
+const PRIORITY_EMOJI = Dict("high" => "🔴", "medium" => "🟡", "low" => "🟢")
+
+function format_relative_time(memory_time::Dates.DateTime, now_time::Dates.DateTime)
+    diff = now_time - memory_time
+    days = Dates.value(diff) ÷ (1000 * 60 * 60 * 24)
+    days == 0 && return "today"
+    days == 1 && return "yesterday"
+    days < 7 && return "$(days) days ago"
+    days < 14 && return "1 week ago"
+    days < 30 && return "$(days ÷ 7) weeks ago"
+    days < 60 && return "1 month ago"
+    days < 365 && return "$(days ÷ 30) months ago"
+    return "$(days ÷ 365) year(s) ago"
+end
+
 function build_relevant_memories_section(assistant::AgentAssistant, session_entries::Vector{Agentif.SessionEntry})
     relevant_memories = get_relevant_memories(assistant, session_entries)
     isempty(relevant_memories) && return ""
+    now_time = Dates.now(Dates.UTC)
     io = IOBuffer()
     print(io, "## Relevant Memories\n")
-    print(io, "The following memories may be relevant to the current conversation:\n")
+    print(io, "These memories are from past interactions. Reference them when relevant — prefer the most recent for current state.\n")
     for mem in relevant_memories
-        timestamp = Dates.unix2datetime(mem.createdAt)
-        date_str = Dates.format(timestamp, "yyyy-mm-dd HH:MM")
-        print(io, "- [", date_str, "] ", mem.memory, "\n")
+        emoji = get(PRIORITY_EMOJI, mem.priority, "🟡")
+        mem_time = Dates.unix2datetime(mem.createdAt)
+        date_str = Dates.format(mem_time, "yyyy-mm-dd HH:MM")
+        relative = format_relative_time(mem_time, now_time)
+        print(io, "- ", emoji, " [", date_str, " — ", relative, "] ", mem.memory)
+        if mem.referenced_at !== nothing
+            print(io, " (re: ", mem.referenced_at, ")")
+        end
+        print(io, "\n")
     end
     return String(take!(io))
 end
@@ -1013,8 +1069,13 @@ evaluate(assistant::AgentAssistant, input::Agentif.AgentTurnInput; abort::Agenti
     evaluate(identity, assistant, input; abort, channel, kw...)
 
 function evaluate(f::Function, assistant::AgentAssistant, input::Agentif.AgentTurnInput; abort::Agentif.Abort=Agentif.Abort(), channel::Union{Nothing, Agentif.AbstractChannel}=nothing, kw...)
-    chan = channel === nothing ? ReplChannel(devnull) : channel
-    chan_id = channel_id(chan)
+    chan = if channel !== nothing
+        channel
+    else
+        cur = Agentif.CURRENT_CHANNEL[]
+        cur !== nothing ? cur : ReplChannel(devnull)
+    end
+    chan_id = Agentif.channel_id(chan)
     session_id = resolve_session!(assistant.db, chan_id)
 
     # Check if this is a rotated session and build bridge context
@@ -1034,7 +1095,7 @@ function evaluate(f::Function, assistant::AgentAssistant, input::Agentif.AgentTu
 
     agent = base_agent(assistant; session_id=session_id, bridge=bridge)
     state = Agentif.AgentState()
-    handler = build_handler(assistant; session_id=session_id, channel=channel)
+    handler = build_handler(assistant; session_id=session_id, channel=chan)
     @atomic assistant.evaluating = true
     try
         return handler(f, agent, state, input, abort; kw...)
@@ -1146,15 +1207,6 @@ function Base.close(assistant::AgentAssistant)
     end
     return nothing
 end
-
-# --- Telegram bot stub ---
-
-"""
-    run_telegram_bot(; use_polling=true, kwargs...)
-
-Start a Telegram bot. Requires `using Telegram` to activate the extension.
-"""
-function run_telegram_bot end
 
 # --- REPL ---
 

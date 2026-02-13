@@ -20,6 +20,7 @@ function openai_completions_detect_compat(model::Model)
         supportsStore = !is_nonstandard,
         supportsDeveloperRole = !is_nonstandard && !is_minimax,
         supportsReasoningEffort = !is_grok && !is_zai,
+        supportsTools = true,
         supportsUsageInStreaming = true,
         maxTokensField = use_max_tokens ? "max_tokens" : "max_completion_tokens",
         requiresToolResultName = is_mistral,
@@ -27,6 +28,7 @@ function openai_completions_detect_compat(model::Model)
         requiresThinkingAsText = is_mistral,
         requiresMistralToolIds = is_mistral,
         thinkingFormat = is_zai ? "zai" : "openai",
+        stripThinkTags = false,
     )
 end
 
@@ -38,6 +40,7 @@ function openai_completions_resolve_compat(model::Model)
         supportsStore = get(() -> detected.supportsStore, compat, "supportsStore"),
         supportsDeveloperRole = get(() -> detected.supportsDeveloperRole, compat, "supportsDeveloperRole"),
         supportsReasoningEffort = get(() -> detected.supportsReasoningEffort, compat, "supportsReasoningEffort"),
+        supportsTools = get(() -> detected.supportsTools, compat, "supportsTools"),
         supportsUsageInStreaming = get(() -> detected.supportsUsageInStreaming, compat, "supportsUsageInStreaming"),
         maxTokensField = get(() -> detected.maxTokensField, compat, "maxTokensField"),
         requiresToolResultName = get(() -> detected.requiresToolResultName, compat, "requiresToolResultName"),
@@ -45,6 +48,7 @@ function openai_completions_resolve_compat(model::Model)
         requiresThinkingAsText = get(() -> detected.requiresThinkingAsText, compat, "requiresThinkingAsText"),
         requiresMistralToolIds = get(() -> detected.requiresMistralToolIds, compat, "requiresMistralToolIds"),
         thinkingFormat = get(() -> detected.thinkingFormat, compat, "thinkingFormat"),
+        stripThinkTags = get(() -> detected.stripThinkTags, compat, "stripThinkTags"),
     )
 end
 
@@ -382,6 +386,126 @@ function openai_completions_stop_reason(reason::Union{Nothing, String}, tool_cal
     return :stop
 end
 
+"""
+    strip_think_tags(text::AbstractString) -> (thinking::String, content::String)
+
+Extract thinking content from text that uses `<think>...</think>` tags.
+Handles both paired tags (`<think>X</think>Y`) and implicit-open patterns
+where content before the first `</think>` is treated as thinking.
+"""
+function strip_think_tags(text::AbstractString)
+    # First try paired <think>...</think> tags
+    rx = r"<think>(.*?)</think>"s
+    if occursin(r"<think>", text)
+        thinking_parts = String[]
+        for m in eachmatch(rx, text)
+            push!(thinking_parts, m.captures[1])
+        end
+        content = replace(text, rx => "")
+        return join(thinking_parts, "\n\n"), lstrip(content)
+    end
+    # Implicit-open: everything before first </think> is thinking
+    idx = findfirst("</think>", text)
+    if idx !== nothing
+        thinking = text[1:first(idx)-1]
+        content = lstrip(text[last(idx)+1:end])
+        return thinking, content
+    end
+    return "", text
+end
+
+"""
+    ThinkTagStreamState
+
+Mutable state for stripping `<think>...</think>` tags from streamed content.
+Starts in "thinking" mode (implicit `<think>` at start) and switches to content
+mode on `</think>`. Also handles explicit `<think>` open tags.
+"""
+mutable struct ThinkTagStreamState
+    in_think::Bool
+    saw_explicit_open::Bool
+    buffer::String
+    ThinkTagStreamState() = new(true, false, "")  # start in thinking mode (implicit open)
+end
+
+"""
+    process_think_tag_chunk(tts::ThinkTagStreamState, chunk::AbstractString) -> (thinking::String, content::String)
+
+Process a streaming chunk, returning any thinking and content text to emit.
+"""
+function process_think_tag_chunk(tts::ThinkTagStreamState, chunk::AbstractString)
+    thinking = IOBuffer()
+    content = IOBuffer()
+    tts.buffer *= chunk
+    buf = tts.buffer
+    tts.buffer = ""
+
+    while !isempty(buf)
+        if tts.in_think
+            # Skip explicit <think> open tag if present
+            if !tts.saw_explicit_open
+                idx = findfirst("<think>", buf)
+                if idx !== nothing && first(idx) == 1
+                    tts.saw_explicit_open = true
+                    buf = buf[last(idx)+1:end]
+                    continue
+                end
+            end
+            # Look for closing </think>
+            idx = findfirst("</think>", buf)
+            if idx !== nothing
+                write(thinking, buf[1:first(idx)-1])
+                buf = buf[last(idx)+1:end]
+                tts.in_think = false
+            else
+                # Buffer last 8 chars in case </think> spans chunks
+                if length(buf) >= 8
+                    write(thinking, buf[1:end-8])
+                    tts.buffer = buf[end-7:end]
+                else
+                    tts.buffer = buf
+                end
+                buf = ""
+            end
+        else
+            # Look for opening <think>
+            idx = findfirst("<think>", buf)
+            if idx !== nothing
+                write(content, buf[1:first(idx)-1])
+                buf = buf[last(idx)+1:end]
+                tts.in_think = true
+                tts.saw_explicit_open = true
+            else
+                # Buffer last 7 chars in case <think> spans chunks
+                if length(buf) >= 7
+                    write(content, buf[1:end-7])
+                    tts.buffer = buf[end-6:end]
+                else
+                    tts.buffer = buf
+                end
+                buf = ""
+            end
+        end
+    end
+
+    return String(take!(thinking)), String(take!(content))
+end
+
+"""
+    flush_think_tag_state(tts::ThinkTagStreamState) -> (thinking::String, content::String)
+
+Flush any remaining buffered content at end of stream.
+"""
+function flush_think_tag_state(tts::ThinkTagStreamState)
+    remaining = tts.buffer
+    tts.buffer = ""
+    if tts.in_think
+        return remaining, ""
+    else
+        return "", remaining
+    end
+end
+
 function openai_completions_event_callback(
         f::Function,
         assistant_message::AssistantMessage,
@@ -390,7 +514,8 @@ function openai_completions_event_callback(
         latest_usage::Base.RefValue{Union{Nothing, OpenAICompletions.Usage}},
         latest_finish::Base.RefValue{Union{Nothing, String}},
         tool_call_accumulators::Dict{Int, ToolCallAccumulator},
-        abort::Abort,
+        abort::Abort;
+        think_tag_state::Union{Nothing, ThinkTagStreamState} = nothing,
     )
     reasoning_buffer = ""
     leading_whitespace = ""
@@ -402,6 +527,26 @@ function openai_completions_event_callback(
             toolcall_debug("openai-completions sse raw tool chunk"; preview = toolcall_preview(data, limit = 500))
         end
         if data == "[DONE]"
+            # Flush any remaining think-tag buffer
+            if think_tag_state !== nothing
+                thinking, content = flush_think_tag_state(think_tag_state)
+                if !isempty(thinking)
+                    if !started[]
+                        started[] = true
+                        f(MessageStartEvent(:assistant, assistant_message))
+                    end
+                    append_thinking!(assistant_message, thinking)
+                    f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, thinking, nothing))
+                end
+                if !isempty(content)
+                    if !started[]
+                        started[] = true
+                        f(MessageStartEvent(:assistant, assistant_message))
+                    end
+                    append_text!(assistant_message, content)
+                    f(MessageUpdateEvent(:assistant, assistant_message, :text, content, nothing))
+                end
+            end
             if started[] && !ended[]
                 ended[] = true
                 f(MessageEndEvent(:assistant, assistant_message))
@@ -425,30 +570,52 @@ function openai_completions_event_callback(
         delta = choice.delta
         if delta.content !== nothing && !isempty(delta.content)
             content_str = delta.content
-            if all(isspace, content_str)
-                if !saw_text
-                    leading_whitespace *= content_str
-                    return
-                end
-            else
-                if !isempty(leading_whitespace)
+            if think_tag_state !== nothing
+                # Route through think-tag processor
+                thinking, text = process_think_tag_chunk(think_tag_state, content_str)
+                if !isempty(thinking)
                     if !started[]
                         started[] = true
                         f(MessageStartEvent(:assistant, assistant_message))
                     end
-                    append_text!(assistant_message, leading_whitespace)
-                    f(MessageUpdateEvent(:assistant, assistant_message, :text, leading_whitespace, nothing))
-                    leading_whitespace = ""
+                    append_thinking!(assistant_message, thinking)
+                    f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, thinking, nothing))
+                end
+                if !isempty(text)
+                    if !started[]
+                        started[] = true
+                        f(MessageStartEvent(:assistant, assistant_message))
+                    end
+                    append_text!(assistant_message, text)
+                    f(MessageUpdateEvent(:assistant, assistant_message, :text, text, nothing))
                     saw_text = true
                 end
+            else
+                if all(isspace, content_str)
+                    if !saw_text
+                        leading_whitespace *= content_str
+                        return
+                    end
+                else
+                    if !isempty(leading_whitespace)
+                        if !started[]
+                            started[] = true
+                            f(MessageStartEvent(:assistant, assistant_message))
+                        end
+                        append_text!(assistant_message, leading_whitespace)
+                        f(MessageUpdateEvent(:assistant, assistant_message, :text, leading_whitespace, nothing))
+                        leading_whitespace = ""
+                        saw_text = true
+                    end
+                end
+                if !started[]
+                    started[] = true
+                    f(MessageStartEvent(:assistant, assistant_message))
+                end
+                append_text!(assistant_message, content_str)
+                f(MessageUpdateEvent(:assistant, assistant_message, :text, content_str, nothing))
+                saw_text = true
             end
-            if !started[]
-                started[] = true
-                f(MessageStartEvent(:assistant, assistant_message))
-            end
-            append_text!(assistant_message, content_str)
-            f(MessageUpdateEvent(:assistant, assistant_message, :text, content_str, nothing))
-            saw_text = true
         end
         if delta.reasoning_details !== nothing
             if !started[]

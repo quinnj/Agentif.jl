@@ -373,6 +373,9 @@ function stream(
             stream_kw = merge(stream_kw, (; store = false))
         end
 
+        if !compat.supportsTools
+            tools = nothing
+        end
         request_kw = merge((; tools), stream_kw)
         req = OpenAICompletions.Request(
             ; model = model.id,
@@ -401,7 +404,8 @@ function stream(
                         latest_usage,
                         latest_finish,
                         tool_call_accumulators,
-                        abort,
+                        abort;
+                        think_tag_state = compat.stripThinkTags ? ThinkTagStreamState() : nothing,
                     ),
                     merged_http_kw...,
                 )
@@ -451,6 +455,15 @@ function stream(
                         part.text === nothing && continue
                         append_text!(assistant_message, part.text)
                     end
+                end
+            end
+            if compat.stripThinkTags
+                full_text = message_text(assistant_message)
+                if occursin("</think>", full_text)
+                    thinking, cleaned = strip_think_tags(full_text)
+                    filter!(b -> !(b isa TextContent), assistant_message.content)
+                    !isempty(cleaned) && pushfirst!(assistant_message.content, TextContent(; text = cleaned))
+                    !isempty(thinking) && append_thinking!(assistant_message, thinking)
                 end
             end
             reasoning_parts = String[]

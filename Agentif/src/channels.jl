@@ -12,8 +12,18 @@ function finish_streaming end
 function send_message end
 # close_channel(ch, stream) -> nothing (final cleanup in finally block)
 function close_channel end
+# channel_id(ch) -> String (stable identifier for session mapping)
+function channel_id end
+channel_id(::AbstractChannel) = "default"
 
 const CURRENT_CHANNEL = ScopedValue{Union{AbstractChannel, Nothing}}(nothing)
+
+"""
+    with_channel(f, ch::AbstractChannel)
+
+Execute `f` with `CURRENT_CHANNEL` bound to `ch`.
+"""
+with_channel(f, ch::AbstractChannel) = @with CURRENT_CHANNEL => ch f()
 
 function channel_middleware(agent_handler::AgentHandler, ch::Union{Nothing, AbstractChannel})
     return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)

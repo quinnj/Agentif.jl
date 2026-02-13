@@ -3,7 +3,7 @@ module Agentif
 using Base64, Dates, HTTP, InteractiveUtils, JSON, JSONSchema, Logging, PtySessions, ScopedValues, StructUtils
 using Encid: UID8
 using LLMProviders
-using LLMProviders: Model, getModel, getProviders, getModels, calculateCost
+using LLMProviders: Model, getModel, getProviders, getModels, calculateCost, registerModel!, discover_models!
 using LLMProviders: OpenAIResponses, OpenAICompletions, AnthropicMessages, GoogleGenerativeAI, GoogleGeminiCli
 
 const CURRENT_EVALUATION_ID = ScopedValue{Union{Nothing, UID8}}(nothing)
@@ -27,12 +27,12 @@ export Agent, Abort, abort!, isaborted, AgentHandler, AgentMiddleware
 export evaluate, stream, build_default_handler
 export steer_middleware, tool_call_middleware, queue_middleware, evaluate_middleware, session_middleware
 export input_guardrail_middleware, skills_middleware, compaction_middleware, channel_middleware
-export AbstractChannel, CURRENT_CHANNEL
-export start_streaming, append_to_stream, finish_streaming, send_message, close_channel
+export AbstractChannel, CURRENT_CHANNEL, with_channel
+export start_streaming, append_to_stream, finish_streaming, send_message, close_channel, channel_id
 export CompactionConfig, CompactionSummaryMessage, compact!
 export with_prompt, with_tools
 export CURRENT_EVALUATION_ID, CURRENT_TURN_ID
-export Model, getModel, getProviders, getModels, calculateCost
+export Model, getModel, getProviders, getModels, calculateCost, registerModel!, discover_models!
 export OpenAIResponses, OpenAICompletions, AnthropicMessages, GoogleGenerativeAI, GoogleGeminiCli
 export @tool, tool_name, AgentTool
 export SkillMetadata, SkillRegistry, default_skill_dirs, discover_skills, create_skill_registry, reload_skills!

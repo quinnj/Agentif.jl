@@ -44,6 +44,7 @@ function addJob!(
         job_name,
         prompt,
         schedule;
+        channel::Union{Nothing, Agentif.AbstractChannel} = nothing,
         enabled::Bool = true,
         expires_at::Union{Nothing, DateTime} = nothing,
         max_executions::Union{Nothing, Int} = nothing,
@@ -86,7 +87,13 @@ function addJob!(
         () -> begin
             a = get_current_assistant()
             a === nothing && return nothing
-            evaluate_fn(a, prompt)
+            if channel !== nothing
+                Agentif.with_channel(channel) do
+                    evaluate_fn(a, prompt; channel=channel)
+                end
+            else
+                evaluate_fn(a, prompt)
+            end
         end,
         job_name,
         cron_schedule;
@@ -127,7 +134,8 @@ The 6-field cron format is: second(0-59) minute(0-59) hour(0-23) day(1-31) month
             enabled_val = enabled === nothing ? true : enabled
             run_once_val = run_once === nothing ? false : run_once
             expires_at_dt = expires_at === nothing ? nothing : parse_iso8601_utc(expires_at)
-            job = Vo.addJob!(assistant, name, prompt, schedule; enabled=enabled_val, expires_at=expires_at_dt, max_executions=max_executions, run_once=run_once_val, evaluate_fn=evaluate_fn)
+            ch = Agentif.CURRENT_CHANNEL[]
+            job = Vo.addJob!(assistant, name, prompt, schedule; channel=ch, enabled=enabled_val, expires_at=expires_at_dt, max_executions=max_executions, run_once=run_once_val, evaluate_fn=evaluate_fn)
             return JSON.json(job_summary(job))
         end,
     )
@@ -143,16 +151,23 @@ end
 
 function build_memory_tools(assistant::AgentAssistant)
     addNewMemory_tool = @tool(
-        "Store a new memory (lesson learned, insight, observation, rule, pattern, etc.) tied to the current evaluation.",
-        addNewMemory(memory::String) = begin
+        """Store a new memory. Use this AGGRESSIVELY — any time you learn something about the user, their preferences, projects, people, decisions, constraints, or context that could be useful later, store it immediately. Don't wait to be asked.
+
+Priority levels:
+- "high": core facts, strong preferences, important decisions, key people, active goals
+- "medium": useful context, project details, patterns, moderate preferences
+- "low": minor observations, one-off details, things that may become irrelevant
+
+Use referenced_at for temporal anchoring when the memory references a specific time (e.g. "2025-06-15", "next Tuesday", "Q3 2025"). This helps with temporal reasoning later.""",
+        addNewMemory(memory::String, priority::Union{Nothing, String}=nothing, referenced_at::Union{Nothing, String}=nothing) = begin
             eval_id = Agentif.CURRENT_EVALUATION_ID[]
             eval_id_str = eval_id === nothing ? nothing : string(eval_id)
-            mem = Vo.addNewMemory(assistant.db, memory; eval_id=eval_id_str, search_store=assistant.search_store)
+            mem = Vo.addNewMemory(assistant.db, memory; eval_id=eval_id_str, priority=priority, referenced_at=referenced_at, search_store=assistant.search_store)
             return JSON.json(mem)
         end,
     )
     searchMemories_tool = @tool(
-        "Search memories (lesson learned, insight, observation, rule, pattern, etc.) by keywords (space-separated) and return matching memories. Matches if any keyword is found.",
+        "Search memories by keywords (space-separated). Use this PROACTIVELY at the start of conversations and whenever a topic comes up that you might have prior context on. Don't ask the user to repeat themselves — search first.",
         searchMemories(keywords::String, limit::Union{Nothing, Int}=nothing) = begin
             limit_value = limit === nothing ? 10 : limit
             results = Vo.searchMemories(assistant.db, keywords; limit=limit_value, search_store=assistant.search_store)
