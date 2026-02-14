@@ -11,8 +11,12 @@ JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 LLMTools = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
 LocalSearch = "3edf9609-13f2-4288-b0a3-8bd6d521158e"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+MSTeams = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
 Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
 PtySessions = "581b29ee-4021-4243-bea3-a8421693f905"
+Signal = "0944c9af-6677-4ce2-950b-62b1fa25f333"
+Slack = "4d517630-ce0d-4555-8fa7-416d9f8f5684"
+Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
 ScopedValues = "7e506255-f358-4e82-b7e4-beb19740aa63"
@@ -23,8 +27,12 @@ UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 Agentif = {path = "../Agentif"}
 LLMTools = {path = "../LLMTools"}
 LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}
+MSTeams = {url = "https://github.com/quinnj/MSTeams.jl.git"}
 Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}
 PtySessions = {url = "https://github.com/quinnj/PtySessions.jl.git"}
+Signal = {url = "https://github.com/quinnj/Signal.jl.git"}
+Slack = {url = "https://github.com/quinnj/Slack.jl.git"}
+Telegram = {url = "https://github.com/quinnj/Telegram.jl.git"}
 Tempus = {url = "https://github.com/JuliaServices/Tempus.jl.git"}
 
 [compat]
