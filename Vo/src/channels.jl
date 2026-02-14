@@ -4,6 +4,7 @@ struct ReplChannel <: Agentif.AbstractChannel
 end
 ReplChannel() = ReplChannel(stdout)
 
+Agentif.channel_id(::ReplChannel) = "repl"
 Agentif.start_streaming(ch::ReplChannel) = ch.io
 Agentif.append_to_stream(::ReplChannel, io::IO, delta::AbstractString) = print(io, delta)
 Agentif.finish_streaming(::ReplChannel, io::IO) = println(io)

@@ -565,8 +565,6 @@ end
 
 # --- Channel-Session Mapping ---
 
-Agentif.channel_id(ch::ReplChannel) = "repl"
-
 """
     resolve_session!(db, chan_id; is_group=false, is_private=true) -> String
 
@@ -1468,7 +1466,8 @@ struct ReplResponse
 end
 
 function Base.show(io::IO, resp::ReplResponse)
-    return evaluate(get_current_assistant(), resp.input; channel=ReplChannel(io))
+    evaluate(get_current_assistant(), resp.input; channel=ReplChannel(io))
+    return
 end
 
 macro a_str(input)
