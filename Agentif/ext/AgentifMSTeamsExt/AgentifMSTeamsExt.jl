@@ -119,7 +119,7 @@ function _handle_activity(handler::Function, activity::AbstractDict, client::MST
 
     @info "AgentifMSTeamsExt: Processing message" conversation_id=conv_id conversation_type=conversation_type user_id=user_id direct_ping=direct_ping text_length=length(text)
 
-    try
+    Threads.@spawn try
         ch = MSTeamsChannel(client, activity, user_id, user_name, conversation_type)
         Agentif.with_channel(ch) do
             @with Agentif.DIRECT_PING => direct_ping handler(text)

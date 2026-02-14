@@ -118,7 +118,7 @@ function _handle_event(handler::Function, event::Mattermost.WebSocketEvent, bot_
 
     @info "AgentifMattermostExt: Processing message" channel_id=channel_id channel_type=channel_type user_id=user_id direct_ping=direct_ping text_length=length(message)
 
-    try
+    Threads.@spawn try
         ch = MattermostChannel(channel_id, Mattermost._get_client(), nothing, user_id, user_name, channel_type)
         Agentif.with_channel(ch) do
             @with Agentif.DIRECT_PING => direct_ping handler(message)

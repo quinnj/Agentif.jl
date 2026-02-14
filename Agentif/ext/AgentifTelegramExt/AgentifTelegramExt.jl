@@ -131,7 +131,7 @@ function _handle_update(handler::Function, update::Telegram.Update, bot_username
 
     @info "AgentifTelegramExt: Processing message" chat_id=chat_id chat_type=chat_type user_id=user_id direct_ping=direct_ping text_length=length(text)
 
-    try
+    Threads.@spawn try
         ch = TelegramChannel(chat_id, Telegram._get_client(), nothing, user_id, user_name, chat_type)
         Agentif.with_channel(ch) do
             @with Agentif.DIRECT_PING => direct_ping handler(text)

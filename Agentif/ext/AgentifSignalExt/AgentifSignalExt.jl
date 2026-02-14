@@ -117,7 +117,7 @@ function _handle_envelope(handler::Function, envelope::Signal.Envelope)
 
     @info "AgentifSignalExt: Processing message" recipient=recipient user_id=user_id is_group=is_group_chat direct_ping=direct_ping text_length=length(text)
 
-    try
+    Threads.@spawn try
         ch = SignalChannel(recipient, Signal._get_client(), nothing, user_id, user_name, is_group_chat)
         Agentif.with_channel(ch) do
             @with Agentif.DIRECT_PING => direct_ping handler(text)

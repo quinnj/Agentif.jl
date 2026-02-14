@@ -122,7 +122,7 @@ function _handle_request(handler::Function, request::Slack.SocketModeRequest, we
 
     @info "AgentifSlackExt: Processing message" channel=channel user_id=user_id channel_type=channel_type direct_ping=direct_ping text_length=length(text)
 
-    try
+    Threads.@spawn try
         ch = SlackChannel(channel, thread_ts, web_client, nothing, user_id, channel_type)
         Agentif.with_channel(ch) do
             @with Agentif.DIRECT_PING => direct_ping handler(text)
