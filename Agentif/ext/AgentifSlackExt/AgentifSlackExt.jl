@@ -72,7 +72,7 @@ function Agentif.send_message(ch::SlackChannel, msg)
 end
 
 function Agentif.channel_id(ch::SlackChannel)
-    return "slack:$(ch.channel)"
+    return "slack:$(ch.channel):$(ch.thread_ts)"
 end
 
 function Agentif.is_group(ch::SlackChannel)

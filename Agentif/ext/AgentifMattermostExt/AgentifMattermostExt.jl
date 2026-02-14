@@ -30,6 +30,7 @@ end
 # MattermostChannel — streams responses to a Mattermost channel
 mutable struct MattermostChannel <: Agentif.AbstractChannel
     channel_id::String
+    root_id::String  # thread root post ID (empty for top-level posts)
     client::Mattermost.Client
     sm::Union{Nothing, Mattermost.StreamingMessage}
     user_id::String
@@ -40,8 +41,9 @@ end
 
 function Agentif.start_streaming(ch::MattermostChannel)
     if ch.sm === nothing
+        kwargs = isempty(ch.root_id) ? (;) : (; root_id=ch.root_id)
         ch.sm = Mattermost.with_client(ch.client) do
-            Mattermost.send_streaming_message(ch.channel_id)
+            Mattermost.send_streaming_message(ch.channel_id; kwargs...)
         end
     end
     return ch.sm
@@ -65,13 +67,15 @@ function Agentif.close_channel(ch::MattermostChannel, sm::Mattermost.StreamingMe
 end
 
 function Agentif.send_message(ch::MattermostChannel, msg)
+    kwargs = isempty(ch.root_id) ? (;) : (; root_id=ch.root_id)
     Mattermost.with_client(ch.client) do
-        Mattermost.create_post(ch.channel_id, string(msg))
+        Mattermost.create_post(ch.channel_id, string(msg); kwargs...)
     end
 end
 
 function Agentif.channel_id(ch::MattermostChannel)
-    return "mattermost:$(ch.channel_id)"
+    base = "mattermost:$(ch.channel_id)"
+    return isempty(ch.root_id) ? base : "$(base):$(ch.root_id)"
 end
 
 function Agentif.is_group(ch::MattermostChannel)
@@ -103,6 +107,12 @@ function _handle_event(handler::Function, event::Mattermost.WebSocketEvent, bot_
 
     channel_id = get(post_data, "channel_id", "")
 
+    # Extract thread root: if this is a reply, root_id is the parent post;
+    # if top-level, use the post's own id so our reply starts/joins a thread
+    post_root_id = get(post_data, "root_id", "")
+    post_id = get(post_data, "id", "")
+    root_id = isempty(post_root_id) ? post_id : post_root_id
+
     # Extract user name from event data
     user_name = get(event.data, "sender_name", "")
     # Strip leading @ if present
@@ -116,10 +126,10 @@ function _handle_event(handler::Function, event::Mattermost.WebSocketEvent, bot_
     # Detect direct ping: DM or @bot_username mention in text
     direct_ping = channel_type == "D" || (!isempty(bot_username) && occursin("@" * bot_username, lowercase(message)))
 
-    @info "AgentifMattermostExt: Processing message" channel_id=channel_id channel_type=channel_type user_id=user_id direct_ping=direct_ping text_length=length(message)
+    @info "AgentifMattermostExt: Processing message" channel_id=channel_id root_id=root_id channel_type=channel_type user_id=user_id direct_ping=direct_ping text_length=length(message)
 
     Threads.@spawn try
-        ch = MattermostChannel(channel_id, Mattermost._get_client(), nothing, user_id, user_name, channel_type)
+        ch = MattermostChannel(channel_id, root_id, Mattermost._get_client(), nothing, user_id, user_name, channel_type)
         Agentif.with_channel(ch) do
             @with Agentif.DIRECT_PING => direct_ping handler(message)
         end
