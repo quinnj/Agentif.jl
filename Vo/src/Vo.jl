@@ -779,24 +779,12 @@ function AgentAssistant(;
 
     init_schema!(sqlite_db)
 
-    # Create LocalSearch store on the same DB path for search
-    db_file = sqlite_db.file
-    search_store = if !isempty(db_file) && db_file != ":memory:"
-        # Use a separate LocalSearch DB in the same directory
-        search_path = db_file * ".search"
-        try
-            LocalSearch.Store(search_path; embed=embed === nothing ? nothing : embed)
-        catch err
-            @warn "Failed to initialize LocalSearch" exception=err
-            nothing
-        end
-    else
-        try
-            LocalSearch.Store(; embed=embed === nothing ? nothing : embed)
-        catch err
-            @warn "Failed to initialize in-memory LocalSearch" exception=err
-            nothing
-        end
+    # Create LocalSearch store on the same DB for search
+    search_store = try
+        LocalSearch.Store(sqlite_db; embed=embed === nothing ? nothing : embed)
+    catch err
+        @warn "Failed to initialize LocalSearch" exception=err
+        nothing
     end
 
     session_store = SQLiteSessionStore(sqlite_db, search_store)
