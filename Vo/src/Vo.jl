@@ -37,6 +37,7 @@ const HEARTBEAT_END_HOUR = 23
 const HEARTBEAT_MINUTE = 0
 const DEFAULT_HEARTBEAT_INTERVAL_MINUTES = 30
 const SESSION_STALE_SECONDS = 3600  # 1 hour
+const NO_REPLY_TOKEN = "NO_REPLY"
 
 const SkillMetadata = Agentif.SkillMetadata
 
@@ -472,18 +473,40 @@ function lookup_memories_by_text(db::SQLite.DB, texts::Vector{String})
     return Memory[by_text[t] for t in texts if haskey(by_text, t)]
 end
 
+"""Check if a response text indicates the agent chose to stay silent."""
+function is_silent_reply(text::AbstractString)
+    stripped = strip(text)
+    isempty(stripped) && return false
+    stripped == NO_REPLY_TOKEN && return true
+    startswith(stripped, NO_REPLY_TOKEN) && (length(stripped) == length(NO_REPLY_TOKEN) || !isletter(stripped[nextind(stripped, length(NO_REPLY_TOKEN))])) && return true
+    endswith(stripped, NO_REPLY_TOKEN) && return true
+    return false
+end
+
+const PRIORITY_MULTIPLIER = Dict("high" => 1.3, "medium" => 1.0, "low" => 0.7)
+
+"""Re-rank memories by combining search relevance scores with priority multipliers."""
+function priority_rerank(memories::Vector{Memory}, scores::Dict{String, Float64})
+    isempty(memories) && return memories
+    scored = [(mem, get(scores, mem.memory, 0.0) * get(PRIORITY_MULTIPLIER, mem.priority, 1.0)) for mem in memories]
+    sort!(scored; by=x -> x[2], rev=true)
+    return Memory[m for (m, _) in scored]
+end
+
 function searchMemories(db::SQLite.DB, keywords::String; limit::Union{Nothing, Int}=nothing, search_store::Union{Nothing, LocalSearch.Store}=nothing, accessible_channels::Union{Nothing, Vector{String}}=nothing)
     limit_value = limit === nothing ? 10 : limit
     # Try LocalSearch if available — results contain the full original memory text
     if search_store !== nothing && !isempty(strip(keywords))
         try
-            results = LocalSearch.search(search_store, keywords; limit=limit_value * 3)  # over-fetch for post-filter
+            results = LocalSearch.search(search_store, keywords; limit=limit_value * 3, mmr=true)  # over-fetch for post-filter
             memory_results = filter(r -> startswith(r.id, "memory:"), results)
             if !isempty(memory_results)
+                score_map = Dict{String, Float64}(r.text => r.score for r in memory_results)
                 memories = lookup_memories_by_text(db, [r.text for r in memory_results])
                 if accessible_channels !== nothing
                     memories = filter(m -> m.channel_id === nothing || m.channel_id in accessible_channels, memories)
                 end
+                memories = priority_rerank(memories, score_map)
                 return apply_limit(memories, limit_value)
             end
         catch err
@@ -1010,16 +1033,18 @@ function get_relevant_memories(assistant::AgentAssistant, session_entries::Vecto
     end
 
     context_query = build_memory_query(session_entries)
-    # Try LocalSearch — results are already relevance-ranked and contain full memory text
+    # Try LocalSearch with MMR for diversity and priority boost
     if !isempty(context_query) && assistant.search_store !== nothing
         try
-            results = LocalSearch.search(assistant.search_store, context_query; limit=limit * 3)
+            results = LocalSearch.search(assistant.search_store, context_query; limit=limit * 3, mmr=true)
             memory_results = filter(r -> startswith(r.id, "memory:"), results)
             if !isempty(memory_results)
+                score_map = Dict{String, Float64}(r.text => r.score for r in memory_results)
                 memories = lookup_memories_by_text(assistant.db, [r.text for r in memory_results])
                 if ac !== nothing
                     memories = filter(m -> m.channel_id === nothing || m.channel_id in ac, memories)
                 end
+                memories = priority_rerank(memories, score_map)
                 memories = apply_limit(memories, limit)
                 !isempty(memories) && return memories
             end
@@ -1086,14 +1111,21 @@ You are participating in a **group chat** with multiple users. Messages are pref
 - Do NOT respond to every message. Silence is appropriate when users are conversing among themselves.
 - Do NOT echo, agree with, or restate what someone already said.
 
+### When to Stay Silent
+If no response is needed, reply with exactly `NO_REPLY` (and nothing else). Do not add any other words, punctuation, or formatting around it.
+
+Be extremely selective — only reply when directly addressed or when you can add clear value. When in doubt, stay silent.
+
 ### How to Respond
 - Keep responses concise — group chats favor brevity.
 - Address the specific user by name when replying to avoid ambiguity.
 - If multiple users ask different things, address each briefly or prioritize the most relevant.
 - Avoid interrupting ongoing human-to-human exchanges.
-- Never share information from private/DM conversations in the group.
+- Write like a human — avoid markdown tables and overly structured formatting in group chats.
+- Be a good group participant: mostly lurk and follow the conversation.
 
 ### Privacy
+- Never share information from private/DM conversations in the group.
 - Memories and context from private DM sessions are NOT available here.
 - Only reference information from this group's history or public channels.
 """
@@ -1227,7 +1259,7 @@ function output_guard_middleware(agent_handler::Agentif.AgentHandler, assistant:
         if isempty(response_text)
             return result_state
         end
-        # Skip output guard if the bot was directly pinged (extension-detected or name match)
+        # Skip guard if the bot was directly pinged (extension-detected or name match)
         if Agentif.DIRECT_PING[]
             Agentif.send_message(channel, response_text)
             return result_state
@@ -1238,31 +1270,13 @@ function output_guard_middleware(agent_handler::Agentif.AgentHandler, assistant:
             Agentif.send_message(channel, response_text)
             return result_state
         end
-        if isempty(user_text)
+        # Check for NO_REPLY token — agent self-suppresses instead of extra LLM call
+        if is_silent_reply(response_text)
+            @debug "Agent chose NO_REPLY" channel_id=Agentif.channel_id(channel)
             return result_state
         end
-        # Evaluate with output guard
-        guard_input = Agentif.build_output_guardrail_input(assistant.config.name, user_text, response_text)
-        guard_agent = Agentif.materialize_output_guardrail_agent(agent, Agentif.DEFAULT_OUTPUT_GUARDRAIL_AGENT)
-        try
-            guard_state = Agentif.evaluate(guard_agent, guard_input)
-            guard_text = ""
-            for msg in guard_state.messages
-                if msg isa Agentif.AssistantMessage
-                    guard_text = Agentif.message_text(msg)
-                end
-            end
-            should_send = occursin("true", lowercase(guard_text))
-            if should_send
-                Agentif.send_message(channel, response_text)
-            else
-                @debug "Output guard suppressed response" channel_id=Agentif.channel_id(channel)
-            end
-        catch err
-            # If guard fails, send the response (fail open)
-            @warn "Output guard evaluation failed, sending response" exception=err
-            Agentif.send_message(channel, response_text)
-        end
+        # Agent produced a real response, send it
+        Agentif.send_message(channel, response_text)
         return result_state
     end
 end
@@ -1296,7 +1310,7 @@ end
 evaluate(assistant::AgentAssistant, input::Agentif.AgentTurnInput; abort::Agentif.Abort=Agentif.Abort(), channel::Union{Nothing, Agentif.AbstractChannel}=nothing, kw...) =
     evaluate(identity, assistant, input; abort, channel, kw...)
 
-function evaluate(f::Function, assistant::AgentAssistant, input::Agentif.AgentTurnInput; abort::Agentif.Abort=Agentif.Abort(), channel::Union{Nothing, Agentif.AbstractChannel}=nothing, kw...)
+function evaluate(f::Function, assistant::AgentAssistant, input::Agentif.AgentTurnInput; abort::Agentif.Abort=Agentif.Abort(), channel::Union{Nothing, Agentif.AbstractChannel}=nothing, repeat_input::Bool=true, kw...)
     chan = if channel !== nothing
         channel
     else
@@ -1331,6 +1345,9 @@ function evaluate(f::Function, assistant::AgentAssistant, input::Agentif.AgentTu
         end
     end
 
+    if repeat_input && tagged_input isa String
+        tagged_input = tagged_input * "\n\n" * tagged_input
+    end
     agent = base_agent(assistant; session_id=session_id, bridge=bridge, is_group=chan_is_group, is_private=chan_is_private)
     state = Agentif.AgentState()
     handler = build_handler(assistant; session_id=session_id, channel=chan)

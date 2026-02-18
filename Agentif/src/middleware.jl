@@ -218,8 +218,12 @@ function evaluate(
         skill_registry::Union{Nothing, SkillRegistry} = nothing,
         channel::Union{Nothing, AbstractChannel} = nothing,
         abort::Abort = Abort(),
+        repeat_input::Bool = false,
         kw...,
     )
+    if repeat_input && input isa String
+        input = input * "\n\n" * input
+    end
     handler = build_default_handler(; base_handler, compaction_config, steer_queue, message_queue, session_store, session_id, input_guardrail, skill_registry, channel)
     return handler(f, agent, state, input, abort; kw...)
 end
