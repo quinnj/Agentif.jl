@@ -62,6 +62,15 @@ Default: `nothing` (no user identity available).
 function get_current_user end
 get_current_user(::AbstractChannel) = nothing
 
+"""
+    create_channel_tools(ch::AbstractChannel) -> Vector{AgentTool}
+
+Return platform-specific tools for the current channel (e.g. emoji reactions).
+Channel extensions should specialize this for their channel types.
+Default: empty vector.
+"""
+create_channel_tools(::AbstractChannel) = AgentTool[]
+
 const CURRENT_CHANNEL = ScopedValue{Union{AbstractChannel, Nothing}}(nothing)
 
 """
@@ -83,6 +92,11 @@ with_channel(f, ch::AbstractChannel) = @with CURRENT_CHANNEL => ch f()
 function channel_middleware(agent_handler::AgentHandler, ch::Union{Nothing, AbstractChannel})
     return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)
         ch === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
+        # Inject channel-specific tools (e.g. emoji reactions)
+        ch_tools = create_channel_tools(ch)
+        if !isempty(ch_tools)
+            agent = with_tools(agent, vcat(agent.tools, ch_tools))
+        end
         stream_ref = Ref{Any}(nothing)
         try
             return @with CURRENT_CHANNEL => ch agent_handler(function (event)

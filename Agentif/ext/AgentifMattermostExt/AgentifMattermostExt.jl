@@ -31,6 +31,7 @@ end
 mutable struct MattermostChannel <: Agentif.AbstractChannel
     channel_id::String
     root_id::String  # thread root post ID (empty for top-level posts)
+    post_id::String  # ID of the specific incoming post (for reactions)
     client::Mattermost.Client
     sm::Union{Nothing, Mattermost.StreamingMessage}
     user_id::String
@@ -91,6 +92,24 @@ function Agentif.get_current_user(ch::MattermostChannel)
     return Agentif.ChannelUser(ch.user_id, ch.user_name)
 end
 
+function Agentif.create_channel_tools(ch::MattermostChannel)
+    post_id = ch.post_id
+    client = ch.client
+    isempty(post_id) && return Agentif.AgentTool[]
+    react_fn = function react_to_message(emoji_name::String)
+        Mattermost.with_client(client) do
+            Mattermost.add_reaction(post_id, emoji_name)
+        end
+        return """{"status":"ok","emoji":"$emoji_name","post_id":"$post_id"}"""
+    end
+    react_tool = Agentif.AgentTool{typeof(react_fn), @NamedTuple{emoji_name::String}}(;
+        name = "react_to_message",
+        description = "React to the user's message with an emoji instead of (or in addition to) sending a text reply. Use this for simple acknowledgments, approvals, or expressing sentiment without a full response. Common emoji names: thumbsup, white_check_mark, eyes, heart, laughing, tada, thinking, thumbsdown, warning, x",
+        func = react_fn,
+    )
+    return Agentif.AgentTool[react_tool]
+end
+
 function _handle_event(handler::Function, event::Mattermost.WebSocketEvent, bot_user_id::String, bot_username::String="")
     event.event == "posted" || return
     event.data === nothing && return
@@ -129,7 +148,7 @@ function _handle_event(handler::Function, event::Mattermost.WebSocketEvent, bot_
     @info "AgentifMattermostExt: Processing message" channel_id=channel_id root_id=root_id channel_type=channel_type user_id=user_id direct_ping=direct_ping text_length=length(message)
 
     Threads.@spawn try
-        ch = MattermostChannel(channel_id, root_id, Mattermost._get_client(), nothing, user_id, user_name, channel_type)
+        ch = MattermostChannel(channel_id, root_id, post_id, Mattermost._get_client(), nothing, user_id, user_name, channel_type)
         Agentif.with_channel(ch) do
             @with Agentif.DIRECT_PING => direct_ping handler(message)
         end
