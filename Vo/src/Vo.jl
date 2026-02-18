@@ -1319,6 +1319,18 @@ function build_handler(assistant::AgentAssistant; session_id::String, channel::U
     cfg.scheduling && (handler = scheduler_middleware(handler, assistant))
     cfg.skills && (handler = manage_skills_middleware(handler, assistant))
     cfg.memories && (handler = memory_middleware(handler, assistant, session_id))
+    # For group chats, inject channel tools at the Vo level since
+    # build_default_handler uses channel=nothing (to suppress streaming),
+    # which also skips channel tool injection.
+    if is_group_chat && channel !== nothing
+        ch_tools = Agentif.create_channel_tools(channel)
+        if !isempty(ch_tools)
+            inner = handler
+            handler = function(f, agent::Agentif.Agent, state::Agentif.AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+                return inner(f, append_tools(agent, ch_tools), state, current_input, abort; kw...)
+            end
+        end
+    end
     # For group chats, wrap with output guard
     if is_group_chat && channel !== nothing
         handler = output_guard_middleware(handler, assistant, channel)

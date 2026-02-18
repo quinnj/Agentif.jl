@@ -52,7 +52,12 @@ end
 
 function Agentif.append_to_stream(ch::MattermostChannel, sm::Mattermost.StreamingMessage, delta::AbstractString)
     Mattermost.with_client(ch.client) do
-        Mattermost.append!(sm, delta)
+        if sm.buffer == "..."
+            # Replace the placeholder with the first real content
+            Mattermost.update!(sm, string(delta))
+        else
+            Mattermost.append!(sm, delta)
+        end
     end
 end
 

@@ -193,6 +193,16 @@ function build_default_handler(
     handler = steer_middleware(handler, steer_queue)
     handler = channel_middleware(handler, channel)
     handler = tool_call_middleware(handler)
+    # Inject channel-specific tools (e.g. emoji reactions) outside the tool_call
+    # loop so that findtool can resolve them when the model calls them.
+    if channel !== nothing
+        ch_tools = create_channel_tools(channel)
+        if !isempty(ch_tools)
+            inner_handler = handler
+            handler = (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) ->
+                inner_handler(f, with_tools(agent, vcat(agent.tools, ch_tools)), state, current_input, abort; kw...)
+        end
+    end
     handler = session_middleware(handler, session_store; session_id)
     handler = input_guardrail_middleware(handler, input_guardrail)
     handler = skills_middleware(handler, skill_registry)
