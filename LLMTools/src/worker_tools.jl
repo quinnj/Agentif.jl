@@ -45,23 +45,14 @@ const WORKER_REGISTRY = SessionRegistry{WorkerSessionMetadata}(
 
 # --- Helpers ---
 
-# LLMTools project dir — used to ensure Worker subprocesses can find ConcurrentUtilities.
-# On Julia 1.12+, the Worker subprocess `using ConcurrentUtilities` fails when the
-# active project only has ConcurrentUtilities as a transitive dep (not direct dep).
-# Pointing JULIA_PROJECT at LLMTools (which directly depends on ConcurrentUtilities)
-# ensures the subprocess can load it.
-const _LLMTOOLS_PROJECT_DIR = dirname(@__DIR__)
-
 function _worker_env()
     env = Dict{String, String}(k => v for (k, v) in ENV)
-    sep = Sys.iswindows() ? ";" : ":"
     # Ensure @stdlib is in the load path (Pkg.test() sandboxes may omit it)
+    sep = Sys.iswindows() ? ";" : ":"
     lp = get(env, "JULIA_LOAD_PATH", "")
     if !isempty(lp) && !occursin("@stdlib", lp)
         env["JULIA_LOAD_PATH"] = lp * sep * "@stdlib"
     end
-    # Point subprocess at LLMTools project so ConcurrentUtilities is findable
-    env["JULIA_PROJECT"] = _LLMTOOLS_PROJECT_DIR
     return env
 end
 
