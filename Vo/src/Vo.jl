@@ -24,7 +24,7 @@ export listJobs, addJob!, removeJob!
 export ReplChannel
 
 const TRIGGER_PROMPT = ScopedValue{Union{String, Nothing}}(nothing)
-const DEFAULT_IDENTITY = read(joinpath(@__DIR__, "soul_template.md"), String)
+const DEFAULT_IDENTITY_TEMPLATE = read(joinpath(@__DIR__, "soul_template.md"), String)
 const DEFAULT_SESSION_CONTEXT_LIMIT = 10
 const DEFAULT_MEMORY_CONTEXT_LIMIT = 6
 const ENV_AGENT_PROVIDER = "VO_AGENT_PROVIDER"
@@ -276,6 +276,17 @@ function normalize_text(value::Union{Nothing, AbstractString})
     return String(cleaned)
 end
 
+function default_identity_for_name(name::AbstractString)
+    normalized_name = normalize_text(name)
+    normalized_name === nothing && return DEFAULT_IDENTITY_TEMPLATE
+    rendered = replace(
+        DEFAULT_IDENTITY_TEMPLATE,
+        "# Vo: Identity, Operating Principles, and Tooling" => "# $(normalized_name): Identity, Operating Principles, and Tooling",
+    )
+    rendered = replace(rendered, "You are **Vo**." => "You are **$(normalized_name)**.")
+    return rendered
+end
+
 function normalize_memory_text(value::AbstractString)
     cleaned = replace(strip(String(value)), r"\s+" => " ")
     isempty(cleaned) && throw(ArgumentError("memory cannot be empty"))
@@ -391,12 +402,19 @@ end
 
 # --- Identity & Heartbeat (backed by kv_store) ---
 
-function getIdentityAndPurpose(db::SQLite.DB)
+function getIdentityAndPurpose(db::SQLite.DB; name::AbstractString="Vo")
     cleaned = normalize_text(kv_get(db, "identity", ""))
-    cleaned === nothing && return DEFAULT_IDENTITY
+    if cleaned === nothing
+        return default_identity_for_name(name)
+    end
+    # Treat persisted legacy default identity as dynamic template as well.
+    legacy_default = normalize_text(DEFAULT_IDENTITY_TEMPLATE)
+    if legacy_default !== nothing && cleaned == legacy_default
+        return default_identity_for_name(name)
+    end
     return cleaned
 end
-getIdentityAndPurpose(a::AgentAssistant) = getIdentityAndPurpose(a.db)
+getIdentityAndPurpose(a::AgentAssistant) = getIdentityAndPurpose(a.db; name=a.config.name)
 
 function setIdentityAndPurpose!(db::SQLite.DB, text::String)
     kv_set!(db, "identity", text)
