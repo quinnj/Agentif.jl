@@ -69,7 +69,8 @@ Base.@kwdef struct AssistantConfig
     enable_heartbeat::Bool = true
     heartbeat_interval_minutes::Int = DEFAULT_HEARTBEAT_INTERVAL_MINUTES
     # Tool group flags
-    pty_tools::Bool = true
+    terminal_tools::Bool = true
+    worker_tools::Bool = true
     web_tools::Bool = true
     scheduling::Bool = true
     memories::Bool = true
@@ -774,7 +775,8 @@ function AgentAssistant(;
         heartbeat_interval_minutes::Int = DEFAULT_HEARTBEAT_INTERVAL_MINUTES,
         embed = nothing,  # pass LocalSearch embed option (nothing=BM25 only, :default=vector+BM25)
         # Tool group flags
-        pty_tools::Bool = true,
+        terminal_tools::Bool = true,
+        worker_tools::Bool = true,
         web_tools::Bool = true,
         scheduling::Bool = true,
         memories::Bool = true,
@@ -838,7 +840,8 @@ function AgentAssistant(;
         base_dir = base_dir,
         enable_heartbeat = enable_heartbeat,
         heartbeat_interval_minutes = heartbeat_interval_minutes,
-        pty_tools = pty_tools,
+        terminal_tools = terminal_tools,
+        worker_tools = worker_tools,
         web_tools = web_tools,
         scheduling = scheduling,
         memories = memories,

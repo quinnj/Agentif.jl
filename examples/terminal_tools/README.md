@@ -1,12 +1,14 @@
-# Long Running Process Tool Examples
+# Terminal Tools Examples
 
-This directory contains examples demonstrating the `create_long_running_process_tool()` capabilities in Agentif, which provides `exec_command` and `write_stdin` functions for managing interactive and long-running shell processes.
+This directory contains examples demonstrating `LLMTools.create_terminal_tools()`, which provides `exec_command` and `write_stdin` for interactive and persistent terminal sessions.
 
 ## Tool Overview
 
-The long_running_process tool is modeled after Codex's UnifiedExec tool and provides:
-- **exec_command**: Start shell commands in a PTY session, with support for long-running processes
-- **write_stdin**: Interact with running processes by sending input and polling for output
+The terminal tools are modeled after Codex's UnifiedExec tool and provide:
+- **exec_command**: Start shell commands in a PTY session and get a structured JSON response
+- **write_stdin**: Interact with running sessions by sending input and polling for output
+- **kill_session**: Explicitly terminate a running session
+- **list_sessions**: Inspect active sessions with metadata
 
 ## Examples
 
@@ -73,13 +75,13 @@ You can run any example with:
 
 ```bash
 cd /Users/jacob.quinn/.julia/dev/Agentif
-julia --project examples/long_running_process_tool/01_simple_echo.jl
+julia --project examples/terminal_tools/01_simple_echo.jl
 ```
 
 Or run all examples:
 
 ```bash
-for f in examples/long_running_process_tool/*.jl; do
+for f in examples/terminal_tools/*.jl; do
     echo "Running $f"
     julia --project "$f"
     echo ""
@@ -94,12 +96,16 @@ done
 - `workdir` (optional): Working directory for the command
 - `shell` (optional): Shell to use (defaults to bash on Unix, powershell on Windows)
 - `yield_time_ms` (optional): How long to wait for output before returning (default: 10000ms)
+- `max_output_lines` (optional): Smart head/tail line truncation limit
+- `max_output_tokens` (optional): Token-estimate truncation limit
 
 ### write_stdin
 
 - `session_id` (required): The session ID returned by exec_command
 - `chars` (optional): Characters to send to stdin (can be empty to just poll)
 - `yield_time_ms` (optional): How long to wait for output (default: 250ms)
+- `max_output_lines` (optional): Smart head/tail line truncation limit
+- `max_output_tokens` (optional): Token-estimate truncation limit
 
 ## Key Patterns
 
@@ -153,5 +159,6 @@ This tool is modeled after Codex's background terminal feature with similar:
 Key differences:
 - Simpler Julia implementation using PtySessions package
 - No built-in sandbox/security features (yet)
-- No output tokenization/truncation (yet)
+- Structured JSON responses with status/events/truncation metadata
+- Output line and token-estimate truncation controls
 - Session IDs are simple integers (Codex uses process IDs)

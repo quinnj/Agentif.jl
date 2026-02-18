@@ -1,10 +1,10 @@
-using Agentif
+using Agentif, LLMTools
 using PtySessions
 
 println("Example 3: Python REPL Interaction")
 println("="^80)
 
-tools = create_long_running_process_tool()
+tools = LLMTools.create_terminal_tools()
 agent = Agent(
     prompt = "You are a helpful assistant that can interact with Python REPLs.",
     model = getModel("anthropic", "claude-sonnet-4-5"),

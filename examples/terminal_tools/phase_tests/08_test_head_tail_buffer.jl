@@ -1,4 +1,4 @@
-using Agentif
+using Agentif, LLMTools
 using PtySessions
 
 println("="^80)
@@ -6,7 +6,7 @@ println("Phase 3 Test: HeadTailBuffer Smart Truncation")
 println("="^80)
 println()
 
-tools = create_long_running_process_tool()
+tools = LLMTools.create_terminal_tools()
 agent = Agent(
     prompt = "You are a helpful assistant testing smart output truncation.",
     model = getModel("anthropic", "claude-sonnet-4-5"),

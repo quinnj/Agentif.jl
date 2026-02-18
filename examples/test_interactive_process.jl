@@ -1,8 +1,8 @@
-using Agentif
+using Agentif, LLMTools
 using PtySessions
 
 # Create a more interactive example - start a Python REPL and interact with it
-tools = create_long_running_process_tool()
+tools = LLMTools.create_terminal_tools()
 
 agent = Agent(
     prompt = "You are a helpful assistant that can run long-running shell commands and interact with them.",

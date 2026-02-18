@@ -1,16 +1,15 @@
 #!/usr/bin/env julia
 
 """
-Run all long_running_process_tool examples as smoke tests.
+Run all terminal_tools examples as smoke tests.
 
 This script runs each example in sequence and reports results.
 Useful for quickly verifying that all examples work correctly.
 """
 
-using Agentif
-
+using Agentif, LLMTools
 println("="^80)
-println("Running all long_running_process_tool examples")
+println("Running all terminal_tools examples")
 println("="^80)
 println()
 

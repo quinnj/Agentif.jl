@@ -366,7 +366,8 @@ function build_assistant_tools(assistant::AgentAssistant)
         push!(tools, setHeartbeatTasks_tool)
     end
     cfg.documents && append!(tools, build_document_tools(assistant))
-    cfg.pty_tools && append!(tools, LLMTools.create_long_running_process_tool(cfg.base_dir))
+    cfg.terminal_tools && append!(tools, LLMTools.create_terminal_tools(cfg.base_dir))
+    cfg.worker_tools && append!(tools, LLMTools.create_worker_tools())
     cfg.web_tools && append!(tools, LLMTools.web_tools())
     return tools
 end

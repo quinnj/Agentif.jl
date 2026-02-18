@@ -657,13 +657,13 @@ function create_grep_tool(base_dir::AbstractString)
 end
 
 
-function append_long_running_tools!(tools::Vector{AgentTool}, base_dir::AbstractString)
-    append!(tools, create_long_running_process_tool(base_dir))
+function append_terminal_tools!(tools::Vector{AgentTool}, base_dir::AbstractString)
+    append!(tools, create_terminal_tools(base_dir))
     return tools
 end
 
-function insert_long_running_tools!(tools::Dict{String, AgentTool}, base_dir::AbstractString)
-    for tool in create_long_running_process_tool(base_dir)
+function insert_terminal_tools!(tools::Dict{String, AgentTool}, base_dir::AbstractString)
+    for tool in create_terminal_tools(base_dir)
         tools[tool.name] = tool
     end
     return tools
@@ -675,7 +675,7 @@ function coding_tools(base_dir::AbstractString = pwd())
         create_edit_tool(base_dir),
         create_write_tool(base_dir),
     ]
-    return append_long_running_tools!(tools, base_dir)
+    return append_terminal_tools!(tools, base_dir)
 end
 
 function read_only_tools(base_dir::AbstractString = pwd())
@@ -687,7 +687,7 @@ function read_only_tools(base_dir::AbstractString = pwd())
     ]
 end
 
-function all_tools(base_dir::AbstractString = pwd(); parent::Union{Nothing, Agent, Function} = nothing)
+function all_tools(base_dir::AbstractString = pwd(); parent::Union{Nothing, Agent, Function} = nothing, workers::Bool = false)
     tools = Dict(
         "read" => create_read_tool(base_dir),
         "edit" => create_edit_tool(base_dir),
@@ -698,471 +698,21 @@ function all_tools(base_dir::AbstractString = pwd(); parent::Union{Nothing, Agen
         "codex" => create_codex_tool(),
     )
     parent !== nothing && (tools["subagent"] = create_subagent_tool(parent))
-    return insert_long_running_tools!(tools, base_dir)
+    insert_terminal_tools!(tools, base_dir)
+    workers && insert_worker_tools!(tools)
+    return tools
 end
 
-
-# Long-running process management using PtySessions
-# Phase 1: Session metadata tracking
-struct PtySessionMetadata
-    session::Any  # PtySession object
-    created_at::Float64
-    last_used::Float64
-    command::String
-    workdir::String
+function append_worker_tools!(tools::Vector{AgentTool})
+    append!(tools, create_worker_tools())
+    return tools
 end
 
-const ACTIVE_PTY_SESSIONS = Dict{Int, PtySessionMetadata}()
-const NEXT_SESSION_ID = Ref(1)
-const PTY_SESSION_LOCK = ReentrantLock()
-
-# Phase 1: Session limits (following Codex patterns)
-const MAX_PTY_SESSIONS = 20
-const WARNING_PTY_SESSIONS = 15
-
-# Phase 3: HeadTailBuffer for smart output truncation
-struct HeadTailBuffer
-    head::Vector{String}
-    tail::Vector{String}
-    head_lines::Int
-    tail_lines::Int
-    total_lines::Int
-    truncated::Bool
-end
-
-function create_head_tail_buffer(text::String, max_lines::Int = 1000)
-    lines = split(text, '\n')
-    total = length(lines)
-
-    if total <= max_lines
-        return HeadTailBuffer(collect(lines), String[], total, 0, total, false)
+function insert_worker_tools!(tools::Dict{String, AgentTool})
+    for tool in create_worker_tools()
+        tools[tool.name] = tool
     end
-
-    # Keep first and last portions
-    head_count = div(max_lines, 2)
-    tail_count = max_lines - head_count
-
-    return HeadTailBuffer(
-        collect(lines[1:head_count]),
-        collect(lines[(end - tail_count + 1):end]),
-        head_count,
-        tail_count,
-        total,
-        true
-    )
-end
-
-function format_head_tail_buffer(buffer::HeadTailBuffer)::String
-    if !buffer.truncated
-        return join(buffer.head, '\n')
-    end
-
-    parts = String[]
-    push!(parts, join(buffer.head, '\n'))
-    push!(parts, "\n... [truncated $(buffer.total_lines - buffer.head_lines - buffer.tail_lines) lines] ...\n")
-    push!(parts, join(buffer.tail, '\n'))
-    return join(parts, "")
-end
-
-function create_long_running_process_tool(base_dir::AbstractString = pwd())
-    base = ensure_base_dir(base_dir)
-
-    function readavailable_with_timeout(session::PtySessions.PtySession, timeout_s::Real)
-        # Use poll-based non-blocking reads to avoid hanging on PTY output.
-        deadline = time() + timeout_s
-        output = ""
-        while time() < deadline
-            output = readavailable_nonblocking(session)
-            !isempty(output) && return output
-            sleep(0.01)
-        end
-        return ""
-    end
-
-    function readavailable_nonblocking(session::PtySessions.PtySession)
-        session.master_fd < 0 && return ""
-        return PtySessions.readavailable(session)
-    end
-
-    # Phase 1: Helper functions for session management
-    function cleanup_exited_sessions!()
-        # Thread-safe cleanup of exited sessions
-        return lock(PTY_SESSION_LOCK) do
-            sessions_to_remove = Int[]
-            for (id, meta) in ACTIVE_PTY_SESSIONS
-                try
-                    if !PtySessions.isactive(meta.session)
-                        push!(sessions_to_remove, id)
-                    end
-                catch
-                    # If we can't check status, mark for removal
-                    push!(sessions_to_remove, id)
-                end
-            end
-            for id in sessions_to_remove
-                delete!(ACTIVE_PTY_SESSIONS, id)
-            end
-            return length(sessions_to_remove)
-        end
-    end
-
-    function prune_oldest_session!()
-        # Thread-safe pruning of oldest session
-        return lock(PTY_SESSION_LOCK) do
-            if length(ACTIVE_PTY_SESSIONS) < MAX_PTY_SESSIONS
-                return false
-            end
-
-            # Phase 1: LRU pruning - find oldest by last_used
-            # Protect the 8 most recent, prune exited first, then LRU
-
-            # Sort by last_used (most recent first)
-            sorted_sessions = sort(collect(ACTIVE_PTY_SESSIONS), by = p -> p[2].last_used, rev = true)
-            protected = Set(p[1] for p in sorted_sessions[1:min(8, length(sorted_sessions))])
-
-            # Find exited session outside protected set
-            for (id, meta) in sorted_sessions
-                is_exited = try
-                    !PtySessions.isactive(meta.session)
-                catch
-                    true  # If we can't check, assume exited
-                end
-
-                if id ∉ protected && is_exited
-                    try
-                        close(meta.session)
-                    catch
-                    end
-                    delete!(ACTIVE_PTY_SESSIONS, id)
-                    @warn "Pruned exited session $id (command: $(meta.command))"
-                    return true
-                end
-            end
-
-            # No exited sessions, prune oldest non-protected
-            for (id, meta) in reverse(sorted_sessions)
-                if id ∉ protected
-                    try
-                        close(meta.session)
-                    catch
-                    end
-                    delete!(ACTIVE_PTY_SESSIONS, id)
-                    @warn "Pruned oldest session $id (command: $(meta.command))"
-                    return true
-                end
-            end
-
-            return false
-        end
-    end
-
-    function check_session_limit_and_warn()
-        # Thread-safe session count check
-        n_sessions = lock(PTY_SESSION_LOCK) do
-            length(ACTIVE_PTY_SESSIONS)
-        end
-
-        if n_sessions >= WARNING_PTY_SESSIONS
-            @warn """
-            You currently have $n_sessions PTY sessions open.
-            The maximum is $MAX_PTY_SESSIONS.
-            Consider reusing existing sessions or closing unused ones with kill_session() to prevent automatic pruning.
-            """
-        end
-
-        return if n_sessions >= MAX_PTY_SESSIONS
-            @warn "Maximum sessions reached ($MAX_PTY_SESSIONS). Pruning oldest session..."
-            prune_oldest_session!()
-        end
-    end
-
-    exec_command = @tool(
-        "Execute a shell command in a PTY session, enabling interactive processes and long-running commands. Returns output and a session_id for ongoing interaction with processes that don't immediately exit (e.g., REPLs, servers, watch commands, interactive CLIs).",
-        exec_command(
-            cmd::String,
-            workdir::Union{Nothing, String} = nothing,
-            shell::Union{Nothing, String} = nothing,
-            yield_time_ms::Union{Nothing, Int} = nothing,
-            max_output_lines::Union{Nothing, Int} = nothing,
-        ) = begin
-            debug_pty = get(ENV, "AGENTIF_DEBUG_PTY", "") != ""
-            debug_pty && @info "exec_command start" cmd = cmd workdir = workdir shell = shell
-            # Phase 2: Check session limits and warn
-            cleanup_exited_sessions!()
-            check_session_limit_and_warn()
-
-            # Determine working directory
-            work_dir = workdir === nothing ? base : resolve_relative_path(base, workdir)
-            isdir(work_dir) || throw(ArgumentError("working directory not found: $(workdir === nothing ? "." : workdir)"))
-
-            # Determine shell command
-            shell_cmd = if shell !== nothing
-                shell
-            else
-                if Sys.iswindows()
-                    "powershell"
-                else
-                    "bash"
-                end
-            end
-
-            # Determine yield time (default 10 seconds like codex)
-            yield_ms = yield_time_ms === nothing ? 10000 : max(100, yield_time_ms)
-            debug_pty && @info "exec_command yield_ms" yield_ms = yield_ms work_dir = work_dir
-
-            # Phase 3: Determine max output lines (minimum 10 for readability)
-            max_lines = max_output_lines === nothing ? 1000 : max(10, max_output_lines)
-
-            # Create the full command
-            full_cmd = if Sys.iswindows()
-                Cmd([shell_cmd, "-Command", cmd])
-            else
-                # Use -l for login shell like codex default
-                Cmd([shell_cmd, "-l", "-c", cmd])
-            end
-
-            # Create PTY session with thread-safe session ID assignment
-            session_id = lock(PTY_SESSION_LOCK) do
-                id = NEXT_SESSION_ID[]
-                NEXT_SESSION_ID[] += 1
-                id
-            end
-
-            start_time = time()
-            try
-                debug_pty && @info "exec_command spawning" full_cmd = full_cmd
-                pty_session = PtySessions.PtySession(full_cmd; dir = work_dir)
-                debug_pty && @info "exec_command spawned" session_id = session_id master_fd = pty_session.master_fd
-
-                # Phase 1: Store metadata (thread-safe)
-                now = time()
-                lock(PTY_SESSION_LOCK) do
-                    ACTIVE_PTY_SESSIONS[session_id] = PtySessionMetadata(
-                        pty_session, now, now, cmd, work_dir
-                    )
-                end
-
-                # Wait for initial output or yield time
-                sleep(yield_ms / 1000.0)
-
-                # Read available output
-                debug_pty && @info "exec_command reading output" session_id = session_id
-                output = readavailable_with_timeout(pty_session, max(0.2, min(1.0, yield_ms / 1000.0)))
-
-                # Check if process is still running
-                debug_pty && @info "exec_command checking active" session_id = session_id
-                is_running = PtySessions.isactive(pty_session)
-
-                # Phase 1: 50ms grace period for fast-exiting commands
-                if !is_running
-                    sleep(0.05)  # 50ms grace
-                    extra_output = readavailable_with_timeout(pty_session, 0.2)
-                    output = output * extra_output
-                end
-
-                # Calculate wall time
-                wall_time = time() - start_time
-
-                # Phase 3: Apply output truncation if needed
-                output_display = if max_lines < 1000000
-                    buffer = create_head_tail_buffer(output, max_lines)
-                    format_head_tail_buffer(buffer)
-                else
-                    output
-                end
-
-                # Format response similar to codex UnifiedExec
-                sections = String[]
-                push!(sections, "Wall time: $(round(wall_time, digits = 4)) seconds")
-
-                if !is_running
-                    # Phase 1: Process completed - auto cleanup (thread-safe)
-                    lock(PTY_SESSION_LOCK) do
-                        delete!(ACTIVE_PTY_SESSIONS, session_id)
-                    end
-                    push!(sections, "Process exited")
-                else
-                    # Process still running
-                    push!(sections, "Process running with session ID $(session_id)")
-                    n_sessions = lock(PTY_SESSION_LOCK) do
-                        length(ACTIVE_PTY_SESSIONS)
-                    end
-                    push!(sections, "Active sessions: $n_sessions")
-                end
-
-                push!(sections, "Output:")
-                push!(sections, isempty(output_display) ? "(no output)" : output_display)
-
-                return join(sections, "\n")
-
-            catch e
-                lock(PTY_SESSION_LOCK) do
-                    delete!(ACTIVE_PTY_SESSIONS, session_id)
-                end
-                rethrow(e)
-            end
-        end,
-    )
-
-    write_stdin = @tool(
-        "Write characters to an existing PTY session and return recent output. Automatically detects if the process has exited. Use this to interact with long-running processes, send input to interactive CLIs, or poll for new output.",
-        write_stdin(
-            session_id::Int,
-            chars::String = "",
-            yield_time_ms::Union{Nothing, Int} = nothing,
-            max_output_lines::Union{Nothing, Int} = nothing,
-        ) = begin
-            debug_pty = get(ENV, "AGENTIF_DEBUG_PTY", "") != ""
-            debug_pty && @info "write_stdin start" session_id = session_id
-            # Get the session metadata (thread-safe)
-            meta = lock(PTY_SESSION_LOCK) do
-                haskey(ACTIVE_PTY_SESSIONS, session_id) || throw(ArgumentError("session_id $(session_id) not found - it may have exited"))
-                ACTIVE_PTY_SESSIONS[session_id]
-            end
-            pty_session = meta.session
-
-            # Phase 1: Update last_used timestamp (thread-safe)
-            now = time()
-            lock(PTY_SESSION_LOCK) do
-                ACTIVE_PTY_SESSIONS[session_id] = PtySessionMetadata(
-                    meta.session, meta.created_at, now, meta.command, meta.workdir
-                )
-            end
-
-            # Determine yield time (default 250ms like codex write_stdin)
-            yield_ms = yield_time_ms === nothing ? 250 : max(50, yield_time_ms)
-
-            # Phase 3: Determine max output lines (minimum 10 for readability)
-            max_lines = max_output_lines === nothing ? 1000 : max(10, max_output_lines)
-
-            start_time = time()
-
-            # Write input if provided
-            if !isempty(chars)
-                debug_pty && @info "write_stdin writing" bytes = length(chars)
-                write_timeout_s = max(1.0, min(5.0, yield_ms / 1000.0))
-                written = PtySessions.write_with_timeout(pty_session, chars; timeout_s = write_timeout_s)
-                if debug_pty && written < ncodeunits(chars)
-                    @info "write_stdin partial write" written = written total = ncodeunits(chars) timeout_s = write_timeout_s
-                end
-                # Give process brief time to react (100ms like Codex)
-                sleep(0.1)
-            end
-
-            # Wait for output
-            sleep(yield_ms / 1000.0)
-
-            # Read available output
-            debug_pty && @info "write_stdin reading" session_id = session_id
-            output = readavailable_with_timeout(pty_session, max(1.0, min(2.0, yield_ms / 1000.0)))
-
-            # Phase 1: Check if process has exited (state refresh)
-            is_running = PtySessions.isactive(pty_session)
-
-            # Calculate wall time
-            wall_time = time() - start_time
-
-            # Phase 1: Auto-cleanup if process has exited (thread-safe)
-            if !is_running
-                lock(PTY_SESSION_LOCK) do
-                    delete!(ACTIVE_PTY_SESSIONS, session_id)
-                end
-                @info "Session $session_id has exited and been removed"
-            end
-
-            # Phase 3: Apply output truncation if needed
-            output_display = if max_lines < 1000000
-                buffer = create_head_tail_buffer(output, max_lines)
-                format_head_tail_buffer(buffer)
-            else
-                output
-            end
-
-            # Format response
-            sections = String[]
-            push!(sections, "Wall time: $(round(wall_time, digits = 4)) seconds")
-
-            if !is_running
-                push!(sections, "Process exited - session removed")
-            else
-                push!(sections, "Process running with session ID $(session_id)")
-                n_sessions = lock(PTY_SESSION_LOCK) do
-                    length(ACTIVE_PTY_SESSIONS)
-                end
-                push!(sections, "Active sessions: $n_sessions")
-            end
-
-            push!(sections, "Output:")
-            push!(sections, isempty(output_display) ? "(no output)" : output_display)
-
-            return join(sections, "\n")
-        end,
-    )
-
-    # Phase 2: Add kill_session tool
-    kill_session = @tool(
-        "Terminate a PTY session by session_id. Use this to clean up hung or unwanted processes. Returns success message or error.",
-        kill_session(session_id::Int) = begin
-            # Thread-safe lookup and removal
-            result = lock(PTY_SESSION_LOCK) do
-                if !haskey(ACTIVE_PTY_SESSIONS, session_id)
-                    return "Session $session_id not found (may have already exited)"
-                end
-
-                meta = ACTIVE_PTY_SESSIONS[session_id]
-                try
-                    close(meta.session)
-                    delete!(ACTIVE_PTY_SESSIONS, session_id)
-                    return "Session $session_id terminated successfully (command: $(meta.command))"
-                catch e
-                    delete!(ACTIVE_PTY_SESSIONS, session_id)
-                    return "Session $session_id forcefully removed (error: $e)"
-                end
-            end
-            return result
-        end
-    )
-
-    # Phase 2: Add list_sessions tool
-    list_sessions = @tool(
-        "List all active PTY sessions with their IDs, commands, status, and age. Useful for debugging and session management.",
-        list_sessions() = begin
-            # Thread-safe snapshot of sessions
-            sessions_snapshot = lock(PTY_SESSION_LOCK) do
-                if isempty(ACTIVE_PTY_SESSIONS)
-                    return nothing
-                end
-                sort(collect(ACTIVE_PTY_SESSIONS), by = first)
-            end
-
-            if sessions_snapshot === nothing
-                return "No active PTY sessions"
-            end
-
-            lines = String["Active PTY Sessions:", ""]
-            for (id, meta) in sessions_snapshot
-                age = round(time() - meta.created_at, digits = 1)
-                last_use = round(time() - meta.last_used, digits = 1)
-                # Safely check status - handle case where session object is invalid
-                status = try
-                    PtySessions.isactive(meta.session) ? "RUNNING" : "EXITED"
-                catch
-                    "UNKNOWN"
-                end
-                push!(lines, "  [$id] $status - $(meta.command)")
-                push!(lines, "      Created: $(age)s ago, Last used: $(last_use)s ago")
-                push!(lines, "      Workdir: $(meta.workdir)")
-                push!(lines, "")
-            end
-            n_total = lock(PTY_SESSION_LOCK) do
-                length(ACTIVE_PTY_SESSIONS)
-            end
-            push!(lines, "Total: $n_total sessions (max: $MAX_PTY_SESSIONS)")
-            return join(lines, "\n")
-        end
-    )
-
-    return [exec_command, write_stdin, kill_session, list_sessions]
+    return tools
 end
 
 

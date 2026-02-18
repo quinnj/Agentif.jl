@@ -4,16 +4,16 @@ Quick smoke test - runs a few key examples to verify basic functionality.
 Use this for fast iteration during development.
 """
 
-using Agentif
+using Agentif, LLMTools
 using PtySessions
 
 println("="^80)
-println("Quick Smoke Test for long_running_process_tool")
+println("Quick Smoke Test for terminal_tools")
 println("="^80)
 
 # Test 1: Simple command execution
 println("\n[1/3] Testing simple command execution...")
-tools = create_long_running_process_tool()
+tools = LLMTools.create_terminal_tools()
 agent = Agent(
     prompt = "Execute commands quickly and concisely.",
     model = getModel("anthropic", "claude-haiku-4-5"),  # Using faster model for smoke tests

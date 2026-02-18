@@ -1,10 +1,10 @@
-using Agentif
+using Agentif, LLMTools
 using PtySessions
 
 println("Example 5: Working Directory Test")
 println("="^80)
 
-tools = create_long_running_process_tool()
+tools = LLMTools.create_terminal_tools()
 agent = Agent(
     prompt = "You are a helpful assistant that can execute commands in different directories.",
     model = getModel("anthropic", "claude-sonnet-4-5"),

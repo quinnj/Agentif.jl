@@ -1,4 +1,4 @@
-using Agentif
+using Agentif, LLMTools
 using PtySessions
 
 println("="^80)
@@ -6,7 +6,7 @@ println("Phase 1 Test: Session Metadata Tracking")
 println("="^80)
 println()
 
-tools = create_long_running_process_tool()
+tools = LLMTools.create_terminal_tools()
 agent = Agent(
     prompt = "You are a helpful assistant testing PTY session metadata tracking.",
     model = getModel("anthropic", "claude-sonnet-4-5"),
