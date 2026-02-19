@@ -5,6 +5,7 @@ authors = ["Jacob Quinn <quinn.jacobd@gmail.com>"]
 
 [deps]
 Agentif = "b1e21dde-9d8e-492f-89d0-ee48af23bfc5"
+ConcurrentUtilities = "f0e56b4a-5159-44fe-b623-3e5288b988bb"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
@@ -45,7 +46,6 @@ ScopedValues = "1.5"
 julia = "1.10"
 
 [extras]
-ConcurrentUtilities = "f0e56b4a-5159-44fe-b623-3e5288b988bb"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]

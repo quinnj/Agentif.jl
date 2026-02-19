@@ -53,6 +53,14 @@ function _worker_env()
     if !isempty(lp) && !occursin("@stdlib", lp)
         env["JULIA_LOAD_PATH"] = lp * sep * "@stdlib"
     end
+    # Ensure the worker inherits the active project, not a stale JULIA_PROJECT
+    # from the OS environment (e.g. JULIA_PROJECT=. in .zshrc). The Worker
+    # constructor only sets JULIA_PROJECT when the env key is absent, so an
+    # inherited "." would point the worker at the wrong project.
+    project = Base.ACTIVE_PROJECT[]
+    if project !== nothing
+        env["JULIA_PROJECT"] = project
+    end
     return env
 end
 
