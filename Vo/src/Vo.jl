@@ -523,7 +523,7 @@ function searchMemories(db::SQLite.DB, keywords::String; limit::Union{Nothing, I
                 score_map = Dict{String, Float64}(r.text => r.score for r in memory_results)
                 memories = lookup_memories_by_text(db, [r.text for r in memory_results])
                 if accessible_channels !== nothing
-                    memories = filter(m -> m.channel_id === nothing || m.channel_id in accessible_channels, memories)
+                    memories = filter(m -> m.channel_id === nothing || base_channel_id(m.channel_id) in accessible_channels, memories)
                 end
                 memories = priority_rerank(memories, score_map)
                 return apply_limit(memories, limit_value)
@@ -537,7 +537,7 @@ function searchMemories(db::SQLite.DB, keywords::String; limit::Union{Nothing, I
     all_memories = load_all_memories(db)
     results = filter(m -> matches_keywords(m.memory, keywords_list), all_memories)
     if accessible_channels !== nothing
-        results = filter(m -> m.channel_id === nothing || m.channel_id in accessible_channels, results)
+        results = filter(m -> m.channel_id === nothing || base_channel_id(m.channel_id) in accessible_channels, results)
     end
     return apply_limit(results, limit)
 end
@@ -639,20 +639,34 @@ function resolve_session!(db::SQLite.DB, chan_id::String; is_group::Bool=false, 
 end
 
 """
+    base_channel_id(channel_id::String) -> String
+
+Extract the base channel identifier, stripping thread-specific suffixes.
+For Mattermost threads (`mattermost:<channel>:<thread_root>`), returns `mattermost:<channel>`.
+For other platforms, returns the full channel_id unchanged.
+"""
+function base_channel_id(channel_id::String)
+    startswith(channel_id, "mattermost:") || return channel_id
+    parts = split(channel_id, ':'; limit=3)
+    return length(parts) >= 3 ? string(parts[1], ':', parts[2]) : channel_id
+end
+
+"""
     accessible_channel_ids(db, current_channel_id) -> Vector{String}
 
-Return channel IDs whose data is accessible from the current channel.
-Includes the current channel plus all public (non-private) channels.
+Return **base** channel IDs whose data is accessible from the current channel.
+Includes the current channel's base plus all public (non-private) channel bases.
+Callers should compare using `base_channel_id(x) in accessible` rather than exact match.
 """
 function accessible_channel_ids(db::SQLite.DB, current_channel_id::String)
-    ids = Set{String}()
-    push!(ids, current_channel_id)
-    # Add all public channels
+    bases = Set{String}()
+    push!(bases, base_channel_id(current_channel_id))
+    # Add all public channel bases
     rows = SQLite.DBInterface.execute(db, "SELECT channel_id FROM channel_sessions WHERE is_private = 0")
     for row in rows
-        push!(ids, String(row.channel_id))
+        push!(bases, base_channel_id(String(row.channel_id)))
     end
-    return collect(ids)
+    return collect(bases)
 end
 
 """
@@ -933,13 +947,14 @@ function search_session(assistant::AgentAssistant, keywords::String; limit::Unio
     limit_value = limit === nothing ? 10 : max(limit, 0)
     limit_value == 0 && return Dict{String,Any}[]
 
-    # Build set of accessible session IDs from accessible channels
+    # Build set of accessible session IDs from accessible base channels
     accessible_session_ids = if accessible_channels !== nothing
+        accessible_bases = Set{String}(accessible_channels)
         sids = Set{String}()
-        for ac_id in accessible_channels
-            row = iterate(SQLite.DBInterface.execute(assistant.db,
-                "SELECT session_id FROM channel_sessions WHERE channel_id = ?", (ac_id,)))
-            row !== nothing && push!(sids, String(row[1].session_id))
+        for row in SQLite.DBInterface.execute(assistant.db, "SELECT channel_id, session_id FROM channel_sessions")
+            if base_channel_id(String(row.channel_id)) in accessible_bases
+                push!(sids, String(row.session_id))
+            end
         end
         sids
     else
@@ -1063,7 +1078,7 @@ function get_relevant_memories(assistant::AgentAssistant, session_entries::Vecto
                 score_map = Dict{String, Float64}(r.text => r.score for r in memory_results)
                 memories = lookup_memories_by_text(assistant.db, [r.text for r in memory_results])
                 if ac !== nothing
-                    memories = filter(m -> m.channel_id === nothing || m.channel_id in ac, memories)
+                    memories = filter(m -> m.channel_id === nothing || base_channel_id(m.channel_id) in ac, memories)
                 end
                 memories = priority_rerank(memories, score_map)
                 memories = apply_limit(memories, limit)
@@ -1076,7 +1091,7 @@ function get_relevant_memories(assistant::AgentAssistant, session_entries::Vecto
     # Fallback: most recent memories
     all_memories = load_all_memories(assistant.db)
     if ac !== nothing
-        all_memories = filter(m -> m.channel_id === nothing || m.channel_id in ac, all_memories)
+        all_memories = filter(m -> m.channel_id === nothing || base_channel_id(m.channel_id) in ac, all_memories)
     end
     return all_memories[1:min(limit, length(all_memories))]
 end
