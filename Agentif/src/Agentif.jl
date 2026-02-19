@@ -30,7 +30,7 @@ export steer_middleware, tool_call_middleware, queue_middleware, evaluate_middle
 export input_guardrail_middleware, skills_middleware, compaction_middleware, channel_middleware
 export AbstractChannel, CURRENT_CHANNEL, DIRECT_PING, with_channel, ChannelUser
 export start_streaming, append_to_stream, finish_streaming, send_message, close_channel, channel_id
-export is_group, is_private, get_current_user
+export is_group, is_private, get_current_user, source_message_id
 export OutputGuardrailAgent, DEFAULT_OUTPUT_GUARDRAIL_AGENT
 export build_output_guardrail_input, materialize_output_guardrail_agent
 export CompactionConfig, CompactionSummaryMessage, compact!

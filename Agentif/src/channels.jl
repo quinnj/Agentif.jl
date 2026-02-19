@@ -63,6 +63,17 @@ function get_current_user end
 get_current_user(::AbstractChannel) = nothing
 
 """
+    source_message_id(ch::AbstractChannel) -> Union{Nothing, String}
+
+Return the platform-specific message ID of the incoming message that triggered
+this evaluation. Used for tracking which stored data (memories, session entries)
+originated from a specific message, enabling scrubbing on deletion.
+Default: `nothing` (no message ID tracking).
+"""
+function source_message_id end
+source_message_id(::AbstractChannel) = nothing
+
+"""
     create_channel_tools(ch::AbstractChannel) -> Vector{AgentTool}
 
 Return platform-specific tools for the current channel (e.g. emoji reactions).

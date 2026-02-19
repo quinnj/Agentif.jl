@@ -18,7 +18,7 @@ export AssistantMessage, UserMessage
 export run!, evaluate, @a_str
 export getIdentityAndPurpose, setIdentityAndPurpose!
 export getHeartbeatTasks, setHeartbeatTasks!, trigger_event_heartbeat!
-export addNewMemory, searchMemories, forgetMemory
+export addNewMemory, searchMemories, forgetMemory, scrub_post_id!
 export SkillMetadata, getSkills, addNewSkill, forgetSkill
 export listJobs, addJob!, removeJob!
 export ReplChannel
@@ -48,8 +48,9 @@ struct Memory
     priority::String  # "high", "medium", "low"
     referenced_at::Union{Nothing, String}  # ISO date or natural language temporal anchor
     channel_id::Union{Nothing, String}
+    post_id::Union{Nothing, String}
 end
-Memory(memory::String, createdAt::Float64, eval_id::Union{Nothing, String}) = Memory(memory, createdAt, eval_id, "medium", nothing, nothing)
+Memory(memory::String, createdAt::Float64, eval_id::Union{Nothing, String}) = Memory(memory, createdAt, eval_id, "medium", nothing, nothing, nothing)
 
 const MEMORY_TIMESTAMP_FORMAT = dateformat"yyyy-mm-dd HH:MM:SS"
 
@@ -110,7 +111,8 @@ function init_schema!(db::SQLite.DB)
             eval_id TEXT,
             priority TEXT NOT NULL DEFAULT 'medium',
             referenced_at TEXT,
-            channel_id TEXT
+            channel_id TEXT,
+            post_id TEXT
         )
     """)
     SQLite.execute(db, """
@@ -137,7 +139,8 @@ function init_schema!(db::SQLite.DB)
             created_at REAL NOT NULL,
             messages TEXT NOT NULL,
             is_compaction INTEGER NOT NULL DEFAULT 0,
-            user_id TEXT
+            user_id TEXT,
+            post_id TEXT
         )
     """)
     SQLite.execute(db, """
@@ -163,6 +166,9 @@ function migrate_memories_schema!(db::SQLite.DB)
     if "channel_id" ∉ cols
         SQLite.execute(db, "ALTER TABLE memories ADD COLUMN channel_id TEXT")
     end
+    if "post_id" ∉ cols
+        SQLite.execute(db, "ALTER TABLE memories ADD COLUMN post_id TEXT")
+    end
 end
 
 function migrate_schema!(db::SQLite.DB)
@@ -185,6 +191,9 @@ function migrate_schema!(db::SQLite.DB)
     end
     if "user_id" ∉ se_cols
         SQLite.execute(db, "ALTER TABLE session_entries ADD COLUMN user_id TEXT")
+    end
+    if "post_id" ∉ se_cols
+        SQLite.execute(db, "ALTER TABLE session_entries ADD COLUMN post_id TEXT")
     end
 end
 
@@ -233,13 +242,14 @@ end
 
 function Agentif.append_session_entry!(store::SQLiteSessionStore, session_id::String, entry::Agentif.SessionEntry)
     messages_json = JSON.json(entry.messages)
-    # Tag with current user ID if available
+    # Tag with current user ID and post_id if available
     ch = Agentif.CURRENT_CHANNEL[]
     user = ch !== nothing ? Agentif.get_current_user(ch) : nothing
     user_id = user !== nothing ? user.id : nothing
+    post_id = ch !== nothing ? Agentif.source_message_id(ch) : nothing
     SQLite.execute(store.db,
-        "INSERT INTO session_entries (session_id, entry_id, created_at, messages, is_compaction, user_id) VALUES (?, ?, ?, ?, ?, ?)",
-        (session_id, entry.id, entry.created_at, messages_json, entry.is_compaction ? 1 : 0, user_id))
+        "INSERT INTO session_entries (session_id, entry_id, created_at, messages, is_compaction, user_id, post_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (session_id, entry.id, entry.created_at, messages_json, entry.is_compaction ? 1 : 0, user_id, post_id))
     # Index session text into LocalSearch
     if store.search_store !== nothing
         text = session_entry_search_text(entry)
@@ -442,14 +452,14 @@ function validate_priority(p::Union{Nothing, String})
     return "medium"
 end
 
-function addNewMemory(db::SQLite.DB, memory::String; eval_id::Union{Nothing, String}=nothing, priority::Union{Nothing, String}=nothing, referenced_at::Union{Nothing, String}=nothing, search_store::Union{Nothing, LocalSearch.Store}=nothing, channel_id::Union{Nothing, String}=nothing)
+function addNewMemory(db::SQLite.DB, memory::String; eval_id::Union{Nothing, String}=nothing, priority::Union{Nothing, String}=nothing, referenced_at::Union{Nothing, String}=nothing, search_store::Union{Nothing, LocalSearch.Store}=nothing, channel_id::Union{Nothing, String}=nothing, post_id::Union{Nothing, String}=nothing)
     text = normalize_memory_text(memory)
     created_at = time()
     eval_id_str = eval_id === nothing ? nothing : string(eval_id)
     pri = validate_priority(priority)
     ref_at = referenced_at === nothing ? nothing : strip(referenced_at)
-    SQLite.execute(db, "INSERT INTO memories (memory, created_at, eval_id, priority, referenced_at, channel_id) VALUES (?, ?, ?, ?, ?, ?)", (text, created_at, eval_id_str, pri, ref_at, channel_id))
-    mem = Memory(text, created_at, eval_id_str, pri, ref_at, channel_id)
+    SQLite.execute(db, "INSERT INTO memories (memory, created_at, eval_id, priority, referenced_at, channel_id, post_id) VALUES (?, ?, ?, ?, ?, ?, ?)", (text, created_at, eval_id_str, pri, ref_at, channel_id, post_id))
+    mem = Memory(text, created_at, eval_id_str, pri, ref_at, channel_id, post_id)
     # Index into LocalSearch
     if search_store !== nothing
         try
@@ -470,11 +480,12 @@ function _row_to_memory(r)
         r.priority === missing ? "medium" : String(r.priority),
         r.referenced_at === missing ? nothing : String(r.referenced_at),
         hasproperty(r, :channel_id) && r.channel_id !== missing ? String(r.channel_id) : nothing,
+        hasproperty(r, :post_id) && r.post_id !== missing ? String(r.post_id) : nothing,
     )
 end
 
 function load_all_memories(db::SQLite.DB)
-    rows = SQLite.DBInterface.execute(db, "SELECT memory, created_at, eval_id, priority, referenced_at, channel_id FROM memories ORDER BY created_at DESC")
+    rows = SQLite.DBInterface.execute(db, "SELECT memory, created_at, eval_id, priority, referenced_at, channel_id, post_id FROM memories ORDER BY created_at DESC")
     return Memory[_row_to_memory(r) for r in rows]
 end
 
@@ -483,7 +494,7 @@ function lookup_memories_by_text(db::SQLite.DB, texts::Vector{String})
     isempty(texts) && return Memory[]
     placeholders = join(fill("?", length(texts)), ", ")
     rows = SQLite.DBInterface.execute(db,
-        "SELECT memory, created_at, eval_id, priority, referenced_at, channel_id FROM memories WHERE memory IN ($placeholders)", texts)
+        "SELECT memory, created_at, eval_id, priority, referenced_at, channel_id, post_id FROM memories WHERE memory IN ($placeholders)", texts)
     by_text = Dict{String, Memory}()
     for r in rows
         by_text[String(r.memory)] = _row_to_memory(r)
@@ -557,6 +568,65 @@ function forgetMemory(db::SQLite.DB, memory::String; search_store::Union{Nothing
         end
     end
     return count
+end
+
+"""
+    scrub_post_id!(assistant, post_id)
+
+Scrub all data associated with a deleted message (identified by `post_id`).
+- Memories: hard-deleted from DB and search index.
+- Session entries: content replaced with a placeholder to preserve session continuity.
+"""
+function scrub_post_id!(assistant::AgentAssistant, post_id::String)
+    db = assistant.db
+    search_store = assistant.search_store
+
+    # 1. Hard-delete memories matching this post_id
+    mem_rows = SQLite.DBInterface.execute(db,
+        "SELECT memory FROM memories WHERE post_id = ?", (post_id,))
+    mem_texts = String[String(r.memory) for r in mem_rows]
+    if !isempty(mem_texts)
+        # Remove from search index
+        if search_store !== nothing
+            for text in mem_texts
+                try
+                    doc_id = "memory:$(bytes2hex(sha256(text))[1:16])"
+                    Base.delete!(search_store, doc_id)
+                catch err
+                    @debug "scrub_post_id!: failed to remove memory from search index" doc_id exception=err
+                end
+            end
+        end
+        SQLite.execute(db, "DELETE FROM memories WHERE post_id = ?", (post_id,))
+        @info "scrub_post_id!: deleted memories" post_id=post_id count=length(mem_texts)
+    end
+
+    # 2. Redact session entries matching this post_id (replace content, preserve structure)
+    se_rows = SQLite.DBInterface.execute(db,
+        "SELECT id, session_id, entry_id FROM session_entries WHERE post_id = ?", (post_id,))
+    entry_ids = Tuple{Int, String, Any}[(Int(r.id), String(r.session_id), r.entry_id) for r in se_rows]
+    if !isempty(entry_ids)
+        placeholder = JSON.json([Dict("type" => "user", "content" => [Dict("type" => "text", "text" => "[original message deleted]")])])
+        for (row_id, session_id, entry_id) in entry_ids
+            # Remove from search index
+            if search_store !== nothing
+                eid = entry_id === missing ? "" : string(entry_id)
+                doc_id = "session:$(session_id):$(eid)"
+                try
+                    Base.delete!(search_store, doc_id)
+                catch err
+                    @debug "scrub_post_id!: failed to remove session entry from search index" doc_id exception=err
+                end
+            end
+            SQLite.execute(db, "UPDATE session_entries SET messages = ? WHERE id = ?", (placeholder, row_id))
+        end
+        @info "scrub_post_id!: redacted session entries" post_id=post_id count=length(entry_ids)
+    end
+
+    if isempty(mem_texts) && isempty(entry_ids)
+        @debug "scrub_post_id!: no data found for post_id" post_id=post_id
+    end
+    return nothing
 end
 
 # --- Skills (backed by skills table) ---

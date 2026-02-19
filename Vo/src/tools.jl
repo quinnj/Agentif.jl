@@ -164,7 +164,8 @@ Use referenced_at for temporal anchoring when the memory references a specific t
             eval_id_str = eval_id === nothing ? nothing : string(eval_id)
             ch = Agentif.CURRENT_CHANNEL[]
             chan_id = ch !== nothing ? Agentif.channel_id(ch) : nothing
-            mem = Vo.addNewMemory(assistant.db, memory; eval_id=eval_id_str, priority=priority, referenced_at=referenced_at, search_store=assistant.search_store, channel_id=chan_id)
+            post_id = ch !== nothing ? Agentif.source_message_id(ch) : nothing
+            mem = Vo.addNewMemory(assistant.db, memory; eval_id=eval_id_str, priority=priority, referenced_at=referenced_at, search_store=assistant.search_store, channel_id=chan_id, post_id=post_id)
             return JSON.json(mem)
         end,
     )

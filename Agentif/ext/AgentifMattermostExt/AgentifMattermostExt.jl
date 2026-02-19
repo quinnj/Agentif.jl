@@ -16,14 +16,15 @@ Start a Mattermost bot that listens for incoming messages via WebSocket and call
 scoped via `Agentif.with_channel`.
 """
 function run_mattermost_bot(handler::Function;
-        error_handler::Union{Function, Nothing} = nothing)
+        error_handler::Union{Function, Nothing} = nothing,
+        on_delete::Union{Function, Nothing} = nothing)
     me = Mattermost.get_me()
     bot_user_id = me.id
     bot_username = me.username !== nothing ? lowercase(string(me.username)) : ""
     @info "AgentifMattermostExt: Bot user: $(me.username) ($(bot_user_id))"
 
     Mattermost.run_websocket(; error_handler) do event
-        _handle_event(handler, event, bot_user_id, bot_username)
+        _handle_event(handler, event, bot_user_id, bot_username; on_delete)
     end
 end
 
@@ -97,6 +98,8 @@ function Agentif.get_current_user(ch::MattermostChannel)
     return Agentif.ChannelUser(ch.user_id, ch.user_name)
 end
 
+Agentif.source_message_id(ch::MattermostChannel) = isempty(ch.post_id) ? nothing : ch.post_id
+
 function Agentif.create_channel_tools(ch::MattermostChannel)
     post_id = ch.post_id
     client = ch.client
@@ -115,9 +118,30 @@ function Agentif.create_channel_tools(ch::MattermostChannel)
     return Agentif.AgentTool[react_tool]
 end
 
-function _handle_event(handler::Function, event::Mattermost.WebSocketEvent, bot_user_id::String, bot_username::String="")
-    event.event == "posted" || return
+function _handle_event(handler::Function, event::Mattermost.WebSocketEvent, bot_user_id::String, bot_username::String="";
+        on_delete::Union{Function, Nothing} = nothing)
     event.data === nothing && return
+
+    # Handle post_deleted events
+    if event.event == "post_deleted"
+        on_delete === nothing && return
+        post_json = get(event.data, "post", nothing)
+        post_json === nothing && return
+        post_data = JSON.parse(post_json)
+        user_id = get(post_data, "user_id", "")
+        user_id == bot_user_id && return
+        post_id = get(post_data, "id", "")
+        isempty(post_id) && return
+        Threads.@spawn try
+            @info "AgentifMattermostExt: Processing post_deleted" post_id=post_id user_id=user_id
+            on_delete(post_id)
+        catch e
+            @error "AgentifMattermostExt: on_delete error" post_id=post_id exception=(e, catch_backtrace())
+        end
+        return
+    end
+
+    event.event == "posted" || return
 
     post_json = get(event.data, "post", nothing)
     post_json === nothing && return
