@@ -1,135 +1,363 @@
 module VoSlackExt
 
 using Slack
+using Slack: JSON
 import Agentif
 import Vo
-export SlackTriggerSource
 
-# === Channel (unchanged from AgentifSlackExt) ===
+export SlackEventSource
+
+# ─── Channel ───
 
 mutable struct SlackChannel <: Agentif.AbstractChannel
     channel::String
     thread_ts::String
+    post_ts::String
     web_client::Slack.WebClient
     sm::Union{Nothing, Slack.ChatStream}
+    io::Union{Nothing, IOBuffer}
     user_id::String
+    user_name::String
     # "channel" = public, "group" = private channel, "im" = DM, "mpim" = multi-party DM
     channel_type::String
+    recipient_team_id::Union{Nothing, String}
+    recipient_user_id::Union{Nothing, String}
 end
 
+const STREAM_BUFFER_SIZE = 32
+
 function Agentif.start_streaming(ch::SlackChannel)
-    if ch.sm === nothing
-        ch.sm = Slack.ChatStream(ch.web_client;
-            channel=ch.channel,
-            thread_ts=ch.thread_ts,
-        )
+    if ch.sm === nothing && ch.io === nothing
+        if !isempty(ch.thread_ts) && ch.recipient_team_id !== nothing && ch.recipient_user_id !== nothing
+            ch.sm = Slack.ChatStream(ch.web_client;
+                channel=ch.channel,
+                thread_ts=ch.thread_ts,
+                buffer_size=STREAM_BUFFER_SIZE,
+                recipient_team_id=ch.recipient_team_id,
+                recipient_user_id=ch.recipient_user_id,
+            )
+        else
+            ch.io = IOBuffer()
+        end
     end
 end
 
 function Agentif.append_to_stream(ch::SlackChannel, delta::AbstractString)
     sm = ch.sm
-    sm === nothing && return
-    Slack.append!(sm; markdown_text=delta)
+    if sm !== nothing
+        Slack.append!(sm; markdown_text=String(delta))
+        return
+    end
+    io = ch.io
+    io === nothing && return
+    write(io, String(delta))
 end
 
-Agentif.finish_streaming(::SlackChannel) = nothing
+function Agentif.finish_streaming(ch::SlackChannel)
+    sm = ch.sm
+    if sm !== nothing && !isempty(sm.buffer)
+        Slack.flush_buffer!(sm)
+    end
+    return nothing
+end
 
 function Agentif.close_channel(ch::SlackChannel)
     sm = ch.sm
-    sm === nothing && return
-    if sm.state != "completed"
-        Slack.stop!(sm)
-    end
-    ch.sm = nothing
-end
-
-function Agentif.send_message(ch::SlackChannel, msg)
-    Slack.chat_post_message(ch.web_client;
-        channel=ch.channel,
-        text=string(msg),
-        thread_ts=ch.thread_ts,
-    )
-end
-
-function Agentif.channel_id(ch::SlackChannel)
-    return "slack:$(ch.channel):$(ch.thread_ts)"
-end
-
-function Agentif.is_group(ch::SlackChannel)
-    return ch.channel_type in ("channel", "group", "mpim")
-end
-
-function Agentif.is_private(ch::SlackChannel)
-    return ch.channel_type != "channel"
-end
-
-function Agentif.get_current_user(ch::SlackChannel)
-    isempty(ch.user_id) && return nothing
-    return Agentif.ChannelUser(ch.user_id, ch.user_id)
-end
-
-function _handle_request(handler::Function, request::Slack.SocketModeRequest, web_client::Slack.WebClient)
-    request.type == "events_api" || return
-
-    payload = request.payload
-    payload === nothing && return
-    payload isa Slack.SlackEventsApiPayload || return
-
-    event = payload.event
-    event === nothing && return
-
-    # Skip bot messages
-    if event isa Slack.SlackMessageEvent && event.bot_id !== nothing
+    if sm !== nothing
+        if sm.state != "completed"
+            Slack.stop!(sm)
+        end
+        ch.sm = nothing
         return
     end
 
-    text = event.text
-    (text === nothing || isempty(text)) && return
+    io = ch.io
+    io === nothing && return
+    text = String(take!(io))
+    if !isempty(text)
+        Agentif.send_message(ch, text)
+    end
+    ch.io = nothing
+end
 
-    channel = event.channel
-    channel === nothing && return
+function Agentif.send_message(ch::SlackChannel, msg)
+    if isempty(ch.thread_ts)
+        Slack.chat_post_message(ch.web_client; channel=ch.channel, text=string(msg))
+    else
+        Slack.chat_post_message(ch.web_client; channel=ch.channel, text=string(msg), thread_ts=ch.thread_ts)
+    end
+end
 
-    thread_ts = event.thread_ts !== nothing ? event.thread_ts : event.ts
-    thread_ts === nothing && return
+function Agentif.channel_id(ch::SlackChannel)
+    base = "slack:$(ch.channel)"
+    return isempty(ch.thread_ts) ? base : "$(base):$(ch.thread_ts)"
+end
 
-    user_id = event.user !== nothing ? string(event.user) : ""
-    channel_type = event.channel_type !== nothing ? string(event.channel_type) : "channel"
+Agentif.is_group(ch::SlackChannel) = ch.channel_type in ("channel", "group", "mpim")
+Agentif.is_private(ch::SlackChannel) = ch.channel_type != "channel"
 
-    direct_ping = event isa Slack.SlackAppMentionEvent || channel_type == "im"
+function Agentif.get_current_user(ch::SlackChannel)
+    isempty(ch.user_id) && return nothing
+    return Agentif.ChannelUser(ch.user_id, ch.user_name)
+end
 
-    @info "VoSlackExt: Processing message" channel=channel user_id=user_id channel_type=channel_type direct_ping=direct_ping text_length=length(text)
+Agentif.source_message_id(ch::SlackChannel) = isempty(ch.post_ts) ? nothing : ch.post_ts
 
-    Threads.@spawn try
-        ch = SlackChannel(channel, thread_ts, web_client, nothing, user_id, channel_type)
-        Agentif.with_channel(ch) do
-            handler(text)
+# ─── Channel Events ───
+
+struct SlackMessageEvent <: Vo.ChannelEvent
+    channel::SlackChannel
+    content::String
+    direct_ping::Bool
+end
+
+Vo.get_name(::SlackMessageEvent) = "slack_message"
+Vo.get_channel(ev::SlackMessageEvent) = ev.channel
+function Vo.event_content(ev::SlackMessageEvent)
+    if Agentif.is_group(ev.channel) && !isempty(ev.channel.user_name)
+        return "[$(ev.channel.user_name)]: $(ev.content)"
+    end
+    return ev.content
+end
+
+struct SlackReactionEvent <: Vo.ChannelEvent
+    channel::SlackChannel
+    emoji::String
+    user_name::String
+    reacted_to_ts::String
+end
+
+Vo.get_name(::SlackReactionEvent) = "slack_reaction"
+Vo.get_channel(ev::SlackReactionEvent) = ev.channel
+
+function Vo.event_content(ev::SlackReactionEvent)
+    lines = ["User '$(ev.user_name)' reacted with :$(ev.emoji):"]
+    !isempty(ev.reacted_to_ts) && push!(lines, "Reacted to message timestamp $(ev.reacted_to_ts)")
+    return join(lines, "\n")
+end
+
+# ─── Event Types & Handlers ───
+
+const MESSAGE_EVENT_TYPE = Vo.EventType("slack_message", "A new message in a Slack conversation")
+const REACTION_EVENT_TYPE = Vo.EventType("slack_reaction", "An emoji reaction added to a Slack message")
+
+const REACTION_HANDLER_PROMPT = """
+A user reacted to one of your messages with an emoji. Interpret the reaction and respond appropriately:
+- Positive reactions (thumbsup, white_check_mark, heart, +1): Approval. Continue with your current approach.
+- Negative reactions (thumbsdown, x, -1): Disapproval. Stop and ask what to change.
+- Other reactions: Acknowledge briefly if appropriate.
+Keep your response concise."""
+
+# ─── EventSource ───
+
+Base.@kwdef struct SlackEventSource <: Vo.EventSource
+    app_token::String = get(ENV, "SLACK_APP_TOKEN", "")
+    bot_token::String = get(ENV, "SLACK_BOT_TOKEN", "")
+    bot_user_id::String = get(ENV, "SLACK_BOT_USER_ID", "")
+    bot_username::String = get(ENV, "SLACK_BOT_USERNAME", "")
+    recipient_team_id::String = get(ENV, "SLACK_STREAM_RECIPIENT_TEAM_ID", "")
+    recipient_user_id::String = get(ENV, "SLACK_STREAM_RECIPIENT_USER_ID", "")
+end
+
+Vo.get_event_types(::SlackEventSource) = Vo.EventType[MESSAGE_EVENT_TYPE, REACTION_EVENT_TYPE]
+
+function Vo.get_event_handlers(::SlackEventSource)
+    Vo.EventHandler[
+        Vo.EventHandler("slack_message_default", ["slack_message"], "", nothing),
+        Vo.EventHandler("slack_reaction_default", ["slack_reaction"], REACTION_HANDLER_PROMPT, nothing),
+    ]
+end
+
+# ─── Request handling ───
+
+_string_or_empty(x) = x === nothing ? "" : String(x)
+
+function _infer_channel_type(channel::String)
+    isempty(channel) && return "channel"
+    first_char = first(channel)
+    first_char == 'D' && return "im"
+    first_char == 'G' && return "group"
+    return "channel"
+end
+
+function _payload_event(payload)
+    if payload isa Slack.SlackEventsApiPayload
+        return payload.event
+    elseif payload isa AbstractDict
+        return get(() -> nothing, payload, "event")
+    end
+    return nothing
+end
+
+function _event_type(event)
+    if event isa Slack.SlackAppMentionEvent
+        return event.type === nothing ? "app_mention" : String(event.type)
+    elseif event isa Slack.SlackMessageEvent
+        return event.type === nothing ? "message" : String(event.type)
+    elseif event isa AbstractDict
+        return _string_or_empty(get(() -> "", event, "type"))
+    end
+    return ""
+end
+
+function _extract_message_event(event, web_client::Slack.WebClient, bot_user_id::String, bot_username::String,
+        recipient_team_id::Union{Nothing, String}, recipient_user_id::Union{Nothing, String})
+    event === nothing && return nothing
+    event_type = _event_type(event)
+    (event_type == "message" || event_type == "app_mention") || return nothing
+
+    text = ""
+    channel = ""
+    thread_ts = ""
+    ts = ""
+    subtype = ""
+    bot_id = ""
+    user_id = ""
+    channel_type = ""
+
+    if event isa Slack.SlackAppMentionEvent
+        text = _string_or_empty(event.text)
+        channel = _string_or_empty(event.channel)
+        thread_ts = _string_or_empty(event.thread_ts)
+        ts = _string_or_empty(event.ts)
+        user_id = _string_or_empty(event.user)
+        channel_type = _infer_channel_type(channel)
+    elseif event isa Slack.SlackMessageEvent
+        text = _string_or_empty(event.text)
+        channel = _string_or_empty(event.channel)
+        thread_ts = _string_or_empty(event.thread_ts)
+        ts = _string_or_empty(event.ts)
+        subtype = _string_or_empty(event.subtype)
+        bot_id = _string_or_empty(event.bot_id)
+        user_id = _string_or_empty(event.user)
+        channel_type = _string_or_empty(event.channel_type)
+        isempty(channel_type) && (channel_type = _infer_channel_type(channel))
+    elseif event isa AbstractDict
+        text = _string_or_empty(get(() -> "", event, "text"))
+        channel = _string_or_empty(get(() -> "", event, "channel"))
+        thread_ts = _string_or_empty(get(() -> "", event, "thread_ts"))
+        ts = _string_or_empty(get(() -> "", event, "ts"))
+        subtype = _string_or_empty(get(() -> "", event, "subtype"))
+        bot_id = _string_or_empty(get(() -> "", event, "bot_id"))
+        user_id = _string_or_empty(get(() -> "", event, "user"))
+        channel_type = _string_or_empty(get(() -> "", event, "channel_type"))
+        isempty(channel_type) && (channel_type = _infer_channel_type(channel))
+    else
+        return nothing
+    end
+
+    isempty(channel) && return nothing
+    isempty(text) && return nothing
+    isempty(ts) && return nothing
+    !isempty(subtype) && return nothing
+    !isempty(bot_id) && return nothing
+    !isempty(bot_user_id) && lowercase(user_id) == lowercase(bot_user_id) && return nothing
+    isempty(thread_ts) && (thread_ts = ts)
+
+    mention_token = isempty(bot_user_id) ? "" : "<@" * lowercase(bot_user_id) * ">"
+    lower_text = lowercase(text)
+    direct_ping = event_type == "app_mention" ||
+        channel_type == "im" ||
+        (!isempty(mention_token) && occursin(mention_token, lower_text)) ||
+        (!isempty(bot_username) && occursin("@" * lowercase(bot_username), lower_text))
+
+    user_name = user_id
+    ch = SlackChannel(channel, thread_ts, ts, web_client, nothing, nothing, user_id, user_name, channel_type, recipient_team_id, recipient_user_id)
+    return SlackMessageEvent(ch, text, direct_ping)
+end
+
+function _extract_reaction_event(event, web_client::Slack.WebClient, bot_user_id::String,
+        recipient_team_id::Union{Nothing, String}, recipient_user_id::Union{Nothing, String})
+    event isa AbstractDict || return nothing
+    _event_type(event) == "reaction_added" || return nothing
+
+    emoji = _string_or_empty(get(() -> "", event, "reaction"))
+    user_id = _string_or_empty(get(() -> "", event, "user"))
+    !isempty(bot_user_id) && lowercase(user_id) == lowercase(bot_user_id) && return nothing
+
+    item = get(() -> nothing, event, "item")
+    item isa AbstractDict || return nothing
+    _string_or_empty(get(() -> "", item, "type")) == "message" || return nothing
+
+    channel = _string_or_empty(get(() -> "", item, "channel"))
+    reacted_to_ts = _string_or_empty(get(() -> "", item, "ts"))
+    if isempty(channel) || isempty(emoji) || isempty(reacted_to_ts)
+        return nothing
+    end
+
+    channel_type = _infer_channel_type(channel)
+    user_name = user_id
+    ch = SlackChannel(channel, reacted_to_ts, reacted_to_ts, web_client, nothing, nothing, user_id, user_name, channel_type, recipient_team_id, recipient_user_id)
+    return SlackReactionEvent(ch, emoji, user_name, reacted_to_ts)
+end
+
+function _handle_request(request::Slack.SocketModeRequest, web_client::Slack.WebClient, bot_user_id::String, bot_username::String,
+        recipient_team_id::Union{Nothing, String}, recipient_user_id::Union{Nothing, String},
+        assistant::Vo.AgentAssistant)
+    request.type == "events_api" || return
+    payload = request.payload
+    payload === nothing && return
+    event = _payload_event(payload)
+    event === nothing && return
+    event_type = _event_type(event)
+
+    message_event = _extract_message_event(event, web_client, bot_user_id, bot_username, recipient_team_id, recipient_user_id)
+    if message_event !== nothing
+        ch = message_event.channel
+        # Deterministic routing to avoid double-processing the same human message:
+        # - group/public: use app_mention events
+        # - direct messages: use message events
+        if event_type == "message" && ch.channel_type != "im"
+            return nothing
         end
-    catch e
-        @error "VoSlackExt: handler error" channel=channel exception=(e, catch_backtrace())
+        if event_type == "app_mention" && ch.channel_type == "im"
+            return nothing
+        end
+        is_group_message = Agentif.is_group(ch)
+        if is_group_message && !message_event.direct_ping
+            return nothing
+        end
+        @info "VoSlackExt: message" channel=ch.channel thread_ts=ch.thread_ts user_id=ch.user_id direct_ping=message_event.direct_ping event_type
+        put!(assistant.event_queue, message_event)
     end
-end
 
-# === TriggerSource ===
-
-struct SlackTriggerSource <: Vo.TriggerSource
-    name::String
-    app_token::String
-    bot_token::String
-end
-
-function SlackTriggerSource(; name::String="slack", app_token=ENV["SLACK_APP_TOKEN"], bot_token=ENV["SLACK_BOT_TOKEN"])
-    SlackTriggerSource(name, String(app_token), String(bot_token))
-end
-
-Vo.source_name(s::SlackTriggerSource) = s.name
-
-function Vo.run(handler::Function, source::SlackTriggerSource)
-    web_client = Slack.WebClient(; token=source.bot_token)
-    @info "VoSlackExt: Starting Socket Mode bot"
-    Slack.run!(source.app_token; web_client=web_client) do sm_client, request
-        Slack.ack!(sm_client, request)
-        _handle_request(handler, request, web_client)
+    reaction_event = _extract_reaction_event(event, web_client, bot_user_id, recipient_team_id, recipient_user_id)
+    if reaction_event !== nothing
+        ch = reaction_event.channel
+        @info "VoSlackExt: reaction" channel=ch.channel thread_ts=ch.thread_ts emoji=reaction_event.emoji user_id=ch.user_id
+        put!(assistant.event_queue, reaction_event)
     end
+
+    return nothing
+end
+
+# ─── start! ───
+
+function Vo.start!(source::SlackEventSource, assistant::Vo.AgentAssistant)
+    app_token = strip(source.app_token)
+    bot_token = strip(source.bot_token)
+    isempty(app_token) && error("VoSlackExt: missing SLACK_APP_TOKEN")
+    isempty(bot_token) && error("VoSlackExt: missing SLACK_BOT_TOKEN")
+
+    errormonitor(Threads.@spawn begin
+        web_client = Slack.WebClient(; token=bot_token)
+        bot_user_id = string(strip(source.bot_user_id))
+        bot_username = lowercase(strip(source.bot_username))
+        recipient_team_id = let v = strip(source.recipient_team_id); isempty(v) ? nothing : String(v); end
+        recipient_user_id = let v = strip(source.recipient_user_id); isempty(v) ? nothing : String(v); end
+        @info "VoSlackExt: Starting Socket Mode"
+
+        Slack.run!(app_token; web_client=web_client) do socket_client, request
+            if request.envelope_id !== nothing
+                try
+                    Slack.ack!(socket_client, request)
+                catch e
+                    @warn "VoSlackExt: failed to ack request" exception=(e, catch_backtrace())
+                end
+            end
+            _handle_request(request, web_client, bot_user_id, bot_username, recipient_team_id, recipient_user_id, assistant)
+        end
+    end)
 end
 
 end # module VoSlackExt

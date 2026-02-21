@@ -1,7 +1,7 @@
 # Custom model registry entries that are not generated.
 
 function _init_custom_models!()
-    _model_registry["google-gemini-cli"] = Dict{String, Model}(
+    google_gemini_cli_models = Dict{String, Model}(
         "gemini-2.0-flash" => Model(
             id = "gemini-2.0-flash",
             name = "Gemini 2.0 Flash (Cloud Code Assist)",
@@ -68,75 +68,48 @@ function _init_custom_models!()
             headers = nothing
         ),
     )
+    merge!(get!(() -> Dict{String, Model}(), _model_registry, "google-gemini-cli"), google_gemini_cli_models)
 
     # OpenAI Codex models (via ChatGPT OAuth)
-    _model_registry["openai-codex"] = Dict{String, Model}(
-        "gpt-5.1" => Model(
-            id = "gpt-5.1",
-            name = "GPT-5.1",
+    function codex_model(
+            model_id::String,
+            name::String;
+            context_window::Int = 272000,
+            max_tokens::Int = 128000,
+        )
+        return Model(
+            id = model_id,
+            name = name,
             api = "openai-codex-responses",
             provider = "openai-codex",
             baseUrl = "https://chatgpt.com/backend-api",
             reasoning = true,
             input = ["text", "image"],
             cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
-            contextWindow = 272000,
-            maxTokens = 128000,
-            headers = nothing
+            contextWindow = context_window,
+            maxTokens = max_tokens,
+            headers = nothing,
+        )
+    end
+    openai_codex_models = Dict{String, Model}(
+        "gpt-5-codex" => codex_model("gpt-5-codex", "GPT-5 Codex"),
+        "gpt-5.1" => codex_model("gpt-5.1", "GPT-5.1"),
+        "gpt-5.1-codex" => codex_model("gpt-5.1-codex", "GPT-5.1 Codex"),
+        "gpt-5.1-codex-max" => codex_model("gpt-5.1-codex-max", "GPT-5.1 Codex Max"),
+        "gpt-5.1-codex-mini" => codex_model("gpt-5.1-codex-mini", "GPT-5.1 Codex Mini"),
+        "gpt-5.2" => codex_model("gpt-5.2", "GPT-5.2"),
+        "gpt-5.2-codex" => codex_model("gpt-5.2-codex", "GPT-5.2 Codex"),
+        "gpt-5.3-codex" => codex_model("gpt-5.3-codex", "GPT-5.3 Codex"; context_window = 400000),
+        "gpt-5.3-codex-spark" => codex_model(
+            "gpt-5.3-codex-spark",
+            "GPT-5.3 Codex Spark";
+            context_window = 128000,
+            max_tokens = 32000,
         ),
-        "gpt-5.1-codex-max" => Model(
-            id = "gpt-5.1-codex-max",
-            name = "GPT-5.1 Codex Max",
-            api = "openai-codex-responses",
-            provider = "openai-codex",
-            baseUrl = "https://chatgpt.com/backend-api",
-            reasoning = true,
-            input = ["text", "image"],
-            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
-            contextWindow = 272000,
-            maxTokens = 128000,
-            headers = nothing
-        ),
-        "gpt-5.1-codex-mini" => Model(
-            id = "gpt-5.1-codex-mini",
-            name = "GPT-5.1 Codex Mini",
-            api = "openai-codex-responses",
-            provider = "openai-codex",
-            baseUrl = "https://chatgpt.com/backend-api",
-            reasoning = true,
-            input = ["text", "image"],
-            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
-            contextWindow = 272000,
-            maxTokens = 128000,
-            headers = nothing
-        ),
-        "gpt-5.2" => Model(
-            id = "gpt-5.2",
-            name = "GPT-5.2",
-            api = "openai-codex-responses",
-            provider = "openai-codex",
-            baseUrl = "https://chatgpt.com/backend-api",
-            reasoning = true,
-            input = ["text", "image"],
-            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
-            contextWindow = 272000,
-            maxTokens = 128000,
-            headers = nothing
-        ),
-        "gpt-5.2-codex" => Model(
-            id = "gpt-5.2-codex",
-            name = "GPT-5.2 Codex",
-            api = "openai-codex-responses",
-            provider = "openai-codex",
-            baseUrl = "https://chatgpt.com/backend-api",
-            reasoning = true,
-            input = ["text", "image"],
-            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
-            contextWindow = 272000,
-            maxTokens = 128000,
-            headers = nothing
-        ),
+        # Friendly aliases: keep lookup compatibility while using canonical API ids.
+        "gpt-codex-5.3" => codex_model("gpt-5.3-codex", "GPT Codex 5.3"; context_window = 400000),
     )
+    merge!(get!(() -> Dict{String, Model}(), _model_registry, "openai-codex"), openai_codex_models)
 
     if !haskey(_model_registry, "minimax")
         openrouter_models = get(() -> nothing, _model_registry, "openrouter")

@@ -12,6 +12,7 @@ Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
 SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
 ScopedValues = "7e506255-f358-4e82-b7e4-beb19740aa63"
 Tempus = "e6262be2-5787-4bdc-bc3f-4b5a3442fa30"
+TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
 [weakdeps]
 MSTeams = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
@@ -39,7 +40,12 @@ VoTelegramExt = "Telegram"
 
 [compat]
 Agentif = "1"
+MSTeams = "0.1.0"
 Mattermost = "0.1.0"
+Signal = "0.1.0"
+Slack = "0.1.0"
+Telegram = "0.1.0"
+TimeZones = "1"
 julia = "1.10"
 
 [extras]
@@ -51,4 +57,4 @@ Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test"]
+test = ["Test", "MSTeams", "Mattermost", "Signal", "Slack", "Telegram"]

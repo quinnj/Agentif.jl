@@ -1,6 +1,6 @@
-using Agentif, Vo, Slack
+using Vo, Slack
 
 const VoSlackExt = Base.get_extension(Vo, :VoSlackExt)
 
-source = VoSlackExt.SlackTriggerSource()
+source = VoSlackExt.SlackEventSource()
 Vo.run(; event_sources=Vo.EventSource[source])

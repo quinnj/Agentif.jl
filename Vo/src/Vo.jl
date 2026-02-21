@@ -7,11 +7,12 @@ using LocalSearch
 using ScopedValues: @with
 using SQLite
 using Tempus
+using TimeZones
 
 export EventSource, Event, ChannelEvent, EventType, EventHandler
 export AgentConfig, AgentAssistant
 export get_channels, get_event_types, get_event_handlers, get_tools
-export get_name, get_channel, event_content, is_direct_ping, get_session_key
+export get_name, get_channel, event_content, get_session_key
 export register_event_source!, register_event_handler!, unregister_event_handler!
 export evaluate, init!, run, start!, get_current_assistant, scrub_post!
 export ReplChannel, ReplEventSource, ReplInputEvent
@@ -38,6 +39,20 @@ function _detect_timezone()
         catch; end
     end
     return "UTC"
+end
+
+const AGENT_DATA_WRITE_LOCK = ReentrantLock()
+
+function _resolve_timezone(name::String)
+    try
+        return TimeZone(name)
+    catch
+        return tz"UTC"
+    end
+end
+
+function _zdt_to_unix(zdt::ZonedDateTime)
+    return datetime2unix(DateTime(astimezone(zdt, tz"UTC")))
 end
 
 # ─── Core types ───
@@ -155,12 +170,15 @@ get_event_handlers(::EventSource) = EventHandler[]
 get_tools(::EventSource) = Agentif.AgentTool[]
 start!(::EventSource, ::AgentAssistant) = nothing
 
+function run(; event_sources=nothing, kwargs...)
+    return init!(""; event_sources, kwargs...)
+end
+
 # ─── Event interface ───
 
 get_name(ev::Event) = error("get_name not implemented for $(typeof(ev))")
 get_channel(ev::ChannelEvent) = error("get_channel not implemented for $(typeof(ev))")
 event_content(ev::Event) = error("event_content not implemented for $(typeof(ev))")
-is_direct_ping(::Event) = false
 get_session_key(::Event) = nothing
 get_session_key(ev::ChannelEvent) = Agentif.channel_id(get_channel(ev))
 
@@ -290,9 +308,11 @@ function build_system_prompt(config::AgentConfig; channel::Union{Nothing, Agenti
 end
 
 function build_context_prefix(config::AgentConfig)
-    now_dt = Dates.now()
-    date_str = Dates.format(now_dt, "EEEE, U d, yyyy")
-    time_str = Dates.format(now_dt, "HH:MM")
+    tz = _resolve_timezone(config.timezone)
+    now_dt = TimeZones.now(tz)
+    local_dt = DateTime(now_dt)
+    date_str = Dates.format(local_dt, "EEEE, U d, yyyy")
+    time_str = Dates.format(local_dt, "HH:MM")
     return string("[Current date: ", date_str, ", time: ", time_str, " (", config.timezone, ")]")
 end
 
@@ -455,7 +475,7 @@ function _parse_tags(s::Union{Nothing, String})
     return unique(sort([lowercase(strip(t)) for t in split(s, ",") if !isempty(strip(t))]))
 end
 
-function _parse_time_filter(s::Union{Nothing, String})
+function _parse_time_filter(s::Union{Nothing, String}; timezone::Union{Nothing, String}=nothing)
     s === nothing && return nothing
     s = strip(s)
     isempty(s) && return nothing
@@ -467,15 +487,23 @@ function _parse_time_filter(s::Union{Nothing, String})
         secs = unit == "d" ? n * 86400 : unit == "h" ? n * 3600 : n * 60
         return time() - secs
     end
-    # Absolute: ISO 8601
+    tz = _resolve_timezone(something(timezone, "UTC"))
+    # Absolute: ISO 8601 with explicit timezone/offset
     try
-        dt = DateTime(s, dateformat"yyyy-mm-ddTHH:MM:SS")
-        return datetime2unix(dt)
+        zdt = ZonedDateTime(s)
+        return _zdt_to_unix(zdt)
     catch
     end
+    # Absolute: ISO 8601 without timezone (interpret in configured timezone)
     try
-        dt = DateTime(s, dateformat"yyyy-mm-dd")
-        return datetime2unix(dt)
+        dt = DateTime(s, dateformat"yyyy-mm-ddTHH:MM:SS")
+        return _zdt_to_unix(ZonedDateTime(dt, tz))
+    catch
+    end
+    # Date only (midnight in configured timezone)
+    try
+        d = Date(s, dateformat"yyyy-mm-dd")
+        return _zdt_to_unix(ZonedDateTime(DateTime(d), tz))
     catch
     end
     return nothing
@@ -483,6 +511,22 @@ end
 
 function _get_search_store(a::AgentAssistant)
     return a.session_store.search_store
+end
+
+function _merge_search_results(primary::Vector, secondary::Vector; limit::Int)
+    by_id = Dict{String, Any}()
+    for result in primary
+        by_id[result.id] = result
+    end
+    for result in secondary
+        existing = get(() -> nothing, by_id, result.id)
+        if existing === nothing || result.score > existing.score
+            by_id[result.id] = result
+        end
+    end
+    merged = Any[values(by_id)...]
+    sort!(merged; by = r -> r.score, rev = true)
+    return first(merged, min(limit, length(merged)))
 end
 
 function _agent_data_visibility_tags(channel_id, channel_flags)
@@ -502,23 +546,27 @@ const DB_STORE_TOOL = @tool "Store a key-value entry in your persistent scratch 
     parsed_tags = _parse_tags(tags)
     user_id, post_id, ch_id, ch_flags = Agentif.current_session_entry_metadata()
     now = time()
-    # Preserve original created_at on update
-    existing = iterate(SQLite.DBInterface.execute(a.db,
-        "SELECT created_at FROM vo_agent_data WHERE key = ?", (key,)))
-    created = existing !== nothing ? existing[1].created_at : now
-    SQLite.DBInterface.execute(a.db,
-        "INSERT OR REPLACE INTO vo_agent_data (key, value, created_at, updated_at, channel_id, channel_flags, user_id, post_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (key, value, created, now, ch_id, ch_flags, user_id, post_id))
-    # Update tags
-    SQLite.DBInterface.execute(a.db, "DELETE FROM vo_agent_data_tags WHERE key = ?", (key,))
-    for tag in parsed_tags
-        SQLite.DBInterface.execute(a.db,
-            "INSERT INTO vo_agent_data_tags (key, tag) VALUES (?, ?)", (key, tag))
+    lock(AGENT_DATA_WRITE_LOCK) do
+        _with_busy_retry() do
+            # Preserve original created_at on update
+            existing = iterate(SQLite.DBInterface.execute(a.db,
+                "SELECT created_at FROM vo_agent_data WHERE key = ?", (key,)))
+            created = existing !== nothing ? existing[1].created_at : now
+            SQLite.DBInterface.execute(a.db,
+                "INSERT OR REPLACE INTO vo_agent_data (key, value, created_at, updated_at, channel_id, channel_flags, user_id, post_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (key, value, created, now, ch_id, ch_flags, user_id, post_id))
+            # Update tags
+            SQLite.DBInterface.execute(a.db, "DELETE FROM vo_agent_data_tags WHERE key = ?", (key,))
+            for tag in parsed_tags
+                SQLite.DBInterface.execute(a.db,
+                    "INSERT INTO vo_agent_data_tags (key, tag) VALUES (?, ?)", (key, tag))
+            end
+            search_store = _get_search_store(a)
+            vis_tags = _agent_data_visibility_tags(ch_id, ch_flags)
+            LocalSearch.load!(search_store, value; id="agent_data:$key", title=key, tags=vcat(parsed_tags, ["vo_agent_data"], vis_tags))
+            return nothing
+        end
     end
-    # Index in LocalSearch with user tags + visibility tags
-    search_store = _get_search_store(a)
-    vis_tags = _agent_data_visibility_tags(ch_id, ch_flags)
-    LocalSearch.load!(search_store, value; id="agent_data:$key", title=key, tags=vcat(parsed_tags, ["vo_agent_data"], vis_tags))
     tag_str = isempty(parsed_tags) ? "" : " [tags: $(join(parsed_tags, ", "))]"
     "Stored '$key'$tag_str"
 end
@@ -529,20 +577,21 @@ const DB_SEARCH_TOOL = @tool "Search your stored data by text query. Optionally 
     n = limit === nothing ? 10 : limit
     search_store = _get_search_store(a)
     max_fetch = n * 3
-    # Channel visibility: scope search to public + current channel
+    # Channel visibility: include current-channel (private/public) plus public entries.
     ch = Agentif.CURRENT_CHANNEL[]
-    search_tags = if ch !== nothing
+    results = if ch !== nothing
         ch_id = Agentif.channel_id(ch)
-        ["agent_data:public", "agent_data:ch:$ch_id"]
+        channel_results = LocalSearch.search(search_store, query; tags=["agent_data:ch:$ch_id"], limit=max_fetch)
+        public_results = LocalSearch.search(search_store, query; tags=["agent_data:public"], limit=max_fetch)
+        _merge_search_results(channel_results, public_results; limit=max_fetch)
     else
-        ["vo_agent_data"]  # no channel context → all agent data
+        LocalSearch.search(search_store, query; tags=["vo_agent_data"], limit=max_fetch)  # no channel context → all agent data
     end
-    results = LocalSearch.search(search_store, query; tags=search_tags, limit=max_fetch)
     isempty(results) && return "No results found for: $query"
     # Extract keys from doc IDs
     filter_tags = _parse_tags(tags)
-    after_ts = _parse_time_filter(after)
-    before_ts = _parse_time_filter(before)
+    after_ts = _parse_time_filter(after; timezone = a.config.timezone)
+    before_ts = _parse_time_filter(before; timezone = a.config.timezone)
     lines = String[]
     for r in results
         length(lines) >= n * 2 && break  # each result is 2 lines
@@ -578,8 +627,8 @@ const DB_LIST_KEYS_TOOL = @tool "List keys stored in your scratch space. Optiona
     a === nothing && return "No assistant initialized"
     n = limit === nothing ? 50 : limit
     filter_tags = _parse_tags(tags)
-    after_ts = _parse_time_filter(after)
-    before_ts = _parse_time_filter(before)
+    after_ts = _parse_time_filter(after; timezone = a.config.timezone)
+    before_ts = _parse_time_filter(before; timezone = a.config.timezone)
     # Channel visibility
     ch = Agentif.CURRENT_CHANNEL[]
     current_ch_id = ch !== nothing ? Agentif.channel_id(ch) : nothing
@@ -647,13 +696,18 @@ end
 const DB_REMOVE_TOOL = @tool "Remove an entry from your scratch space by key." function db_remove(key::String)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
-    # Check exists
-    existing = iterate(SQLite.DBInterface.execute(a.db,
-        "SELECT 1 FROM vo_agent_data WHERE key = ?", (key,)))
-    existing === nothing && return "Key '$key' not found"
-    SQLite.DBInterface.execute(a.db, "DELETE FROM vo_agent_data WHERE key = ?", (key,))
-    search_store = _get_search_store(a)
-    LocalSearch.delete!(search_store, "agent_data:$key")
+    removed = lock(AGENT_DATA_WRITE_LOCK) do
+        _with_busy_retry() do
+            existing = iterate(SQLite.DBInterface.execute(a.db,
+                "SELECT 1 FROM vo_agent_data WHERE key = ?", (key,)))
+            existing === nothing && return false
+            SQLite.DBInterface.execute(a.db, "DELETE FROM vo_agent_data WHERE key = ?", (key,))
+            search_store = _get_search_store(a)
+            LocalSearch.delete!(search_store, "agent_data:$key")
+            return true
+        end
+    end
+    !removed && return "Key '$key' not found"
     "Removed '$key'"
 end
 
@@ -703,57 +757,116 @@ function scrub_post!(assistant::AgentAssistant, post_id::String)
     # 1. Mark session entries as deleted (preserves AgentState for prompt caching)
     Agentif.scrub_post!(assistant.session_store, post_id)
     # 2. Hard-delete agent data matching this post_id
-    db = assistant.db
-    rows = SQLite.DBInterface.execute(db,
-        "SELECT key FROM vo_agent_data WHERE post_id = ?", (post_id,))
-    keys = String[String(r.key) for r in rows]
-    if !isempty(keys)
-        search_store = _get_search_store(assistant)
-        for key in keys
-            try
-                Base.delete!(search_store, "agent_data:$key")
-            catch
+    lock(AGENT_DATA_WRITE_LOCK) do
+        _with_busy_retry() do
+            db = assistant.db
+            rows = SQLite.DBInterface.execute(db,
+                "SELECT key FROM vo_agent_data WHERE post_id = ?", (post_id,))
+            keys = String[String(r.key) for r in rows]
+            if !isempty(keys)
+                search_store = _get_search_store(assistant)
+                for key in keys
+                    try
+                        Base.delete!(search_store, "agent_data:$key")
+                    catch
+                    end
+                end
+                SQLite.execute(db, "DELETE FROM vo_agent_data WHERE post_id = ?", (post_id,))
+                @info "scrub_post!: deleted agent data" post_id count=length(keys)
             end
+            return nothing
         end
-        SQLite.execute(db, "DELETE FROM vo_agent_data WHERE post_id = ?", (post_id,))
-        @info "scrub_post!: deleted agent data" post_id count=length(keys)
     end
     return nothing
 end
 
 # ─── Event loop ───
 
+function _is_sqlite_busy_error(e)
+    msg = lowercase(sprint(showerror, e))
+    return occursin("busy", msg) || occursin("locked", msg)
+end
+
+function _with_busy_retry(f::Function; retries::Int = 3, base_delay_s::Float64 = 0.05)
+    attempt = 1
+    while true
+        try
+            return f()
+        catch e
+            if !_is_sqlite_busy_error(e) || attempt >= retries
+                rethrow()
+            end
+            sleep(base_delay_s * attempt)
+            attempt += 1
+        end
+    end
+end
+
+function _event_handlers_for(assistant::AgentAssistant, event_name::String)
+    return _with_busy_retry() do
+        handlers = NamedTuple[]
+        for row in SQLite.DBInterface.execute(assistant.db, """
+            SELECT eh.id, eh.prompt, eh.channel_id
+            FROM vo_event_handlers eh
+            JOIN vo_handler_event_types het ON eh.id = het.handler_id
+            WHERE het.event_type_name = ?
+        """, (event_name,))
+            handler_id = row.id === missing ? "" : String(row.id)
+            isempty(handler_id) && continue
+            prompt = row.prompt === missing ? "" : String(row.prompt)
+            channel_id = row.channel_id === missing ? nothing : String(row.channel_id)
+            push!(handlers, (; id=handler_id, prompt, channel_id))
+        end
+        return handlers
+    end
+end
+
+function _resolve_event_channel(assistant::AgentAssistant, ev::Event, handler_channel_id::Union{Nothing, String})
+    if ev isa ChannelEvent
+        return get_channel(ev)
+    end
+    handler_channel_id === nothing && return nothing
+    return get(assistant._channels, handler_channel_id, nothing)
+end
+
+function _run_event_handler!(assistant::AgentAssistant, ev::Event, handler)
+    ch = _resolve_event_channel(assistant, ev, handler.channel_id)
+    if ch === nothing
+        @warn "No channel available for handler" handler_id=handler.id channel_id=handler.channel_id
+        return nothing
+    end
+    input = make_prompt(handler.prompt, ev)
+    session_key = something(get_session_key(ev), handler.id)
+    sid = _with_busy_retry() do
+        _get_or_create_session(assistant.db, session_key)
+    end
+    evaluate(assistant, input; session_id=sid, channel=ch)
+    return nothing
+end
+
 function start_event_loop!(assistant::AgentAssistant)
-    errormonitor(Threads.@spawn begin
+    errormonitor(@async begin
         for ev in assistant.event_queue
-            nm = get_name(ev)
-            rows = SQLite.DBInterface.execute(assistant.db, """
-                SELECT eh.id, eh.prompt, eh.channel_id
-                FROM vo_event_handlers eh
-                JOIN vo_handler_event_types het ON eh.id = het.handler_id
-                WHERE het.event_type_name = ?
-            """, (nm,))
-            for row in rows
-                handler_id = row.id
-                ch = if ev isa ChannelEvent
-                    get_channel(ev)
-                elseif row.channel_id !== missing
-                    get(assistant._channels, row.channel_id, nothing)
-                else
-                    nothing
-                end
-                if ch === nothing
-                    @warn "No channel available for handler" handler_id channel_id=row.channel_id
-                    continue
-                end
-                input = make_prompt(row.prompt, ev)
-                session_key = something(get_session_key(ev), handler_id)
-                sid = _get_or_create_session(assistant.db, session_key)
-                Threads.@spawn try
-                    evaluate(assistant, input; session_id=sid, channel=ch)
-                catch e
-                    @error "Event handler failed" handler=handler_id event=nm exception=(e, catch_backtrace())
-                end
+            nm = try
+                get_name(ev)
+            catch e
+                @error "Event dropped: failed to compute event name" event_type=typeof(ev) exception=(e, catch_backtrace())
+                continue
+            end
+            handlers = try
+                _event_handlers_for(assistant, nm)
+            catch e
+                @error "Event handler lookup failed" event=nm exception=(e, catch_backtrace())
+                continue
+            end
+            for handler in handlers
+                errormonitor(@async begin
+                    try
+                        _run_event_handler!(assistant, ev, handler)
+                    catch e
+                        @error "Event handler failed" handler=handler.id event=nm exception=(e, catch_backtrace())
+                    end
+                end)
             end
         end
     end)

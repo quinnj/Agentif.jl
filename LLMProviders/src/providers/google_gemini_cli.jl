@@ -234,11 +234,12 @@ function build_request(
             hasproperty(thinking, :budgetTokens) && (thinking_budget = getproperty(thinking, :budgetTokens))
         end
         if enabled
-            thinking_config = ThinkingConfig(; includeThoughts = true)
             if thinking_level !== nothing
-                thinking_config = ThinkingConfig(; thinking_config..., thinkingLevel = string(thinking_level))
+                thinking_config = ThinkingConfig(; includeThoughts = true, thinkingLevel = string(thinking_level))
             elseif thinking_budget !== nothing
-                thinking_config = ThinkingConfig(; thinking_config..., thinkingBudget = thinking_budget)
+                thinking_config = ThinkingConfig(; includeThoughts = true, thinkingBudget = thinking_budget)
+            else
+                thinking_config = ThinkingConfig(; includeThoughts = true)
             end
             generation_config = GenerationConfig(
                 ; temperature = temperature,

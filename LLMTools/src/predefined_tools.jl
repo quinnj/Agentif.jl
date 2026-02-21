@@ -355,6 +355,30 @@ end
 
 
 function create_codex_tool()
+    function extract_branch_name(command::Union{Nothing, AbstractString}, output::Union{Nothing, AbstractString})
+        cmd = command === nothing ? "" : String(command)
+        if occursin("git worktree add", cmd)
+            tokens = split(cmd)
+            for i in 1:(length(tokens) - 1)
+                if tokens[i] == "-b" || tokens[i] == "--branch"
+                    branch = strip(tokens[i + 1])
+                    isempty(branch) || return branch
+                end
+            end
+        end
+        text = output === nothing ? "" : String(output)
+        for pattern in (
+                r"branch ['\"]?([A-Za-z0-9._/-]+)['\"]?",
+                r"/worktrees/([A-Za-z0-9._/-]+)",
+            )
+            m = match(pattern, text)
+            m === nothing && continue
+            branch = strip(String(m.captures[1]))
+            isempty(branch) || return branch
+        end
+        return nothing
+    end
+
     return @tool(
         "Run Codex CLI in exec mode on a directory. Prepends worktree requirements (default-branch checkout, create `/worktrees/<branch>`, work there, push, remove worktree). Research the package, evaluate the prompt, use the GitHub CLI tool to make code changes, commit to a branch, and push the branch (without opening a PR). Returns session_id, summary of work done, and branch name if created.",
         codex(prompt::String, directory::String, timeout::Union{Nothing, Int} = nothing) = begin
@@ -372,14 +396,14 @@ function create_codex_tool()
                 ), "\n"
             )
             full_prompt = codex_preamble * "\n\n" * prompt
-            cmd_str = "codex exec --json --enable skills --yolo --cd $(shell_escape(directory)) --skip-git-repo-check $(shell_escape(full_prompt))"
+            codex_executable = get(ENV, "LLMTOOLS_CODEX_EXECUTABLE", "codex")
+            cmd_str = "$(shell_escape(codex_executable)) exec --json --enable skills --yolo --cd $(shell_escape(directory)) --skip-git-repo-check $(shell_escape(full_prompt))"
             cmd = Cmd(`bash -lc $cmd_str`, ignorestatus = true)
             stderr_buf = IOBuffer()
             process = open(pipeline(cmd, stderr = stderr_buf))
             output_task = @async read(process, String)
             timed_out = false
-            prompt_lower = lowercase(String(prompt))
-            apply_timeout = timeout !== nothing && timeout > 0 && (occursin("timeout", prompt_lower) || occursin("time limit", prompt_lower) || occursin("time-limit", prompt_lower))
+            apply_timeout = timeout !== nothing && timeout > 0
             if apply_timeout
                 status = timedwait(() -> istaskdone(output_task), timeout)
                 status == :timed_out && (
@@ -417,6 +441,10 @@ function create_codex_tool()
                             cmd = get(() -> nothing, item, "command")
                             output = get(() -> "", item, "aggregated_output")
                             exit_code = get(() -> nothing, item, "exit_code")
+                            if branch_name === nothing
+                                extracted_branch = extract_branch_name(cmd, output)
+                                extracted_branch !== nothing && (branch_name = extracted_branch)
+                            end
                             if exit_code !== nothing && exit_code != 0
                                 err = "Command failed: $(cmd)\nExit code: $(exit_code)\nOutput: $(output)"
                                 push!(errors, err)
@@ -730,10 +758,54 @@ const WEB_FETCH_USER_AGENT = "Mozilla/5.0 (compatible; AgentifBot/1.0)"
 
 # Thread-safe storage for temp files (maps file_id to path)
 const WEB_TEMP_FILES = Dict{String, String}()
+const WEB_TEMP_FILE_META = Dict{String, NamedTuple{(:is_binary, :content_type), Tuple{Bool, String}}}()
 const WEB_TEMP_FILES_LOCK = ReentrantLock()
 
 # Create a temp directory that persists for the session
 const WEB_TEMP_DIR = Ref{Union{Nothing, String}}(nothing)
+
+mutable struct LimitedResponseSink
+    io::IO
+    max_bytes::Int
+    downloaded_bytes::Int
+    truncated::Bool
+end
+
+LimitedResponseSink(io::IO, max_bytes::Int) = LimitedResponseSink(io, max_bytes, 0, false)
+
+function Base.write(sink::LimitedResponseSink, data::AbstractVector{UInt8})
+    remaining = sink.max_bytes - sink.downloaded_bytes
+    if remaining > 0
+        to_write = min(length(data), remaining)
+        write(sink.io, @view(data[1:to_write]))
+        sink.downloaded_bytes += to_write
+        sink.truncated = sink.truncated || (to_write < length(data))
+    else
+        sink.truncated = true
+    end
+    # Report all bytes as consumed so the HTTP stream can continue draining.
+    return length(data)
+end
+
+function Base.write(sink::LimitedResponseSink, byte::UInt8)
+    if sink.downloaded_bytes < sink.max_bytes
+        write(sink.io, byte)
+        sink.downloaded_bytes += 1
+    else
+        sink.truncated = true
+    end
+    return 1
+end
+
+function Base.write(sink::LimitedResponseSink, stream::HTTP.Streams.Stream)
+    consumed = 0
+    while !Base.eof(stream)
+        chunk = Base.readavailable(stream)
+        isempty(chunk) && continue
+        consumed += write(sink, chunk)
+    end
+    return consumed
+end
 
 function get_web_temp_dir()
     return lock(WEB_TEMP_FILES_LOCK) do
@@ -744,10 +816,11 @@ function get_web_temp_dir()
     end
 end
 
-function register_temp_file(path::String)::String
+function register_temp_file(path::String; is_binary::Bool = false, content_type::AbstractString = "unknown")::String
     file_id = string(UUIDs.uuid4())[1:8]  # Short ID
     lock(WEB_TEMP_FILES_LOCK) do
         WEB_TEMP_FILES[file_id] = path
+        WEB_TEMP_FILE_META[file_id] = (is_binary = is_binary, content_type = string(content_type))
     end
     return file_id
 end
@@ -755,6 +828,12 @@ end
 function get_temp_file(file_id::String)::Union{Nothing, String}
     return lock(WEB_TEMP_FILES_LOCK) do
         get(WEB_TEMP_FILES, file_id, nothing)
+    end
+end
+
+function get_temp_file_meta(file_id::String)
+    return lock(WEB_TEMP_FILES_LOCK) do
+        get(WEB_TEMP_FILE_META, file_id, (is_binary = false, content_type = "unknown"))
     end
 end
 
@@ -988,11 +1067,11 @@ function create_web_fetch_tool()
             content_length = 0
             is_binary = false
             error_message = nothing
+            truncated_download = false
 
             try
                 # Build request kwargs
                 request_kw = (;
-                    headers = request_headers,
                     connect_timeout = WEB_FETCH_CONNECT_TIMEOUT,
                     readtimeout = timeout,
                     retry = true,
@@ -1002,10 +1081,15 @@ function create_web_fetch_tool()
                     status_exception = false,  # Don't throw on 4xx/5xx
                 )
 
-                if body !== nothing && method in ["POST", "PUT", "PATCH"]
-                    response = HTTP.request(method, url, request_headers, body; request_kw...)
-                else
-                    response = HTTP.request(method, url; request_kw...)
+                sink = open(temp_file, "w+") do io
+                    sink = LimitedResponseSink(io, WEB_FETCH_MAX_SIZE)
+                    if body !== nothing && method in ["POST", "PUT", "PATCH"]
+                        response = HTTP.request(method, url, request_headers, body; response_stream = sink, request_kw...)
+                    else
+                        response = HTTP.request(method, url; headers = request_headers, response_stream = sink, request_kw...)
+                    end
+                    flush(io)
+                    sink
                 end
 
                 status_code = response.status
@@ -1013,47 +1097,29 @@ function create_web_fetch_tool()
 
                 # Get content type
                 ct_header = HTTP.header(response, "Content-Type", "application/octet-stream")
-                content_type, charset = parse_content_type(ct_header)
+                content_type, _ = parse_content_type(ct_header)
                 is_binary = is_binary_content_type(content_type)
 
                 # Get content length if available
                 cl_header = HTTP.header(response, "Content-Length", "")
                 if !isempty(cl_header)
-                    content_length = tryparse(Int, cl_header)
-                    if content_length !== nothing && content_length > WEB_FETCH_MAX_SIZE
-                        throw(ArgumentError("Response too large: $(format_size(content_length)). Maximum is $(format_size(WEB_FETCH_MAX_SIZE))."))
+                    parsed_length = tryparse(Int, cl_header)
+                    if parsed_length !== nothing && parsed_length > WEB_FETCH_MAX_SIZE
+                        throw(ArgumentError("Response too large: $(format_size(parsed_length)). Maximum is $(format_size(WEB_FETCH_MAX_SIZE))."))
+                    elseif parsed_length !== nothing
+                        content_length = parsed_length
                     end
                 end
 
-                # Write response body to temp file
-                response_body = response.body
-                actual_size = length(response_body)
+                content_length <= 0 && (content_length = sink.downloaded_bytes)
+                truncated_download = sink.truncated
 
-                if actual_size > WEB_FETCH_MAX_SIZE
-                    # Truncate to max size
-                    response_body = response_body[1:WEB_FETCH_MAX_SIZE]
-                end
-
-                content_length = actual_size
-
-                # Convert to string if text content
+                # Binary fallback when server reports text but payload is not UTF-8.
                 if !is_binary
-                    # Try to decode with detected charset, fallback to UTF-8
                     try
-                        body_str = String(copy(response_body))
-                        open(temp_file, "w") do io
-                            write(io, body_str)
-                        end
+                        read(temp_file, String)
                     catch
-                        # Binary fallback - write raw bytes
                         is_binary = true
-                        open(temp_file, "w") do io
-                            write(io, response_body)
-                        end
-                    end
-                else
-                    open(temp_file, "w") do io
-                        write(io, response_body)
                     end
                 end
 
@@ -1077,7 +1143,7 @@ function create_web_fetch_tool()
             end
 
             # Register the temp file
-            new_file_id = register_temp_file(temp_file)
+            new_file_id = register_temp_file(temp_file; is_binary, content_type)
 
             # Build response
             output = IOBuffer()
@@ -1089,6 +1155,7 @@ function create_web_fetch_tool()
             println(output, "Status: $status_code$status_text")
             println(output, "Content-Type: $content_type")
             println(output, "Size: $(format_size(content_length))")
+            truncated_download && println(output, "Note: Content exceeded $(format_size(WEB_FETCH_MAX_SIZE)); cache/preview is truncated.")
             println(output, "Saved to: file_id=\"$new_file_id\"")
             println(output)
 
@@ -1113,16 +1180,21 @@ function create_web_fetch_tool()
                 if start_line > total_lines
                     println(output, "[No content at offset $start_line - file has $total_lines lines]")
                 else
-                    truncation = truncate_head(display_content)
+                    selected = join(lines[start_line:end], "\n")
+                    truncation = truncate_head(selected)
 
                     println(output, "--- Content Preview ---")
                     println(output, truncation.content)
 
                     if truncation.truncated
-                        end_line = truncation.output_lines
+                        end_line = start_line + truncation.output_lines - 1
                         next_offset = end_line + 1
                         println(output)
-                        println(output, "[Showing lines 1-$end_line of $total_lines. Use file_id=\"$new_file_id\" offset=$next_offset to continue]")
+                        println(output, "[Showing lines $start_line-$end_line of $total_lines. Use file_id=\"$new_file_id\" offset=$next_offset to continue]")
+                    elseif start_line > 1
+                        end_line = start_line + truncation.output_lines - 1
+                        println(output)
+                        println(output, "[Showing lines $start_line-$end_line of $total_lines (end of file)]")
                     end
                 end
             end
@@ -1139,8 +1211,25 @@ function read_cached_web_content(file_id::String, offset::Union{Nothing, Int}, e
     path = get_temp_file(file_id)
     path === nothing && throw(ArgumentError("Unknown file_id: $file_id. The file may have been cleaned up."))
     !isfile(path) && throw(ArgumentError("Cached file no longer exists for file_id: $file_id"))
+    meta = get_temp_file_meta(file_id)
+    if meta.is_binary
+        size_bytes = filesize(path)
+        return "Reading file_id=\"$file_id\": [Binary content ($size_bytes bytes, content-type: $(meta.content_type)) cannot be rendered as text]"
+    end
 
-    content = read(path, String)
+    content = try
+        read(path, String)
+    catch e
+        if e isa ArgumentError
+            size_bytes = filesize(path)
+            return "Reading file_id=\"$file_id\": [Binary-like content ($size_bytes bytes) cannot be rendered as UTF-8 text]"
+        end
+        rethrow()
+    end
+    if !isvalid(content)
+        size_bytes = filesize(path)
+        return "Reading file_id=\"$file_id\": [Binary-like content ($size_bytes bytes) cannot be rendered as UTF-8 text]"
+    end
 
     # Optionally extract text (guess HTML from content)
     if extract_text && (startswith(strip(content), "<") || occursin("<!DOCTYPE", content))

@@ -1,10 +1,5 @@
 using Test
-using JSON
 using LLMTools
-
-function parse_tool_json(raw::String)
-    return JSON.parse(raw)
-end
 
 function worker_funcs()
     tools = LLMTools.create_worker_tools()

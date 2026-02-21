@@ -1,10 +1,5 @@
 using Test
-using JSON
 using LLMTools
-
-function parse_tool_json(raw::String)
-    return JSON.parse(raw)
-end
 
 function terminal_funcs(base_dir::AbstractString)
     tools = LLMTools.create_terminal_tools(base_dir)

@@ -30,8 +30,6 @@ function HeartbeatPollSource(;
     HeartbeatPollSource(name, interval_minutes, start_hour, end_hour, UInt64(0), 0.0)
 end
 
-Vo.source_name(h::HeartbeatPollSource) = h.name
-
 function Vo.get_schedule(h::HeartbeatPollSource)
     offset_minutes = Vo.local_utc_offset_minutes()
     heartbeat_schedule(offset_minutes, h.interval_minutes)

@@ -87,11 +87,15 @@ Calculate cost based on model pricing and usage.
 Returns the cost dictionary with input, output, cacheRead, cacheWrite, and total.
 """
 function calculateCost(model::Model, usage)
+    input_rate = get(() -> 0.0, model.cost, "input")
+    output_rate = get(() -> 0.0, model.cost, "output")
+    cache_read_rate = get(() -> 0.0, model.cost, "cacheRead")
+    cache_write_rate = get(() -> 0.0, model.cost, "cacheWrite")
     cost = Dict{String, Float64}(
-        "input" => (model.cost["input"] / 1000000) * usage.input,
-        "output" => (model.cost["output"] / 1000000) * usage.output,
-        "cacheRead" => (model.cost["cacheRead"] / 1000000) * usage.cacheRead,
-        "cacheWrite" => (model.cost["cacheWrite"] / 1000000) * usage.cacheWrite,
+        "input" => (input_rate / 1000000) * usage.input,
+        "output" => (output_rate / 1000000) * usage.output,
+        "cacheRead" => (cache_read_rate / 1000000) * usage.cacheRead,
+        "cacheWrite" => (cache_write_rate / 1000000) * usage.cacheWrite,
     )
     cost["total"] = cost["input"] + cost["output"] + cost["cacheRead"] + cost["cacheWrite"]
     usage.cost = cost
@@ -116,15 +120,25 @@ function discover_models!(base_url::String; provider::String="local")
     url = rstrip(base_url, '/') * "/v1/models"
     resp = HTTP.get(url; status_exception=false)
     resp.status == 200 || error("Failed to query $url: HTTP $(resp.status)")
-    data = JSON.parse(String(resp.body))
-    entries = get(data, "data", [])
+    data = try
+        JSON.parse(resp.body)
+    catch e
+        error("Invalid JSON from $url: $(sprint(showerror, e))")
+    end
+    entries = get(() -> nothing, data, "data")
+    entries isa AbstractVector || error("Invalid /v1/models payload from $url: expected `data` array")
     models = Model[]
     api_base = rstrip(base_url, '/') * "/v1"
-    for entry in entries
-        id = entry["id"]
+    for (idx, entry) in enumerate(entries)
+        entry isa AbstractDict || continue
+        id = get(() -> nothing, entry, "id")
+        if !(id isa AbstractString) || isempty(strip(id))
+            @warn "Skipping discovered model without valid id" index = idx provider
+            continue
+        end
         model = Model(
-            id = id,
-            name = id,
+            id = String(id),
+            name = String(id),
             api = "openai-completions",
             provider = provider,
             baseUrl = api_base,

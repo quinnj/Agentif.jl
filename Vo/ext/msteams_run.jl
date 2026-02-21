@@ -1,6 +1,6 @@
-using Agentif, Vo, MSTeams
+using Vo, MSTeams
 
 const VoMSTeamsExt = Base.get_extension(Vo, :VoMSTeamsExt)
 
-source = VoMSTeamsExt.MSTeamsTriggerSource()
+source = VoMSTeamsExt.MSTeamsEventSource()
 Vo.run(; event_sources=Vo.EventSource[source])

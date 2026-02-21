@@ -14,35 +14,32 @@ mutable struct MattermostChannel <: Agentif.AbstractChannel
     root_id::String
     post_id::String
     client::Mattermost.Client
-    sm::Union{Nothing, Mattermost.StreamingMessage}
+    io::Union{Nothing, IOBuffer}
     user_id::String
     user_name::String
     channel_type::String  # "O" = public, "P" = private, "D" = DM, "G" = group DM
 end
 
-Agentif.start_streaming(::MattermostChannel) = nothing
+function Agentif.start_streaming(ch::MattermostChannel)
+    ch.io === nothing && (ch.io = IOBuffer())
+    return nothing
+end
 
 function Agentif.append_to_stream(ch::MattermostChannel, delta::AbstractString)
-    Mattermost.with_client(ch.client) do
-        if ch.sm === nothing
-            kwargs = isempty(ch.root_id) ? (;) : (; root_id=ch.root_id)
-            ch.sm = Mattermost.send_streaming_message(ch.channel_id; kwargs...)
-            Mattermost.update!(ch.sm, string(delta))
-        else
-            Mattermost.append!(ch.sm, delta)
-        end
-    end
+    io = ch.io
+    io === nothing && return
+    write(io, String(delta))
 end
 
 Agentif.finish_streaming(::MattermostChannel) = nothing
 
 function Agentif.close_channel(ch::MattermostChannel)
-    sm = ch.sm
-    sm === nothing && return
-    Mattermost.with_client(ch.client) do
-        Mattermost.finish!(sm)
-    end
-    ch.sm = nothing
+    io = ch.io
+    io === nothing && return
+    text = String(take!(io))
+    ch.io = nothing
+    isempty(text) && return
+    Agentif.send_message(ch, text)
 end
 
 function Agentif.send_message(ch::MattermostChannel, msg)
@@ -101,7 +98,6 @@ function Vo.event_content(ev::MattermostMessageEvent)
     end
     return ev.content
 end
-Vo.is_direct_ping(ev::MattermostMessageEvent) = ev.direct_ping
 
 struct MattermostReactionEvent <: Vo.ChannelEvent
     channel::MattermostChannel
@@ -112,7 +108,6 @@ end
 
 Vo.get_name(::MattermostReactionEvent) = "mattermost_reaction"
 Vo.get_channel(ev::MattermostReactionEvent) = ev.channel
-Vo.is_direct_ping(::MattermostReactionEvent) = true
 
 function Vo.event_content(ev::MattermostReactionEvent)
     lines = ["User '$(ev.user_name)' reacted with :$(ev.emoji):"]

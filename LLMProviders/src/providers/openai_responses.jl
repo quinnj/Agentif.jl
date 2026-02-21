@@ -3,7 +3,27 @@ module OpenAIResponses
 using StructUtils, JSON, JSONSchema
 
 
-schema(::Type{T}) where {T} = JSONSchema.schema(T; all_fields_required = true, additionalProperties = false)
+function _required_field_names(::Type{T}) where {T}
+    names = fieldnames(T)
+    types = fieldtypes(T)
+    required = String[]
+    for (nm, ty) in zip(names, types)
+        Nothing <: ty && continue
+        push!(required, string(nm))
+    end
+    return required
+end
+
+function schema(::Type{T}) where {T}
+    sch = JSONSchema.schema(T; all_fields_required = true, additionalProperties = false)
+    required = _required_field_names(T)
+    if isempty(required)
+        haskey(sch.spec, "required") && delete!(sch.spec, "required")
+    else
+        sch.spec["required"] = required
+    end
+    return sch
+end
 
 @omit_null @kwarg struct InputTextContent
     type::String = "input_text"
@@ -54,10 +74,18 @@ end
     type::String = "reasoning_text"
 end
 
-const OutputContent = Union{OutputTextContent, Refusal, ReasoningText}
+@omit_null @kwarg struct UnknownOutputContent
+    type::Union{Nothing, String} = nothing
+end
+
+const OutputContent = Union{OutputTextContent, Refusal, ReasoningText, UnknownOutputContent}
 
 JSON.@choosetype OutputContent x -> begin
-    type = x.type[]
+    type = try
+        x.type[]
+    catch
+        nothing
+    end
     if type == "output_text"
         return OutputTextContent
     elseif type == "refusal"
@@ -65,14 +93,22 @@ JSON.@choosetype OutputContent x -> begin
     elseif type == "reasoning_text"
         return ReasoningText
     else
-        return error("Invalid output content type: $type")
+        return UnknownOutputContent
     end
 end
 
-const Content = Union{InputContent, OutputContent}
+@omit_null @kwarg struct UnknownContent
+    type::Union{Nothing, String} = nothing
+end
+
+const Content = Union{InputContent, OutputContent, UnknownContent}
 
 JSON.@choosetype Content x -> begin
-    type = x.type[]
+    type = try
+        x.type[]
+    catch
+        nothing
+    end
     if type == "input_text"
         return InputTextContent
     elseif type == "input_image"
@@ -88,7 +124,7 @@ JSON.@choosetype Content x -> begin
     elseif type == "reasoning_text"
         return ReasoningText
     else
-        return error("Invalid content type: $type")
+        return UnknownContent
     end
 end
 
@@ -108,15 +144,56 @@ end
     status::Union{Nothing, String} = nothing # "in_progress", "completed", "incomplete"
 end
 
+@omit_null @kwarg struct UnknownItem
+    type::Union{Nothing, String} = nothing
+end
 
-const Item = Union{Message, FunctionToolCallOutput} # TODO: add other item types here: Function tool call, Function tool call output, etc.
+const Item = Union{Message, FunctionToolCallOutput, UnknownItem} # TODO: add other item types here: Function tool call, Function tool call output, etc.
+
+JSON.@choosetype Item x -> begin
+    type = try
+        x.type[]
+    catch
+        nothing
+    end
+    if type == "message"
+        return Message
+    elseif type == "function_call_output"
+        return FunctionToolCallOutput
+    else
+        # Some payloads omit explicit type for message-like items.
+        role = try
+            x.role[]
+        catch
+            nothing
+        end
+        role === nothing ? UnknownItem : Message
+    end
+end
 
 @omit_null @kwarg struct ItemReference
     id::String
     type::String = "item_reference"
 end
 
-const InputItem = Union{Message, Item, ItemReference}
+const InputItem = Union{Message, Item, ItemReference, UnknownItem}
+
+JSON.@choosetype InputItem x -> begin
+    type = try
+        x.type[]
+    catch
+        nothing
+    end
+    if type == "item_reference"
+        return ItemReference
+    elseif type == "function_call_output"
+        return FunctionToolCallOutput
+    elseif type == "message" || type === nothing
+        return Message
+    else
+        return UnknownItem
+    end
+end
 
 @omit_null @kwarg struct Prompt
     id::String
@@ -138,7 +215,8 @@ end
     type::String = "json_schema"
     name::String
     description::Union{Nothing, String} = nothing
-    # the JSONSchema.Schema *must* have all fields be required, and additionalProperties: false
+    # JSON schema is emitted with additionalProperties: false and only
+    # non-nullable fields marked required.
     # allOf, not, dependentRequired, dependentSchemas, if, then, else are not supported
     # root schema must be an object
     schema::JSONSchema.Schema{T}
@@ -752,6 +830,10 @@ end
     id::Union{Nothing, String} = nothing
 end
 
+@omit_null @kwarg struct UnknownOutput
+    type::Union{Nothing, String} = nothing
+end
+
 const Output = Union{
     Message,
     ReasoningOutput,
@@ -771,10 +853,15 @@ const Output = Union{
     McpApprovalRequest,
     CompactionItem,
     CustomToolCall,
+    UnknownOutput,
 } # TODO: add other output types here as needed
 
 JSON.@choosetype Output x -> begin
-    type = x.type[]
+    type = try
+        x.type[]
+    catch
+        nothing
+    end
     if type == "message"
         return Message
     elseif type == "reasoning"
@@ -812,7 +899,7 @@ JSON.@choosetype Output x -> begin
     elseif type == "custom_tool_call"
         return CustomToolCall
     else
-        return error("Invalid output type: $type")
+        return UnknownOutput
     end
 end
 
@@ -1311,8 +1398,16 @@ end
     param::Union{Nothing, String} = nothing
 end
 
+@omit_null @kwarg struct UnknownStreamEvent <: StreamEvent
+    type::Union{Nothing, String} = nothing
+end
+
 JSON.@choosetype StreamEvent x -> begin
-    type = x.type[]
+    type = try
+        x.type[]
+    catch
+        nothing
+    end
     if type == "response.created"
         return StreamResponseCreatedEvent
     elseif type == "response.in_progress"
@@ -1420,7 +1515,7 @@ JSON.@choosetype StreamEvent x -> begin
     elseif type == "error"
         return StreamErrorEvent
     else
-        return error("Invalid stream event type: $type")
+        return UnknownStreamEvent
     end
 end
 

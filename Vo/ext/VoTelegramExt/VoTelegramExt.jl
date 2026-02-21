@@ -96,7 +96,6 @@ function Vo.event_content(ev::TelegramMessageEvent)
     end
     return ev.content
 end
-Vo.is_direct_ping(ev::TelegramMessageEvent) = ev.direct_ping
 
 struct TelegramReactionEvent <: Vo.ChannelEvent
     channel::TelegramChannel
@@ -107,7 +106,6 @@ end
 
 Vo.get_name(::TelegramReactionEvent) = "telegram_reaction"
 Vo.get_channel(ev::TelegramReactionEvent) = ev.channel
-Vo.is_direct_ping(::TelegramReactionEvent) = true
 
 function Vo.event_content(ev::TelegramReactionEvent)
     return "User '$(ev.user_name)' reacted with $(ev.emoji) to message #$(ev.message_id)"
