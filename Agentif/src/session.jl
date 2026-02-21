@@ -120,11 +120,19 @@ function session_entries(store::FileSessionStore, session_id::String; start::Int
         entries = SessionEntry[]
         isfile(path) || return entries
         open(path, "r") do io
-            for idx in start:stop
+            final_idx = min(stop, length(offsets))
+            for idx in start:final_idx
                 seek(io, offsets[idx])
                 line = readline(io)
                 isempty(strip(line)) && continue
-                push!(entries, JSON.parse(line, SessionEntry))
+                parsed = try
+                    JSON.parse(line, SessionEntry)
+                catch e
+                    @warn "Skipping invalid session entry line" session_id index=idx error=sprint(showerror, e)
+                    nothing
+                end
+                parsed === nothing && continue
+                push!(entries, parsed)
             end
         end
         return entries
@@ -172,6 +180,7 @@ function append_session_entry!(store::FileSessionStore, session_id::String, entr
             offset = position(io)
             write(io, JSON.json(entry))
             write(io, '\n')
+            flush(io)
             if session_id in store.indexed
                 offsets = get!(() -> Int64[], store.offsets, session_id)
                 push!(offsets, offset)
@@ -196,10 +205,13 @@ function save_session!(store::FileSessionStore, session_id::String, state::Agent
     path = session_path(store, session_id)
     lock(store.lock) do
         mkpath(dirname(path))
-        open(path, "w") do io
+        tmp_path = string(path, ".tmp.", string(UID8()))
+        open(tmp_path, "w") do io
             write(io, JSON.json(entry))
             write(io, '\n')
+            flush(io)
         end
+        mv(tmp_path, path; force = true)
         store.offsets[session_id] = [0]
         store.counts[session_id] = 1
         push!(store.indexed, session_id)
@@ -280,27 +292,42 @@ end
 function search_sessions(store::FileSessionStore, query::String; limit::Int=10, current_channel_id::Union{Nothing, String}=nothing)
     keywords = [lowercase(k) for k in split(strip(query); keepempty=false)]
     isempty(keywords) && return SessionSearchResult[]
+    limit <= 0 && return SessionSearchResult[]
     results = SessionSearchResult[]
-    lock(store.lock) do
-        isdir(store.directory) || return results
+    files = lock(store.lock) do
+        isdir(store.directory) || return String[]
+        files = Tuple{String, Float64}[]
         for fname in readdir(store.directory)
             fpath = joinpath(store.directory, fname)
             isfile(fpath) || continue
-            for line in eachline(fpath)
-                isempty(strip(line)) && continue
-                entry = try
-                    JSON.parse(line, SessionEntry)
-                catch
-                    continue
-                end
-                entry.is_deleted && continue
-                _visible_entry(entry, current_channel_id) || continue
-                text = _entry_search_text(entry)
-                if _matches_keywords(text, keywords)
-                    push!(results, SessionSearchResult(fname, text, _keyword_score(text, keywords)))
-                end
+            mtime = try
+                stat(fpath).mtime
+            catch
+                0.0
             end
+            push!(files, (fpath, mtime))
         end
+        sort!(files; by = x -> x[2], rev = true)
+        return [f[1] for f in files]
+    end
+    for fpath in files
+        sid = basename(fpath)
+        for line in eachline(fpath)
+            isempty(strip(line)) && continue
+            entry = try
+                JSON.parse(line, SessionEntry)
+            catch
+                continue
+            end
+            entry.is_deleted && continue
+            _visible_entry(entry, current_channel_id) || continue
+            text = _entry_search_text(entry)
+            if _matches_keywords(text, keywords)
+                push!(results, SessionSearchResult(sid, text, _keyword_score(text, keywords)))
+            end
+            length(results) >= limit * 10 && break
+        end
+        length(results) >= limit * 10 && break
     end
     sort!(results; by=r -> r.score, rev=true)
     return first(results, min(limit, length(results)))

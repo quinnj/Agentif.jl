@@ -179,11 +179,10 @@ function codex_decode_jwt(token::String)
     parts = split(token, ".")
     length(parts) == 3 || return Dict{String, Any}()
     try
-        # Add padding if needed for base64 decoding
-        payload = parts[2]
+        payload = replace(parts[2], '-' => '+', '_' => '/')
         padding = mod(4 - mod(length(payload), 4), 4)
-        payload = payload * repeat("=", padding)
-        decoded = String(Base64.base64decode(payload))
+        padding > 0 && (payload *= repeat("=", padding))
+        decoded = Base64.base64decode(payload)
         return JSON.parse(decoded)
     catch
         return Dict{String, Any}()
@@ -198,15 +197,15 @@ Throws an error if the account ID cannot be extracted.
 """
 function codex_get_account_id(access_token::String)
     payload = codex_decode_jwt(access_token)
-    auth_claims = get(payload, CODEX_JWT_CLAIM_PATH, nothing)
+    auth_claims = get(() -> nothing, payload, CODEX_JWT_CLAIM_PATH)
     if auth_claims === nothing
         throw(ErrorException("Failed to extract account ID from Codex token: missing auth claims"))
     end
-    account_id = get(auth_claims, "chatgpt_account_id", nothing)
-    if account_id === nothing || isempty(account_id)
+    account_id = get(() -> nothing, auth_claims, "chatgpt_account_id")
+    if !(account_id isa AbstractString) || isempty(account_id)
         throw(ErrorException("Failed to extract account ID from Codex token: missing chatgpt_account_id"))
     end
-    return string(account_id)
+    return String(account_id)
 end
 
 function codex_exchange_code(code::AbstractString, verifier::OAuth.PKCEVerifier)
@@ -374,6 +373,17 @@ Get valid Codex credentials, refreshing the token if necessary.
 Throws an error if no stored credentials exist or refresh fails.
 """
 function codex_credentials(; skew_seconds::Integer = 60)
+    config = codex_client_config()
+    store = config.refresh_token_store
+    if store isa OAuth.FileBasedRefreshTokenStore
+        return OAuth.with_refresh_token_lock(store, config.verbose) do
+            _codex_credentials_unlocked(skew_seconds)
+        end
+    end
+    return _codex_credentials_unlocked(skew_seconds)
+end
+
+function _codex_credentials_unlocked(skew_seconds::Integer)
     creds = codex_load_credentials()
 
     # Check if token is expired or about to expire

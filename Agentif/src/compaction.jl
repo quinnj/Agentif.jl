@@ -219,6 +219,18 @@ function compact!(agent::Agent, state::AgentState, config::CompactionConfig, mod
     return
 end
 
+function compaction_threshold(context_window::Int, reserve_tokens::Int)
+    context_window <= 0 && return 0
+    reserve_tokens <= 0 && return context_window
+    if reserve_tokens >= context_window
+        # Fallback for undersized context windows to avoid compacting every turn.
+        return max(1, floor(Int, context_window * 0.8))
+    end
+    return context_window - reserve_tokens
+end
+
+compaction_threshold(config::CompactionConfig, model::Model) = compaction_threshold(model.contextWindow, config.reserve_tokens)
+
 """
     compaction_middleware(agent_handler, config) -> middleware
 
@@ -245,7 +257,8 @@ function compaction_middleware(agent_handler::AgentHandler, config::CompactionCo
             return agent_handler(f, agent, state, current_input, abort; model, kw...)
         end
 
-        threshold = resolved_model.contextWindow - config.reserve_tokens
+        threshold = compaction_threshold(config, resolved_model)
+        threshold <= 0 && return agent_handler(f, agent, state, current_input, abort; model, kw...)
 
         # Compact if previous call's input tokens exceeded threshold
         if last_input_tokens[] > 0 && last_input_tokens[] > threshold

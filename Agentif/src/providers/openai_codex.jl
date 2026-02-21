@@ -8,14 +8,21 @@ const OPENAI_HEADERS = (
     account_id = "chatgpt-account-id",
     originator = "originator",
     session_id = "session_id",
+    conversation_id = "conversation_id",
 )
 
 const OPENAI_HEADER_VALUES = (
     beta_responses = "responses=experimental",
+    beta_responses_websocket = "responses_websockets=2026-02-06",
     originator_codex = "pi",
 )
 
-const CODEX_DEBUG = true
+const CODEX_JWT_CLAIM_PATH = "https://api.openai.com/auth"
+const CODEX_DEBUG = lowercase(get(ENV, "AGENTIF_CODEX_DEBUG", "false")) in ("1", "true", "yes", "on")
+const CODEX_DEFAULT_MAX_RETRIES = 3
+const CODEX_DEFAULT_RETRY_BASE_MS = 1000
+const CODEX_DEFAULT_RETRY_MAX_MS = 60000
+const CODEX_RETRYABLE_ERROR_REGEX = r"rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused|connection.?reset|reset.?before.?headers|terminated|temporar"i
 
 function resolve_codex_url(base_url::AbstractString)
     raw = strip(String(base_url))
@@ -27,6 +34,73 @@ function resolve_codex_url(base_url::AbstractString)
         return normalized * "/responses"
     end
     return normalized * "/codex/responses"
+end
+
+function resolve_codex_websocket_url(base_url::AbstractString)
+    url = resolve_codex_url(base_url)
+    if startswith(url, "https://")
+        return "wss://" * url[9:end]
+    elseif startswith(url, "http://")
+        return "ws://" * url[8:end]
+    end
+    return url
+end
+
+function normalize_codex_transport(value)::Symbol
+    value === nothing && return :sse
+    value isa Bool && return value ? :websocket : :sse
+
+    text = lowercase(strip(string(value)))
+    text in ("", "sse") && return :sse
+    text in ("ws", "websocket") && return :websocket
+    text == "auto" && return :auto
+    throw(ArgumentError("Unsupported codex transport: $(value). Expected one of: sse, websocket, auto."))
+end
+
+function codex_pop_option!(kw::Dict{Symbol, Any}, key::Symbol, aliases::Symbol...; default = nothing)
+    if haskey(kw, key)
+        return pop!(kw, key)
+    end
+    for alias in aliases
+        if haskey(kw, alias)
+            return pop!(kw, alias)
+        end
+    end
+    return default
+end
+
+function codex_env_int(name::String, default::Int)
+    raw = strip(get(ENV, name, ""))
+    isempty(raw) && return default
+    parsed = tryparse(Int, raw)
+    parsed === nothing && return default
+    return max(0, parsed)
+end
+
+function codex_parse_nonnegative_int(value, default::Int, label::String)
+    value === nothing && return default
+    parsed = parse_int(value)
+    parsed === nothing && throw(ArgumentError("Invalid $label value: $(value)"))
+    return max(0, parsed)
+end
+
+function codex_retry_settings!(kw::Dict{Symbol, Any})
+    max_retries = codex_parse_nonnegative_int(
+        codex_pop_option!(kw, :max_retries, :maxRetries, :codex_max_retries, :codexMaxRetries),
+        codex_env_int("AGENTIF_CODEX_MAX_RETRIES", CODEX_DEFAULT_MAX_RETRIES),
+        "max_retries",
+    )
+    retry_base_ms = codex_parse_nonnegative_int(
+        codex_pop_option!(kw, :retry_base_ms, :retryBaseMs, :codex_retry_base_ms, :codexRetryBaseMs),
+        codex_env_int("AGENTIF_CODEX_RETRY_BASE_MS", CODEX_DEFAULT_RETRY_BASE_MS),
+        "retry_base_ms",
+    )
+    retry_max_ms = codex_parse_nonnegative_int(
+        codex_pop_option!(kw, :retry_max_ms, :retryMaxMs, :codex_retry_max_ms, :codexRetryMaxMs),
+        codex_env_int("AGENTIF_CODEX_RETRY_MAX_MS", CODEX_DEFAULT_RETRY_MAX_MS),
+        "retry_max_ms",
+    )
+    return (; max_retries, retry_base_ms, retry_max_ms)
 end
 
 function build_codex_tools(tools::Vector{AgentTool})
@@ -48,12 +122,44 @@ end
 
 function clamp_reasoning_effort(model::String, effort::String)
     model_id = occursin("/", model) ? split(model, "/")[end] : model
+    if (startswith(model_id, "gpt-5.2") || startswith(model_id, "gpt-5.3")) && effort == "minimal"
+        return "low"
+    end
     if model_id == "gpt-5.1" && effort == "xhigh"
         return "high"
     elseif model_id == "gpt-5.1-codex-mini"
         return (effort == "high" || effort == "xhigh") ? "high" : "medium"
     end
     return effort
+end
+
+function decode_base64url(data::AbstractString)
+    payload = replace(String(data), '-' => '+', '_' => '/')
+    padding = mod(4 - mod(length(payload), 4), 4)
+    padding > 0 && (payload *= repeat("=", padding))
+    return String(Base64.base64decode(payload))
+end
+
+function codex_account_id_from_access_token(access_token::AbstractString)
+    parts = split(String(access_token), ".")
+    length(parts) == 3 || return nothing
+    try
+        payload = JSON.parse(Vector{UInt8}(codeunits(decode_base64url(parts[2]))))
+        auth_claims = get(() -> nothing, payload, CODEX_JWT_CLAIM_PATH)
+        auth_claims isa AbstractDict || return nothing
+        account_id = get(() -> nothing, auth_claims, "chatgpt_account_id")
+        return (account_id isa AbstractString && !isempty(account_id)) ? String(account_id) : nothing
+    catch
+        return nothing
+    end
+end
+
+function resolve_codex_account_id(account_id::Union{Nothing, Any}, access_token::AbstractString)
+    if account_id !== nothing
+        explicit = strip(string(account_id))
+        !isempty(explicit) && return explicit
+    end
+    return codex_account_id_from_access_token(access_token)
 end
 
 function transform_request_body!(
@@ -318,7 +424,7 @@ function openai_codex_event_callback(
 
         local raw
         try
-            raw = JSON.parse(data)
+            raw = JSON.parse(Vector{UInt8}(codeunits(data)))
         catch e
             f(AgentErrorEvent(ErrorException("Failed to parse Codex SSE event: $(sprint(showerror, e))")))
             return
@@ -463,13 +569,37 @@ function create_codex_headers(
 
     if session_id !== nothing
         headers[OPENAI_HEADERS.session_id] = session_id
+        headers[OPENAI_HEADERS.conversation_id] = session_id
     else
         delete!(headers, OPENAI_HEADERS.session_id)
+        delete!(headers, OPENAI_HEADERS.conversation_id)
     end
 
     headers["Accept"] = "text/event-stream"
     headers["Content-Type"] = "application/json"
     return headers
+end
+
+function create_codex_websocket_headers(headers::Dict{String, String})
+    ws_headers = copy(headers)
+    ws_headers[OPENAI_HEADERS.beta] = OPENAI_HEADER_VALUES.beta_responses_websocket
+    ws_headers["Accept"] = "application/json"
+    return ws_headers
+end
+
+function codex_event_type_from_payload(data::AbstractString)
+    raw = try
+        JSON.parse(Vector{UInt8}(codeunits(data)))
+    catch
+        return nothing
+    end
+    event_type = get(() -> nothing, raw, "type")
+    return event_type isa AbstractString ? String(event_type) : nothing
+end
+
+function codex_terminal_event_type(event_type::Union{Nothing, String})
+    event_type === nothing && return false
+    return event_type in ("response.completed", "response.done", "response.failed", "response.incomplete", "error")
 end
 
 function map_stop_reason(status::Union{Nothing, String})
@@ -620,6 +750,198 @@ function parse_codex_error(resp::HTTP.Response)
         friendly_message = friendly,
         status = resp.status,
     )
+end
+
+codex_retryable_status(status::Integer) = Int(status) in (408, 409, 429, 500, 502, 503, 504, 599)
+
+function codex_retryable_message(message::AbstractString)
+    isempty(message) && return false
+    return occursin(CODEX_RETRYABLE_ERROR_REGEX, lowercase(message))
+end
+
+function codex_retryable_exception(err::Exception)
+    if err isa HTTP.ConnectError
+        return true
+    elseif err isa HTTP.RequestError
+        inner = err.error
+        inner isa Exception && return codex_retryable_exception(inner)
+        return codex_retryable_message(string(inner))
+    elseif err isa EOFError || err isa Base.IOError || err isa InterruptException
+        return true
+    end
+    return codex_retryable_message(sprint(showerror, err))
+end
+
+function codex_retry_after_seconds(resp::HTTP.Response)
+    raw = strip(HTTP.header(resp, "retry-after"))
+    isempty(raw) && return nothing
+    parsed = tryparse(Float64, raw)
+    parsed === nothing && return nothing
+    return max(0.0, parsed)
+end
+
+function codex_retry_delay_seconds(attempt::Int, retry_base_ms::Int, retry_max_ms::Int; response::Union{Nothing, HTTP.Response} = nothing)
+    retry_after = response === nothing ? nothing : codex_retry_after_seconds(response)
+    if retry_after !== nothing
+        return min(retry_after, retry_max_ms / 1000)
+    end
+    exp_ms = retry_base_ms * (2.0^(max(attempt - 1, 0)))
+    delay_ms = min(retry_max_ms, exp_ms)
+    # Keep jitter small to avoid long/erratic delays for interactive usage.
+    jitter_ms = delay_ms * 0.1 * rand()
+    return max(0.0, (delay_ms + jitter_ms) / 1000)
+end
+
+function codex_sleep_with_abort!(delay_s::Real, abort::Abort)
+    delay_s <= 0 && return
+    deadline = time() + delay_s
+    while true
+        isaborted(abort) && throw(StopStreaming("aborted"))
+        remaining = deadline - time()
+        remaining <= 0 && return
+        sleep(min(remaining, 0.05))
+    end
+end
+
+function codex_stream_sse_with_retry!(
+        callback::Function,
+        url::String,
+        headers::Dict{String, String},
+        request_body::Dict{String, Any},
+        abort::Abort;
+        http_kw = (;),
+        max_retries::Int = CODEX_DEFAULT_MAX_RETRIES,
+        retry_base_ms::Int = CODEX_DEFAULT_RETRY_BASE_MS,
+        retry_max_ms::Int = CODEX_DEFAULT_RETRY_MAX_MS,
+    )
+    http_nt = http_kw isa NamedTuple ? http_kw : (; http_kw...)
+    request_http_kw = merge(http_nt, (; retry = false, status_exception = false))
+    payload = JSON.json(request_body)
+    attempt = 0
+
+    while true
+        isaborted(abort) && throw(StopStreaming("aborted"))
+
+        local resp
+        try
+            resp = HTTP.post(
+                url,
+                headers;
+                body = payload,
+                sse_callback = callback,
+                request_http_kw...,
+            )
+        catch err
+            err isa StopStreaming && rethrow()
+            if attempt < max_retries && codex_retryable_exception(err)
+                attempt += 1
+                delay_s = codex_retry_delay_seconds(attempt, retry_base_ms, retry_max_ms)
+                log_codex_debug(
+                    "codex sse retry",
+                    Dict(
+                        "attempt" => attempt,
+                        "max_retries" => max_retries,
+                        "delay_s" => delay_s,
+                        "error" => sprint(showerror, err),
+                    ),
+                )
+                codex_sleep_with_abort!(delay_s, abort)
+                continue
+            end
+            rethrow()
+        end
+
+        if resp.status in 200:299
+            return resp
+        end
+
+        info = parse_codex_error(resp)
+        info_msg = String(get(() -> "", info, :message))
+        retryable = codex_retryable_status(resp.status) || codex_retryable_message(info_msg)
+        if attempt < max_retries && retryable
+            attempt += 1
+            delay_s = codex_retry_delay_seconds(attempt, retry_base_ms, retry_max_ms; response = resp)
+            log_codex_debug(
+                "codex sse retry",
+                Dict(
+                    "attempt" => attempt,
+                    "max_retries" => max_retries,
+                    "delay_s" => delay_s,
+                    "status" => resp.status,
+                    "message" => info_msg,
+                ),
+            )
+            codex_sleep_with_abort!(delay_s, abort)
+            continue
+        end
+
+        msg = info.friendly_message === nothing ? info.message : info.friendly_message
+        throw(ErrorException(msg))
+    end
+end
+
+function codex_stream_websocket!(
+        callback::Function,
+        ws_url::String,
+        headers::Dict{String, String},
+        request_body::Dict{String, Any},
+        abort::Abort;
+        http_kw = (;),
+    )
+    http_nt = http_kw isa NamedTuple ? http_kw : (; http_kw...)
+    ws_open_kw = merge(http_nt, (; retry = false))
+    ws_headers = create_codex_websocket_headers(headers)
+    start_request = copy(request_body)
+    start_request["type"] = "response.create"
+    saw_terminal = false
+
+    HTTP.WebSockets.open(ws_url; headers = collect(pairs(ws_headers)), suppress_close_error = true, ws_open_kw...) do ws
+        maybe_abort!(abort, ws)
+        HTTP.WebSockets.send(ws, JSON.json(start_request))
+        while true
+            maybe_abort!(abort, ws)
+            msg = try
+                HTTP.WebSockets.receive(ws)
+            catch err
+                if err isa HTTP.WebSockets.WebSocketError && HTTP.WebSockets.isok(err)
+                    break
+                end
+                rethrow()
+            end
+            data = msg isa AbstractString ? String(msg) : String(msg)
+            callback(ws, (; data))
+            event_type = codex_event_type_from_payload(data)
+            if codex_terminal_event_type(event_type)
+                saw_terminal = true
+                break
+            end
+        end
+    end
+
+    saw_terminal || throw(ErrorException("Codex websocket stream closed before response completion"))
+    return nothing
+end
+
+function codex_replay_sse_body!(callback::Function, body::AbstractVector{UInt8})
+    isempty(body) && return false
+    text = replace(String(body), "\r\n" => "\n")
+    isempty(strip(text)) && return false
+    saw_payload = false
+    for block in split(text, "\n\n")
+        stripped = strip(block)
+        isempty(stripped) && continue
+        data_lines = String[]
+        for line in split(stripped, '\n')
+            startswith(line, "data:") || continue
+            push!(data_lines, strip(line[6:end]))
+        end
+        isempty(data_lines) && continue
+        payload = join(data_lines, "\n")
+        isempty(strip(payload)) && continue
+        callback(nothing, (; data = payload))
+        saw_payload = true
+    end
+    return saw_payload
 end
 
 function redact_headers(headers::AbstractDict)

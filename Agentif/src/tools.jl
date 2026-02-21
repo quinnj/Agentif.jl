@@ -6,12 +6,16 @@
 end
 
 parameters(::AgentTool{F, T}) where {F, T} = T
+tool_name(tool::AgentTool) = tool.name
+tool_name(name::AbstractString) = String(name)
 
 @kwarg mutable struct PendingToolCall
     const call_id::String
     const name::String
     arguments::String
 end
+
+tool_name(tool::PendingToolCall) = tool.name
 
 function findtool(tools, name)
     for tool in tools

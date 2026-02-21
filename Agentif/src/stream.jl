@@ -793,7 +793,8 @@ function stream(
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         account_id = get(() -> nothing, kw_nt, :account_id)
         account_id === nothing && (account_id = get(() -> nothing, kw_nt, :accountId))
-        account_id === nothing && throw(ArgumentError("Missing `account_id` for openai-codex provider; pass `account_id=` or `accountId=`"))
+        account_id = resolve_codex_account_id(account_id, String(apikey))
+        account_id === nothing && throw(ArgumentError("Missing `account_id` for openai-codex provider and unable to infer it from access token"))
 
         assistant_message = assistant_message_for_model(model; response_id = state.response_id)
         started = Ref(false)
@@ -821,6 +822,8 @@ function stream(
         text_verbosity === nothing && (text_verbosity = pop!(codex_kw, :text_verbosity, nothing))
         include_opt = pop!(codex_kw, :include, nothing)
         max_tokens = pop!(codex_kw, :maxTokens, nothing)
+        transport = normalize_codex_transport(codex_pop_option!(codex_kw, :transport, :transportMode, :websocket, :websockets))
+        retry_settings = codex_retry_settings!(codex_kw)
 
         tools = build_codex_tools(agent.tools)
         current_input = codex_build_input(agent, state, input)
@@ -872,44 +875,88 @@ function stream(
                 "reasoningSummary" => reasoning_summary,
                 "textVerbosity" => text_verbosity,
                 "include" => include_opt,
+                "transport" => string(transport),
+                "maxRetries" => retry_settings.max_retries,
+                "retryBaseMs" => retry_settings.retry_base_ms,
+                "retryMaxMs" => retry_settings.retry_max_ms,
                 "instructions_length" => length(string(get(request_body, "instructions", ""))),
                 "instructions_preview" => first(string(get(request_body, "instructions", "")), min(200, length(string(get(request_body, "instructions", ""))))),
                 "headers" => redact_headers(headers),
             )
         )
 
+        callback = openai_codex_event_callback(
+            f,
+            agent,
+            assistant_message,
+            started,
+            ended,
+            response_usage,
+            response_status,
+            tool_call_accumulators,
+            abort,
+        )
+
+        request_http_kw = merge(merged_http_kw, (; retry = false))
         resp = nothing
-        try
-            resp = HTTP.post(
-                url,
-                headers;
-                body = JSON.json(request_body),
-                sse_callback = openai_codex_event_callback(
-                    f,
-                    agent,
-                    assistant_message,
-                    started,
-                    ended,
-                    response_usage,
-                    response_status,
-                    tool_call_accumulators,
-                    abort,
-                ),
-                merged_http_kw...,
-            )
-        catch e
-            if !(e isa StopStreaming)
-                rethrow()
+        used_websocket = false
+
+        if transport != :sse
+            ws_url = resolve_codex_websocket_url(model.baseUrl)
+            try
+                codex_stream_websocket!(
+                    callback,
+                    ws_url,
+                    headers,
+                    request_body,
+                    abort;
+                    http_kw = request_http_kw,
+                )
+                used_websocket = true
+            catch e
+                if e isa StopStreaming
+                    rethrow()
+                end
+                if transport == :websocket || started[] || ended[]
+                    rethrow()
+                end
+                log_codex_debug(
+                    "codex websocket fallback", Dict(
+                        "error" => sprint(showerror, e),
+                        "fallback_transport" => "sse",
+                    )
+                )
+            end
+        end
+
+        if !used_websocket
+            try
+                resp = codex_stream_sse_with_retry!(
+                    callback,
+                    url,
+                    headers,
+                    request_body,
+                    abort;
+                    http_kw = request_http_kw,
+                    max_retries = retry_settings.max_retries,
+                    retry_base_ms = retry_settings.retry_base_ms,
+                    retry_max_ms = retry_settings.retry_max_ms,
+                )
+            catch e
+                if !(e isa StopStreaming)
+                    rethrow()
+                end
             end
         end
 
         if resp !== nothing
-            if !(resp.status in 200:299)
-                info = parse_codex_error(resp)
-                msg = info.friendly_message === nothing ? info.message : info.friendly_message
-                throw(ErrorException(msg))
+            if !started[] && !isempty(resp.body)
+                replayed = codex_replay_sse_body!(callback, resp.body)
+                replayed && log_codex_debug(
+                    "codex sse replayed body events",
+                    Dict("body_bytes" => length(resp.body)),
+                )
             end
-
             log_codex_debug(
                 "codex response", Dict(
                     "url" => resp.request.url,

@@ -129,13 +129,35 @@ function _create_search_session_tool(store::SessionStore)
 end
 
 function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, SessionStore}; session_id::Union{Nothing, String} = nothing, channel::Union{Nothing, AbstractChannel} = nothing)
-    sid_ref = Ref{Union{Nothing, String}}(session_id)
+    sid_ref = Ref{Union{Nothing, String}}(session_id === nothing ? nothing : ensure_session_id(session_id))
+    sid_by_channel = Dict{String, String}()
+    sid_lock = ReentrantLock()
     search_tool = store === nothing ? nothing : _create_search_session_tool(store)
     return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; session_id::Union{Nothing, String} = nothing, kw...)
         store === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
-        sid = session_id === nothing ? sid_ref[] : ensure_session_id(session_id)
-        sid === nothing && (sid = new_session_id())
-        sid_ref[] = sid
+        current_channel = channel === nothing ? CURRENT_CHANNEL[] : channel
+        current_channel_id = current_channel === nothing ? nothing : channel_id(current_channel)
+        sid = if session_id === nothing
+            lock(sid_lock) do
+                if current_channel_id === nothing
+                    sid_ref[] === nothing && (sid_ref[] = new_session_id())
+                    sid_ref[]
+                else
+                    get!(() -> new_session_id(), sid_by_channel, current_channel_id)
+                end
+            end
+        else
+            ensure_session_id(session_id)
+        end
+        if session_id !== nothing
+            lock(sid_lock) do
+                if current_channel_id === nothing
+                    sid_ref[] = sid
+                else
+                    sid_by_channel[current_channel_id] = sid
+                end
+            end
+        end
         current_state = load_session(store, sid)
         current_state.session_id = sid
         start_idx = length(current_state.messages)
@@ -146,7 +168,7 @@ function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, S
         # Use directly-provided channel if available; fall back to CURRENT_CHANNEL
         # (which works when with_channel wraps the outer call, but NOT when
         # channel_middleware is inner — that @with exits before we reach here).
-        user_id, post_id, current_channel_id, current_channel_flags = _entry_metadata(channel !== nothing ? channel : CURRENT_CHANNEL[])
+        user_id, post_id, current_channel_id, current_channel_flags = _entry_metadata(current_channel)
         if current_state.last_compaction !== nothing
             # Compaction happened: write full state as compaction entry
             entry = SessionEntry(;

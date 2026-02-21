@@ -1,5 +1,7 @@
 using Test
 using Agentif
+using Base64
+using HTTP
 using JSON
 using LocalSearch
 using SQLite
@@ -37,6 +39,13 @@ function make_agent(; prompt = "test prompt", tools = AgentTool[])
     )
 end
 
+function fake_jwt(payload::AbstractDict)
+    encoded = Base64.base64encode(JSON.json(payload))
+    encoded = replace(encoded, '+' => '-', '/' => '_')
+    encoded = replace(encoded, "=" => "")
+    return "header.$encoded.signature"
+end
+
 function make_base_handler(; with_tool_call::Bool = false, call_counter = Ref(0), inputs = Agentif.AgentTurnInput[])
     return function (f, agent::Agent, state::AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
         call_counter[] += 1
@@ -67,6 +76,31 @@ end
 Agentif.channel_id(ch::SessionTestChannel) = ch.id
 Agentif.get_current_user(ch::SessionTestChannel) = ch.user
 Agentif.source_message_id(ch::SessionTestChannel) = ch.message_id
+
+mutable struct StreamTestChannel <: Agentif.AbstractChannel
+    id::String
+    started::Int
+    finished::Int
+    closed::Int
+    deltas::Vector{String}
+end
+
+StreamTestChannel(id::String = "stream-test") = StreamTestChannel(id, 0, 0, 0, String[])
+
+Agentif.channel_id(ch::StreamTestChannel) = ch.id
+Agentif.start_streaming(ch::StreamTestChannel) = (ch.started += 1)
+Agentif.append_to_stream(ch::StreamTestChannel, delta::AbstractString) = push!(ch.deltas, String(delta))
+Agentif.finish_streaming(ch::StreamTestChannel) = (ch.finished += 1)
+Agentif.send_message(::StreamTestChannel, ::Any) = nothing
+Agentif.close_channel(ch::StreamTestChannel) = (ch.closed += 1)
+
+@testset "public API bindings" begin
+    tool = @tool "Echo text." echo_text(text::String) = text
+    @test tool_name(tool) == "echo_text"
+    pending = Agentif.PendingToolCall(; call_id = "call-1", name = "echo_pending", arguments = "{}")
+    @test tool_name(pending) == "echo_pending"
+    @test tool_name("literal-name") == "literal-name"
+end
 
 @testset "stream (MiniMax live)" begin
     provider = get(ENV, "VO_AGENT_PROVIDER", "")
@@ -178,6 +212,37 @@ end
     @test length(result_state_2.messages) > len1
 end
 
+@testset "session_middleware channel isolation" begin
+    store = InMemorySessionStore()
+    handler = session_middleware(make_base_handler(), store)
+    agent = make_agent()
+    ch1 = SessionTestChannel("chan:iso-1", Agentif.ChannelUser("U1", "One"), "p1")
+    ch2 = SessionTestChannel("chan:iso-2", Agentif.ChannelUser("U2", "Two"), "p2")
+
+    s1 = Agentif.with_channel(ch1) do
+        handler(identity, agent, AgentState(), "hello from one", Abort())
+    end
+    s2 = Agentif.with_channel(ch2) do
+        handler(identity, agent, AgentState(), "hello from two", Abort())
+    end
+    s1_again = Agentif.with_channel(ch1) do
+        handler(identity, agent, AgentState(), "followup one", Abort())
+    end
+
+    @test s1.session_id !== s2.session_id
+    @test s1_again.session_id == s1.session_id
+
+    st1 = load_session(store, s1.session_id)
+    st2 = load_session(store, s2.session_id)
+    t1 = join([message_text(m) for m in st1.messages if m isa UserMessage], "\n")
+    t2 = join([message_text(m) for m in st2.messages if m isa UserMessage], "\n")
+    @test occursin("hello from one", t1)
+    @test occursin("followup one", t1)
+    @test !occursin("hello from two", t1)
+    @test occursin("hello from two", t2)
+    @test !occursin("hello from one", t2)
+end
+
 @testset "SessionEntry metadata serialization" begin
     entry = SessionEntry(;
         id = "entry-1",
@@ -215,6 +280,35 @@ end
     @test entries[1].channel_id == "chan:1"
     # SessionTestChannel defaults: is_group=false, is_private=true → flags=0x01
     @test entries[1].channel_flags == 1
+end
+
+@testset "FileSessionStore tolerates malformed entries" begin
+    mktempdir() do tmpdir
+        store = FileSessionStore(tmpdir)
+        sid = "file-session"
+        append_session_entry!(store, sid, SessionEntry(; id = "entry-1", messages = AgentMessage[UserMessage("hello")]))
+
+        path = joinpath(tmpdir, sid)
+        open(path, "a") do io
+            write(io, "{bad json")
+            write(io, '\n')
+        end
+
+        append_session_entry!(store, sid, SessionEntry(; id = "entry-2", messages = AgentMessage[UserMessage("world")]))
+
+        entries = session_entries(store, sid)
+        @test length(entries) == 2
+        @test [e.id for e in entries] == ["entry-1", "entry-2"]
+
+        loaded = load_session(store, sid)
+        user_messages = [Agentif.message_text(m) for m in loaded.messages if m isa UserMessage]
+        @test user_messages == ["hello", "world"]
+
+        search_results = search_sessions(store, "hello world"; limit = 1)
+        @test length(search_results) == 1
+        @test search_results[1].session_id == sid
+        @test isempty(search_sessions(store, "hello world"; limit = 0))
+    end
 end
 
 @testset "AgentifSQLiteExt session store" begin
@@ -347,6 +441,46 @@ end
     @test length(pgrp_results) == 3  # private_group_entry + public_entry + legacy_entry
 end
 
+@testset "channel_middleware" begin
+    @testset "suppresses NO_REPLY_SENTINEL output" begin
+        ch = StreamTestChannel()
+        base_handler = function (f, agent::Agent, state::AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+            msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+            f(MessageStartEvent(:assistant, msg))
+            f(MessageUpdateEvent(:assistant, msg, :text, string(Agentif.NO_REPLY_SENTINEL, "ignore me"), nothing))
+            f(MessageEndEvent(:assistant, msg))
+            Agentif.append_state!(state, current_input, msg, Usage())
+            state.pending_tool_calls = Agentif.PendingToolCall[]
+            state.most_recent_stop_reason = :stop
+            return state
+        end
+        handler = channel_middleware(base_handler, ch)
+        handler(identity, make_agent(), AgentState(), "hello", Abort())
+        @test ch.started == 0
+        @test isempty(ch.deltas)
+        @test ch.finished == 0
+        @test ch.closed == 1
+    end
+
+    @testset "streams regular assistant text and closes channel on error" begin
+        ch = StreamTestChannel()
+        base_handler = function (f, agent::Agent, state::AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+            msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+            f(MessageStartEvent(:assistant, msg))
+            f(MessageUpdateEvent(:assistant, msg, :text, "hello", nothing))
+            f(MessageUpdateEvent(:assistant, msg, :text, " world", nothing))
+            f(MessageEndEvent(:assistant, msg))
+            throw(ErrorException("boom"))
+        end
+        handler = channel_middleware(base_handler, ch)
+        @test_throws ErrorException handler(identity, make_agent(), AgentState(), "hello", Abort())
+        @test ch.started == 1
+        @test ch.deltas == ["hello", " world"]
+        @test ch.finished == 1
+        @test ch.closed == 1
+    end
+end
+
 @testset "input_guardrail_middleware" begin
     guardrail = (prompt, input, apikey) -> input != "blocked"
     base_handler = make_base_handler()
@@ -374,6 +508,13 @@ end
         # CompactionSummaryMessage
         compaction_msg = CompactionSummaryMessage(; summary = "some summary text", tokens_before = 100, compacted_at = time())
         @test Agentif.estimate_message_tokens(compaction_msg) > 0
+    end
+
+    @testset "compaction_threshold" begin
+        @test Agentif.compaction_threshold(100000, 16384) == 83616
+        @test Agentif.compaction_threshold(4096, 16384) == 3276
+        @test Agentif.compaction_threshold(4096, 0) == 4096
+        @test Agentif.compaction_threshold(0, 10) == 0
     end
 
     @testset "find_cut_point" begin
@@ -640,4 +781,276 @@ end
     state = AgentState()
     handler(identity, agent, state, "hello", Abort())
     @test occursin("<available_skills>", prompt_seen[])
+end
+
+@testset "openai_codex helpers" begin
+    @test Agentif.clamp_reasoning_effort("gpt-5.3-codex-spark", "minimal") == "low"
+    @test Agentif.clamp_reasoning_effort("gpt-5.3-codex-spark", "xhigh") == "xhigh"
+    @test Agentif.clamp_reasoning_effort("gpt-5.2-codex", "minimal") == "low"
+    @test Agentif.clamp_reasoning_effort("gpt-5.1", "xhigh") == "high"
+    @test Agentif.clamp_reasoning_effort("gpt-5.1-codex-mini", "low") == "medium"
+    @test Agentif.clamp_reasoning_effort("gpt-5.1-codex-mini", "xhigh") == "high"
+
+    token = fake_jwt(Dict("https://api.openai.com/auth" => Dict("chatgpt_account_id" => "acct-123")))
+    @test Agentif.codex_account_id_from_access_token(token) == "acct-123"
+    @test Agentif.resolve_codex_account_id(nothing, token) == "acct-123"
+    @test Agentif.resolve_codex_account_id("explicit-1", token) == "explicit-1"
+    @test Agentif.codex_account_id_from_access_token("invalid-token") === nothing
+
+    headers = Agentif.create_codex_headers(nothing, "acct-123", "tok", "sess-1")
+    @test headers["chatgpt-account-id"] == "acct-123"
+    @test headers["OpenAI-Beta"] == "responses=experimental"
+    @test headers["originator"] == "pi"
+    @test headers["session_id"] == "sess-1"
+    @test headers["conversation_id"] == "sess-1"
+    @test headers["Accept"] == "text/event-stream"
+    ws_headers = Agentif.create_codex_websocket_headers(headers)
+    @test ws_headers["OpenAI-Beta"] == "responses_websockets=2026-02-06"
+
+    no_session_headers = Agentif.create_codex_headers(nothing, "acct-123", "tok", nothing)
+    @test !haskey(no_session_headers, "session_id")
+    @test !haskey(no_session_headers, "conversation_id")
+    @test Agentif.normalize_codex_transport(nothing) == :sse
+    @test Agentif.normalize_codex_transport("sse") == :sse
+    @test Agentif.normalize_codex_transport("websocket") == :websocket
+    @test Agentif.normalize_codex_transport("auto") == :auto
+    @test Agentif.normalize_codex_transport(true) == :websocket
+    @test_throws ArgumentError Agentif.normalize_codex_transport("bogus")
+end
+
+@testset "openai_codex stream infers account_id from JWT" begin
+    request_headers = Ref(Dict{String, String}())
+    request_body = Ref(Dict{String, Any}())
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        request_headers[] = Dict{String, String}(String(k) => String(v) for (k, v) in req.headers)
+        request_body[] = JSON.parse(req.body)
+        sse = join([
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}}",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}",
+            "data: [DONE]",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        sock = HTTP.Sockets.getsockname(server.listener.server)
+        port = sock[2]
+        model = Model(
+            id = "gpt-5.3-codex-spark",
+            name = "gpt-5.3-codex-spark",
+            api = "openai-codex-responses",
+            provider = "openai-codex",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        payload = Dict("https://api.openai.com/auth" => Dict("chatgpt_account_id" => "acct-jwt-1"))
+        token = fake_jwt(payload)
+        agent = Agent(
+            id = "codex-jwt-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = token,
+            tools = AgentTool[],
+        )
+
+        state = AgentState()
+        result = stream(identity, agent, state, "Say hello", Abort(); session_id = "sess-123", reasoning = "minimal")
+        @test result isa AgentState
+        @test request_headers[]["chatgpt-account-id"] == "acct-jwt-1"
+        @test request_headers[]["session_id"] == "sess-123"
+        @test request_headers[]["conversation_id"] == "sess-123"
+        @test get(() -> nothing, request_body[], "prompt_cache_key") == "sess-123"
+        reasoning = get(() -> nothing, request_body[], "reasoning")
+        @test reasoning !== nothing
+        @test get(() -> nothing, reasoning, "effort") == "low"
+    finally
+        close(server)
+    end
+end
+
+@testset "openai_codex stream retries transient SSE failures" begin
+    request_count = Ref(0)
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        request_count[] += 1
+        if request_count[] == 1
+            return HTTP.Response(
+                503,
+                ["Content-Type" => "application/json", "Retry-After" => "0"],
+                "{\"error\":{\"code\":\"service_unavailable\",\"message\":\"temporary outage\"}}",
+            )
+        end
+        sse = join([
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}}",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}",
+            "data: [DONE]",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+
+    try
+        sock = HTTP.Sockets.getsockname(server.listener.server)
+        port = sock[2]
+        model = Model(
+            id = "gpt-5.3-codex",
+            name = "gpt-5.3-codex",
+            api = "openai-codex-responses",
+            provider = "openai-codex",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        payload = Dict("https://api.openai.com/auth" => Dict("chatgpt_account_id" => "acct-jwt-2"))
+        token = fake_jwt(payload)
+        agent = Agent(
+            id = "codex-retry-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = token,
+            tools = AgentTool[],
+        )
+
+        state = AgentState()
+        result = stream(
+            identity,
+            agent,
+            state,
+            "Say hello",
+            Abort();
+            max_retries = 2,
+            retry_base_ms = 1,
+            retry_max_ms = 2,
+        )
+        @test result isa AgentState
+        @test request_count[] == 2
+        @test length(result.messages) >= 2
+        @test result.messages[end] isa AssistantMessage
+        @test Agentif.message_text(result.messages[end]) == "Hello"
+    finally
+        close(server)
+    end
+end
+
+@testset "openai_codex stream replays SSE body when content-type is missing" begin
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        sse = join([
+            "event: response.created",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}",
+            "event: response.output_item.added",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}",
+            "event: response.output_text.delta",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello from body\"}",
+            "event: response.output_item.done",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello from body\"}]}}",
+            "event: response.completed",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}",
+            "data: [DONE]",
+        ], "\n\n") * "\n\n"
+        return HTTP.Response(200, String[], sse)
+    end
+
+    try
+        sock = HTTP.Sockets.getsockname(server.listener.server)
+        port = sock[2]
+        model = Model(
+            id = "gpt-5.3-codex",
+            name = "gpt-5.3-codex",
+            api = "openai-codex-responses",
+            provider = "openai-codex",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        payload = Dict("https://api.openai.com/auth" => Dict("chatgpt_account_id" => "acct-jwt-4"))
+        token = fake_jwt(payload)
+        agent = Agent(
+            id = "codex-sse-body-replay-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = token,
+            tools = AgentTool[],
+        )
+
+        result = stream(identity, agent, AgentState(), "Say hello", Abort())
+        @test result isa AgentState
+        @test result.messages[end] isa AssistantMessage
+        @test Agentif.message_text(result.messages[end]) == "Hello from body"
+    finally
+        close(server)
+    end
+end
+
+@testset "openai_codex websocket transport" begin
+    request_headers = Ref(Dict{String, String}())
+    request_body = Ref(Dict{String, Any}())
+
+    ws_server = HTTP.WebSockets.listen!("127.0.0.1", 0) do ws
+        request_headers[] = Dict{String, String}(lowercase(String(k)) => String(v) for (k, v) in ws.request.headers)
+        msg = HTTP.WebSockets.receive(ws)
+        data = msg isa AbstractString ? String(msg) : String(msg)
+        request_body[] = JSON.parse(data)
+        events = Any[
+            Dict("type" => "response.output_item.added", "item" => Dict("type" => "message", "id" => "msg_1", "role" => "assistant", "content" => Any[])),
+            Dict("type" => "response.output_text.delta", "delta" => "Hello over ws"),
+            Dict("type" => "response.output_item.done", "item" => Dict("type" => "message", "id" => "msg_1", "role" => "assistant", "content" => Any[Dict("type" => "output_text", "text" => "Hello over ws")])),
+            Dict("type" => "response.completed", "response" => Dict("status" => "completed", "usage" => Dict("input_tokens" => 1, "output_tokens" => 2, "total_tokens" => 3))),
+        ]
+        for event in events
+            HTTP.WebSockets.send(ws, JSON.json(event))
+        end
+        close(ws)
+    end
+
+    try
+        sock = HTTP.Sockets.getsockname(ws_server.listener.server)
+        port = sock[2]
+        model = Model(
+            id = "gpt-5.3-codex",
+            name = "gpt-5.3-codex",
+            api = "openai-codex-responses",
+            provider = "openai-codex",
+            baseUrl = "http://127.0.0.1:$port",
+            reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000,
+            maxTokens = 32000,
+        )
+        payload = Dict("https://api.openai.com/auth" => Dict("chatgpt_account_id" => "acct-jwt-3"))
+        token = fake_jwt(payload)
+        agent = Agent(
+            id = "codex-ws-test",
+            prompt = "You are helpful.",
+            model = model,
+            apikey = token,
+            tools = AgentTool[],
+        )
+
+        state = AgentState()
+        result = stream(identity, agent, state, "Say hello", Abort(); transport = "websocket", session_id = "ws-123")
+        @test result isa AgentState
+        @test result.messages[end] isa AssistantMessage
+        @test Agentif.message_text(result.messages[end]) == "Hello over ws"
+        @test get(() -> nothing, request_body[], "type") == "response.create"
+        @test get(() -> nothing, request_body[], "prompt_cache_key") == "ws-123"
+        @test request_headers[]["openai-beta"] == "responses_websockets=2026-02-06"
+        @test request_headers[]["chatgpt-account-id"] == "acct-jwt-3"
+    finally
+        close(ws_server)
+    end
 end
