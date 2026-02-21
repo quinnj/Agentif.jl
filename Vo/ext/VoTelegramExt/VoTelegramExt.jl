@@ -19,19 +19,15 @@ mutable struct TelegramChannel <: Agentif.AbstractChannel
     chat_type::String
 end
 
-function Agentif.start_streaming(ch::TelegramChannel)
-    if ch.sm === nothing
-        ch.sm = Telegram.with_client(ch.client) do
-            Telegram.send_streaming_message(ch.chat_id)
-        end
-    end
-end
+Agentif.start_streaming(::TelegramChannel) = nothing
 
 function Agentif.append_to_stream(ch::TelegramChannel, delta::AbstractString)
-    sm = ch.sm
-    sm === nothing && return
     Telegram.with_client(ch.client) do
-        Telegram.append!(sm, delta)
+        if ch.sm === nothing
+            ch.sm = Telegram.send_streaming_message(ch.chat_id, delta)
+        else
+            Telegram.append!(ch.sm, delta)
+        end
     end
 end
 

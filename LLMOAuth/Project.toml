@@ -7,10 +7,10 @@ Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-OAuth = "818da804-8b6f-40df-b4a5-e161c4d67f0f"
+OAuth = "22d8b318-f366-56fb-a292-a93f7d76c017"
 
 [sources]
-OAuth = {url = "https://github.com/JuliaServices/OAuth.jl.git"}
+OAuth = {url = "https://github.com/JuliaServices/OAuth.jl.git", rev = "main"}
 
 [compat]
 HTTP = "1"
