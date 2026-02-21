@@ -29,6 +29,9 @@ function close_channel end
 # channel_id(ch) -> String (stable identifier for session mapping)
 function channel_id end
 channel_id(::AbstractChannel) = "default"
+# channel_name(ch) -> String (human-readable display name)
+function channel_name end
+channel_name(ch::AbstractChannel) = channel_id(ch)
 
 # --- Group/privacy/user interface ---
 # These have sensible defaults for backward compatibility (single-user DM behavior).

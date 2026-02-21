@@ -14,7 +14,7 @@ if tmux has-session -t "${SESSION_NAME}" 2>/dev/null; then
 fi
 
 CMD="cd \"${SCRIPT_DIR}\" && julia --startup-file=no --project=. -e \"using Pkg; Pkg.instantiate()\" && exec julia --startup-file=no --project=. runner.jl"
-tmux new-session -d -s "${SESSION_NAME}" "zsh -lc '${CMD}'"
+tmux new-session -d -s "${SESSION_NAME}" "zsh -lic '${CMD}'"
 
 echo "Started tmux session '${SESSION_NAME}'"
 echo "Attach with: tmux attach -t ${SESSION_NAME}"

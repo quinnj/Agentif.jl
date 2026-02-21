@@ -18,6 +18,7 @@ mutable struct MattermostChannel <: Agentif.AbstractChannel
     user_id::String
     user_name::String
     channel_type::String  # "O" = public, "P" = private, "D" = DM, "G" = group DM
+    display_name::String
 end
 
 function Agentif.start_streaming(ch::MattermostChannel)
@@ -54,6 +55,7 @@ function Agentif.channel_id(ch::MattermostChannel)
     return isempty(ch.root_id) ? base : "$(base):$(ch.root_id)"
 end
 
+Agentif.channel_name(ch::MattermostChannel) = ch.display_name
 Agentif.is_group(ch::MattermostChannel) = ch.channel_type in ("O", "P", "G")
 Agentif.is_private(ch::MattermostChannel) = ch.channel_type != "O"
 
@@ -131,7 +133,18 @@ Keep your response concise."""
 
 # ─── EventSource ───
 
-struct MattermostEventSource <: Vo.EventSource end
+mutable struct MattermostEventSource <: Vo.EventSource
+    client::Union{Nothing, Mattermost.Client}
+    bot_user_id::Union{Nothing, String}
+end
+MattermostEventSource() = MattermostEventSource(nothing, nothing)
+
+function Vo.get_channels(source::MattermostEventSource)
+    source.client === nothing && return Agentif.AbstractChannel[]
+    Mattermost.with_client(source.client) do
+        _fetch_channels(source.client, source.bot_user_id)
+    end
+end
 
 Vo.get_event_types(::MattermostEventSource) = Vo.EventType[MESSAGE_EVENT_TYPE, REACTION_EVENT_TYPE]
 
@@ -168,7 +181,7 @@ function _handle_posted(event, bot_user_id, bot_username, assistant)
 
     @info "VoMattermostExt: message" channel_id post_id direct_ping
 
-    ch = MattermostChannel(channel_id, root_id, post_id, Mattermost._get_client(), nothing, user_id, user_name, channel_type)
+    ch = MattermostChannel(channel_id, root_id, post_id, Mattermost._get_client(), nothing, user_id, user_name, channel_type, "")
     put!(assistant.event_queue, MattermostMessageEvent(ch, message, direct_ping))
 end
 
@@ -205,7 +218,7 @@ function _handle_reaction(event, bot_user_id, assistant)
 
     @info "VoMattermostExt: reaction" emoji=emoji_name post_id channel_id user_id
 
-    ch = MattermostChannel(channel_id, root_id, post_id, Mattermost._get_client(), nothing, user_id, user_name, "")
+    ch = MattermostChannel(channel_id, root_id, post_id, Mattermost._get_client(), nothing, user_id, user_name, "", "")
     put!(assistant.event_queue, MattermostReactionEvent(ch, emoji_name, user_name, reacted_to))
 end
 
@@ -237,12 +250,25 @@ end
 
 # ─── start! ───
 
-function Vo.start!(::MattermostEventSource, assistant::Vo.AgentAssistant)
+function _fetch_channels(client::Mattermost.Client, bot_user_id::String)
+    channels = MattermostChannel[]
+    teams = Mattermost.get_teams()
+    for team in teams
+        for mm_ch in Mattermost.get_channels_for_user(bot_user_id, team.id)
+            push!(channels, MattermostChannel(mm_ch.id, "", "", client, nothing, "", "", mm_ch.type, mm_ch.display_name))
+        end
+    end
+    return channels
+end
+
+function Vo.start!(source::MattermostEventSource, assistant::Vo.AgentAssistant)
     errormonitor(Threads.@spawn begin
         Mattermost.with_mattermost(ENV["MATTERMOST_TOKEN"], ENV["MATTERMOST_URL"]) do
             me = Mattermost.get_me()
             bot_user_id = me.id
             bot_username = me.username !== nothing ? lowercase(string(me.username)) : ""
+            source.client = Mattermost._get_client()
+            source.bot_user_id = bot_user_id
             @info "VoMattermostExt: Bot user: $(me.username) ($(bot_user_id))"
 
             Mattermost.run_websocket() do event

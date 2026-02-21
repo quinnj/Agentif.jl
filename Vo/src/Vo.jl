@@ -13,7 +13,7 @@ export EventSource, Event, ChannelEvent, EventType, EventHandler
 export AgentConfig, AgentAssistant
 export get_channels, get_event_types, get_event_handlers, get_tools
 export get_name, get_channel, event_content, get_session_key
-export register_event_source!, register_event_handler!, unregister_event_handler!
+export register_event_source!, register_channels!, register_event_handler!, unregister_event_handler!
 export evaluate, init!, run, start!, get_current_assistant, scrub_post!
 export ReplChannel, ReplEventSource, ReplInputEvent
 export @a_str
@@ -100,14 +100,7 @@ function _init_vo_schema!(db::SQLite.DB)
     SQLite.DBInterface.execute(db, "PRAGMA foreign_keys=ON")
     SQLite.DBInterface.execute(db, "PRAGMA busy_timeout=5000")
 
-    SQLite.DBInterface.execute(db, """
-        CREATE TABLE IF NOT EXISTS vo_channels (
-            id TEXT PRIMARY KEY,
-            type_name TEXT NOT NULL,
-            is_group INTEGER NOT NULL DEFAULT 0,
-            is_private INTEGER NOT NULL DEFAULT 1
-        )
-    """)
+    SQLite.DBInterface.execute(db, "DROP TABLE IF EXISTS vo_channels")
 
     SQLite.DBInterface.execute(db, """
         CREATE TABLE IF NOT EXISTS vo_event_types (
@@ -200,13 +193,11 @@ end
 # ─── Registration ───
 
 function register_event_source!(assistant::AgentAssistant, es::EventSource)
+    register_event_source!(es)
     db = assistant.db
     for ch in get_channels(es)
         id = Agentif.channel_id(ch)
         assistant._channels[id] = ch
-        SQLite.DBInterface.execute(db,
-            "INSERT OR IGNORE INTO vo_channels (id, type_name, is_group, is_private) VALUES (?, ?, ?, ?)",
-            (id, string(nameof(typeof(ch))), Int(Agentif.is_group(ch)), Int(Agentif.is_private(ch))))
     end
     for et in get_event_types(es)
         SQLite.DBInterface.execute(db,
@@ -218,6 +209,13 @@ function register_event_source!(assistant::AgentAssistant, es::EventSource)
     end
     append!(assistant.tools, get_tools(es))
     return es
+end
+
+function register_channels!(assistant::AgentAssistant, channels)
+    for ch in channels
+        id = Agentif.channel_id(ch)
+        assistant._channels[id] = ch
+    end
 end
 
 function _upsert_event_handler!(db::SQLite.DB, eh::EventHandler)
@@ -352,11 +350,21 @@ end
 const LIST_CHANNELS_TOOL = @tool "List all registered messaging channels with their IDs, type, and group/private status. Use the channel ID when calling add_job or add_event_handler." function list_channels()
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
+    # Refresh channels from all event sources
+    lock(EVENT_SOURCES_LOCK) do
+        for es in EVENT_SOURCES
+            for ch in get_channels(es)
+                a._channels[Agentif.channel_id(ch)] = ch
+            end
+        end
+    end
     lines = String[]
-    for row in SQLite.DBInterface.execute(a.db, "SELECT id, type_name, is_group, is_private FROM vo_channels")
-        group = row.is_group == 1 ? "group" : "direct"
-        privacy = row.is_private == 1 ? "private" : "public"
-        push!(lines, "- $(row.id) ($(row.type_name), $group, $privacy)")
+    for (id, ch) in sort!(collect(a._channels); by=first)
+        name = Agentif.channel_name(ch)
+        group = Agentif.is_group(ch) ? "group" : "direct"
+        privacy = Agentif.is_private(ch) ? "private" : "public"
+        label = name == id ? id : "$name ($id)"
+        push!(lines, "- $label — $group, $privacy")
     end
     isempty(lines) ? "No channels registered" : join(lines, "\n")
 end
@@ -398,9 +406,7 @@ const ADD_EVENT_HANDLER_TOOL = @tool "Register a new event handler. event_type_n
         result === nothing && return "Unknown event type: $n"
     end
     if channel_id !== nothing
-        result = iterate(SQLite.DBInterface.execute(a.db,
-            "SELECT 1 FROM vo_channels WHERE id = ?", (channel_id,)))
-        result === nothing && return "Unknown channel: $channel_id"
+        haskey(a._channels, channel_id) || return "Unknown channel: $channel_id"
     end
     eh = EventHandler(id, names, prompt, channel_id)
     register_event_handler!(a, eh)
@@ -438,9 +444,7 @@ end
 const ADD_JOB_TOOL = @tool "Schedule a recurring job with a cron expression (e.g. '0 9 * * *' for daily at 9am). The job fires the given prompt on the specified channel. Use list_channels to find channel IDs." function add_job(name::String, schedule::String, prompt::String, channel_id::String, timezone::Union{Nothing, String} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
-    result = iterate(SQLite.DBInterface.execute(a.db,
-        "SELECT 1 FROM vo_channels WHERE id = ?", (channel_id,)))
-    result === nothing && return "Unknown channel: $channel_id"
+    haskey(a._channels, channel_id) || return "Unknown channel: $channel_id"
     et_name = "tempus_job:$name"
     SQLite.DBInterface.execute(a.db,
         "INSERT OR IGNORE INTO vo_event_types (name, description) VALUES (?, ?)",
@@ -910,7 +914,6 @@ function init!(db_path::String=""; event_sources=nothing, kwargs...)
     assistant = AgentAssistant(db_path; kwargs...)
     CURRENT_ASSISTANT[] = assistant
     # Purge ephemeral tables (re-populated from EventSources)
-    SQLite.DBInterface.execute(assistant.db, "DELETE FROM vo_channels")
     SQLite.DBInterface.execute(assistant.db, "DELETE FROM vo_event_types")
     for es in sources
         register_event_source!(assistant, es)
