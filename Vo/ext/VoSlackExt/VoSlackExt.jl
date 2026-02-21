@@ -172,12 +172,63 @@ end
 
 _string_or_empty(x) = x === nothing ? "" : String(x)
 
+function _normalize_channel_type(raw::String)
+    value = lowercase(strip(raw))
+    isempty(value) && return ""
+    value == "private_channel" && return "group"
+    value == "dm" && return "im"
+    return value
+end
+
 function _infer_channel_type(channel::String)
     isempty(channel) && return "channel"
     first_char = first(channel)
+    first_char == 'C' && return "channel"
     first_char == 'D' && return "im"
     first_char == 'G' && return "group"
     return "channel"
+end
+
+function _channel_type_from_info(channel_info)
+    channel_info isa AbstractDict || return nothing
+    get(() -> false, channel_info, "is_im") == true && return "im"
+    get(() -> false, channel_info, "is_mpim") == true && return "mpim"
+    get(() -> false, channel_info, "is_group") == true && return "group"
+    if get(() -> false, channel_info, "is_channel") == true
+        return get(() -> false, channel_info, "is_private") == true ? "group" : "channel"
+    end
+    get(() -> false, channel_info, "is_private") == true && return "group"
+    return nothing
+end
+
+function _resolve_channel_type(channel::String, raw_type::String, web_client::Slack.WebClient, channel_type_cache::Dict{String, String})
+    cached = get(() -> "", channel_type_cache, channel)
+    !isempty(cached) && return cached
+
+    normalized = _normalize_channel_type(raw_type)
+    inferred = isempty(normalized) ? _infer_channel_type(channel) : normalized
+    if inferred == "im"
+        channel_type_cache[channel] = inferred
+        return inferred
+    end
+
+    needs_metadata_lookup = isempty(normalized) || normalized in ("channel", "group")
+    if !needs_metadata_lookup
+        channel_type_cache[channel] = inferred
+        return inferred
+    end
+
+    resolved = inferred
+    try
+        info_response = Slack.conversations_info(web_client; channel=channel)
+        channel_info = get(() -> nothing, info_response, "channel")
+        inferred_info = _channel_type_from_info(channel_info)
+        inferred_info !== nothing && (resolved = inferred_info)
+    catch e
+        @debug "VoSlackExt: failed to resolve channel metadata" channel exception=e
+    end
+    channel_type_cache[channel] = resolved
+    return resolved
 end
 
 function _payload_event(payload)
@@ -201,7 +252,8 @@ function _event_type(event)
 end
 
 function _extract_message_event(event, web_client::Slack.WebClient, bot_user_id::String, bot_username::String,
-        recipient_team_id::Union{Nothing, String}, recipient_user_id::Union{Nothing, String})
+        recipient_team_id::Union{Nothing, String}, recipient_user_id::Union{Nothing, String},
+        channel_type_cache::Dict{String, String}=Dict{String, String}())
     event === nothing && return nothing
     event_type = _event_type(event)
     (event_type == "message" || event_type == "app_mention") || return nothing
@@ -221,7 +273,6 @@ function _extract_message_event(event, web_client::Slack.WebClient, bot_user_id:
         thread_ts = _string_or_empty(event.thread_ts)
         ts = _string_or_empty(event.ts)
         user_id = _string_or_empty(event.user)
-        channel_type = _infer_channel_type(channel)
     elseif event isa Slack.SlackMessageEvent
         text = _string_or_empty(event.text)
         channel = _string_or_empty(event.channel)
@@ -231,7 +282,6 @@ function _extract_message_event(event, web_client::Slack.WebClient, bot_user_id:
         bot_id = _string_or_empty(event.bot_id)
         user_id = _string_or_empty(event.user)
         channel_type = _string_or_empty(event.channel_type)
-        isempty(channel_type) && (channel_type = _infer_channel_type(channel))
     elseif event isa AbstractDict
         text = _string_or_empty(get(() -> "", event, "text"))
         channel = _string_or_empty(get(() -> "", event, "channel"))
@@ -241,7 +291,6 @@ function _extract_message_event(event, web_client::Slack.WebClient, bot_user_id:
         bot_id = _string_or_empty(get(() -> "", event, "bot_id"))
         user_id = _string_or_empty(get(() -> "", event, "user"))
         channel_type = _string_or_empty(get(() -> "", event, "channel_type"))
-        isempty(channel_type) && (channel_type = _infer_channel_type(channel))
     else
         return nothing
     end
@@ -253,6 +302,7 @@ function _extract_message_event(event, web_client::Slack.WebClient, bot_user_id:
     !isempty(bot_id) && return nothing
     !isempty(bot_user_id) && lowercase(user_id) == lowercase(bot_user_id) && return nothing
     isempty(thread_ts) && (thread_ts = ts)
+    channel_type = _resolve_channel_type(channel, channel_type, web_client, channel_type_cache)
 
     mention_token = isempty(bot_user_id) ? "" : "<@" * lowercase(bot_user_id) * ">"
     lower_text = lowercase(text)
@@ -267,7 +317,8 @@ function _extract_message_event(event, web_client::Slack.WebClient, bot_user_id:
 end
 
 function _extract_reaction_event(event, web_client::Slack.WebClient, bot_user_id::String,
-        recipient_team_id::Union{Nothing, String}, recipient_user_id::Union{Nothing, String})
+        recipient_team_id::Union{Nothing, String}, recipient_user_id::Union{Nothing, String},
+        channel_type_cache::Dict{String, String}=Dict{String, String}())
     event isa AbstractDict || return nothing
     _event_type(event) == "reaction_added" || return nothing
 
@@ -285,7 +336,7 @@ function _extract_reaction_event(event, web_client::Slack.WebClient, bot_user_id
         return nothing
     end
 
-    channel_type = _infer_channel_type(channel)
+    channel_type = _resolve_channel_type(channel, "", web_client, channel_type_cache)
     user_name = user_id
     ch = SlackChannel(channel, reacted_to_ts, reacted_to_ts, web_client, nothing, nothing, user_id, user_name, channel_type, recipient_team_id, recipient_user_id)
     return SlackReactionEvent(ch, emoji, user_name, reacted_to_ts)
@@ -293,7 +344,7 @@ end
 
 function _handle_request(request::Slack.SocketModeRequest, web_client::Slack.WebClient, bot_user_id::String, bot_username::String,
         recipient_team_id::Union{Nothing, String}, recipient_user_id::Union{Nothing, String},
-        assistant::Vo.AgentAssistant)
+        assistant::Vo.AgentAssistant, channel_type_cache::Dict{String, String}=Dict{String, String}())
     request.type == "events_api" || return
     payload = request.payload
     payload === nothing && return
@@ -301,27 +352,14 @@ function _handle_request(request::Slack.SocketModeRequest, web_client::Slack.Web
     event === nothing && return
     event_type = _event_type(event)
 
-    message_event = _extract_message_event(event, web_client, bot_user_id, bot_username, recipient_team_id, recipient_user_id)
+    message_event = _extract_message_event(event, web_client, bot_user_id, bot_username, recipient_team_id, recipient_user_id, channel_type_cache)
     if message_event !== nothing
         ch = message_event.channel
-        # Deterministic routing to avoid double-processing the same human message:
-        # - group/public: use app_mention events
-        # - direct messages: use message events
-        if event_type == "message" && ch.channel_type != "im"
-            return nothing
-        end
-        if event_type == "app_mention" && ch.channel_type == "im"
-            return nothing
-        end
-        is_group_message = Agentif.is_group(ch)
-        if is_group_message && !message_event.direct_ping
-            return nothing
-        end
         @info "VoSlackExt: message" channel=ch.channel thread_ts=ch.thread_ts user_id=ch.user_id direct_ping=message_event.direct_ping event_type
         put!(assistant.event_queue, message_event)
     end
 
-    reaction_event = _extract_reaction_event(event, web_client, bot_user_id, recipient_team_id, recipient_user_id)
+    reaction_event = _extract_reaction_event(event, web_client, bot_user_id, recipient_team_id, recipient_user_id, channel_type_cache)
     if reaction_event !== nothing
         ch = reaction_event.channel
         @info "VoSlackExt: reaction" channel=ch.channel thread_ts=ch.thread_ts emoji=reaction_event.emoji user_id=ch.user_id
@@ -341,6 +379,7 @@ function Vo.start!(source::SlackEventSource, assistant::Vo.AgentAssistant)
 
     errormonitor(Threads.@spawn begin
         web_client = Slack.WebClient(; token=bot_token)
+        channel_type_cache = Dict{String, String}()
         bot_user_id = string(strip(source.bot_user_id))
         bot_username = lowercase(strip(source.bot_username))
         recipient_team_id = let v = strip(source.recipient_team_id); isempty(v) ? nothing : String(v); end
@@ -355,7 +394,7 @@ function Vo.start!(source::SlackEventSource, assistant::Vo.AgentAssistant)
                     @warn "VoSlackExt: failed to ack request" exception=(e, catch_backtrace())
                 end
             end
-            _handle_request(request, web_client, bot_user_id, bot_username, recipient_team_id, recipient_user_id, assistant)
+            _handle_request(request, web_client, bot_user_id, bot_username, recipient_team_id, recipient_user_id, assistant, channel_type_cache)
         end
     end)
 end

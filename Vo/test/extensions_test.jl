@@ -21,6 +21,7 @@ using Vo
     @test any(h -> h.id == "slack_reaction_default", handlers)
 
     web_client = Slack.WebClient(; token="xoxb-test")
+    channel_type_cache = Dict("C123" => "channel", "C555" => "group", "C999" => "group")
 
     msg = Slack.SlackMessageEvent(
         type="message",
@@ -30,13 +31,26 @@ using Vo
         text="hello",
         ts="1700000000.123",
     )
-    msg_event = ext._extract_message_event(msg, web_client, "", "", nothing, nothing)
+    msg_event = ext._extract_message_event(msg, web_client, "", "", nothing, nothing, channel_type_cache)
     @test msg_event !== nothing
     @test Vo.get_name(msg_event) == "slack_message"
     @test Agentif.channel_id(Vo.get_channel(msg_event)) == "slack:C123:1700000000.123"
     @test !msg_event.direct_ping
     @test Agentif.source_message_id(Vo.get_channel(msg_event)) == "1700000000.123"
     @test Vo.event_content(msg_event) == "[U123]: hello"
+
+    private_msg = Slack.SlackMessageEvent(
+        type="message",
+        channel="C555",
+        channel_type="private_channel",
+        user="U555",
+        text="private hello",
+        ts="1700000000.777",
+    )
+    private_msg_event = ext._extract_message_event(private_msg, web_client, "", "", nothing, nothing, channel_type_cache)
+    @test private_msg_event !== nothing
+    @test Agentif.is_group(Vo.get_channel(private_msg_event))
+    @test Agentif.is_private(Vo.get_channel(private_msg_event))
 
     mention = Slack.SlackAppMentionEvent(
         type="app_mention",
@@ -45,7 +59,7 @@ using Vo
         text="<@UBOT> hi",
         ts="1700000001.456",
     )
-    mention_event = ext._extract_message_event(mention, web_client, "UBOT", "vo", nothing, nothing)
+    mention_event = ext._extract_message_event(mention, web_client, "UBOT", "vo", nothing, nothing, channel_type_cache)
     @test mention_event !== nothing
     @test mention_event.direct_ping
 
@@ -57,7 +71,7 @@ using Vo
         text="ignore me",
         ts="1700000002.789",
     )
-    @test ext._extract_message_event(bot_msg, web_client, "", "", nothing, nothing) === nothing
+    @test ext._extract_message_event(bot_msg, web_client, "", "", nothing, nothing, channel_type_cache) === nothing
 
     reaction_payload = Slack.JSON.Object(
         "type" => "reaction_added",
@@ -69,10 +83,33 @@ using Vo
             "ts" => "1700000000.123",
         ),
     )
-    reaction_event = ext._extract_reaction_event(reaction_payload, web_client, "", nothing, nothing)
+    reaction_event = ext._extract_reaction_event(reaction_payload, web_client, "", nothing, nothing, channel_type_cache)
     @test reaction_event !== nothing
     @test Vo.get_name(reaction_event) == "slack_reaction"
     @test occursin("thumbsup", Vo.event_content(reaction_event))
+    @test !Agentif.is_private(Vo.get_channel(reaction_event))
+
+    private_reaction_payload = Slack.JSON.Object(
+        "type" => "reaction_added",
+        "user" => "U333",
+        "reaction" => "eyes",
+        "item" => Slack.JSON.Object(
+            "type" => "message",
+            "channel" => "C999",
+            "ts" => "1700000010.999",
+        ),
+    )
+    private_reaction = ext._extract_reaction_event(private_reaction_payload, web_client, "", nothing, nothing, channel_type_cache)
+    @test private_reaction !== nothing
+    @test Agentif.is_group(Vo.get_channel(private_reaction))
+    @test Agentif.is_private(Vo.get_channel(private_reaction))
+
+    @test ext._channel_type_from_info(Dict("is_im" => true)) == "im"
+    @test ext._channel_type_from_info(Dict("is_channel" => true, "is_private" => false)) == "channel"
+    @test ext._channel_type_from_info(Dict("is_channel" => true, "is_private" => true)) == "group"
+    @test ext._channel_type_from_info(Dict("is_mpim" => true)) == "mpim"
+    @test ext._channel_type_from_info(Dict("is_group" => true)) == "group"
+    @test ext._channel_type_from_info(nothing) === nothing
 
     assistant = Vo.AgentAssistant(":memory:";
         provider="openai-completions",
@@ -80,7 +117,7 @@ using Vo
         apikey="test-key",
     )
 
-    # Group non-mention message should be ignored by default
+    # Group non-mention message should enqueue; group prompt decides whether to stay silent.
     group_request = Slack.SocketModeRequest(
         type="events_api",
         envelope_id="env-1",
@@ -97,10 +134,13 @@ using Vo
             ),
         ),
     )
-    ext._handle_request(group_request, web_client, "", "", nothing, nothing, assistant)
-    @test !isready(assistant.event_queue)
+    ext._handle_request(group_request, web_client, "", "", nothing, nothing, assistant, channel_type_cache)
+    @test isready(assistant.event_queue)
+    ev_group = take!(assistant.event_queue)
+    @test ev_group isa ext.SlackMessageEvent
+    @test !ev_group.direct_ping
 
-    # Mention in channel should enqueue
+    # Mention in channel should also enqueue.
     mention_request = Slack.SocketModeRequest(
         type="events_api",
         envelope_id="env-2",
@@ -116,13 +156,14 @@ using Vo
             ),
         ),
     )
-    ext._handle_request(mention_request, web_client, "UBOT", "", nothing, nothing, assistant)
+    ext._handle_request(mention_request, web_client, "UBOT", "", nothing, nothing, assistant, channel_type_cache)
     @test isready(assistant.event_queue)
     ev = take!(assistant.event_queue)
     @test ev isa ext.SlackMessageEvent
+    @test ev.direct_ping
 
-    # Re-delivery of same mention is still a processable app_mention event
-    ext._handle_request(mention_request, web_client, "UBOT", "", nothing, nothing, assistant)
+    # Re-delivery of same mention is still a processable event.
+    ext._handle_request(mention_request, web_client, "UBOT", "", nothing, nothing, assistant, channel_type_cache)
     @test isready(assistant.event_queue)
     ev2 = take!(assistant.event_queue)
     @test ev2 isa ext.SlackMessageEvent

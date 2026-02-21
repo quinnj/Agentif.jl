@@ -3,6 +3,7 @@ using Agentif
 using Base64
 using HTTP
 using JSON
+using LLMOAuth
 using LocalSearch
 using SQLite
 
@@ -45,6 +46,25 @@ function fake_jwt(payload::AbstractDict)
     encoded = replace(encoded, "=" => "")
     return "header.$encoded.signature"
 end
+
+const CODEX_OAUTH_TEST_TOKEN = fake_jwt(Dict("https://api.openai.com/auth" => Dict("chatgpt_account_id" => "acct-jwt-1")))
+
+struct MockOAuthBackend <: Agentif.AbstractOAuthBackend end
+
+Agentif.get_codex_token(::MockOAuthBackend) = CODEX_OAUTH_TEST_TOKEN
+Agentif.get_anthropic_token(::MockOAuthBackend) = "anthropic-token"
+
+function with_oauth_backend(f::Function, backend::Agentif.AbstractOAuthBackend)
+    previous = Agentif.OAUTH_BACKEND[]
+    Agentif.OAUTH_BACKEND[] = backend
+    try
+        return f()
+    finally
+        Agentif.OAUTH_BACKEND[] = previous
+    end
+end
+
+with_oauth_backend(backend::Agentif.AbstractOAuthBackend, f::Function) = with_oauth_backend(f, backend)
 
 function make_base_handler(; with_tool_call::Bool = false, call_counter = Ref(0), inputs = Agentif.AgentTurnInput[])
     return function (f, agent::Agent, state::AgentState, current_input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
@@ -818,6 +838,14 @@ end
     @test_throws ArgumentError Agentif.normalize_codex_transport("bogus")
 end
 
+@testset "oauth apikey resolution" begin
+    @test Base.get_extension(Agentif, :AgentifLLMOAuthExt) !== nothing
+    @test Agentif.resolve_oauth_apikey(:codex, "explicit-token") == "explicit-token"
+    @test with_oauth_backend(MockOAuthBackend(), () -> Agentif.resolve_oauth_apikey(:codex, "OAUTH")) == CODEX_OAUTH_TEST_TOKEN
+    @test with_oauth_backend(MockOAuthBackend(), () -> Agentif.resolve_oauth_apikey(:anthropic, "OAUTH")) == "anthropic-token"
+    @test_throws ArgumentError Agentif.resolve_oauth_apikey(:unknown, "OAUTH")
+end
+
 @testset "openai_codex stream infers account_id from JWT" begin
     request_headers = Ref(Dict{String, String}())
     request_body = Ref(Dict{String, Any}())
@@ -850,18 +878,18 @@ end
             contextWindow = 128000,
             maxTokens = 32000,
         )
-        payload = Dict("https://api.openai.com/auth" => Dict("chatgpt_account_id" => "acct-jwt-1"))
-        token = fake_jwt(payload)
         agent = Agent(
             id = "codex-jwt-test",
             prompt = "You are helpful.",
             model = model,
-            apikey = token,
+            apikey = "OAUTH",
             tools = AgentTool[],
         )
 
         state = AgentState()
-        result = stream(identity, agent, state, "Say hello", Abort(); session_id = "sess-123", reasoning = "minimal")
+        result = with_oauth_backend(MockOAuthBackend()) do
+            stream(identity, agent, state, "Say hello", Abort(); session_id = "sess-123", reasoning = "minimal")
+        end
         @test result isa AgentState
         @test request_headers[]["chatgpt-account-id"] == "acct-jwt-1"
         @test request_headers[]["session_id"] == "sess-123"

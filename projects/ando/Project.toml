@@ -1,0 +1,12 @@
+[deps]
+LLMOAuth = "f3f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2d"
+Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
+Vo = "46916a23-5c37-4b23-b62b-45b422578c04"
+
+[sources]
+LLMOAuth = {path = "../../LLMOAuth"}
+Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}
+Vo = {path = "../../Vo"}
+
+[compat]
+julia = "1.10"

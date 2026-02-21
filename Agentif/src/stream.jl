@@ -218,6 +218,27 @@ function finalize_stream!(
     return state
 end
 
+abstract type AbstractOAuthBackend end
+struct MissingOAuthBackend <: AbstractOAuthBackend end
+
+const OAUTH_BACKEND = Ref{AbstractOAuthBackend}(MissingOAuthBackend())
+
+get_codex_token(::AbstractOAuthBackend) = throw(ArgumentError("Codex OAuth token provider unavailable; load `LLMOAuth` and run `LLMOAuth.codex_login()` first, or pass an explicit `apikey`"))
+get_anthropic_token(::AbstractOAuthBackend) = throw(ArgumentError("Anthropic OAuth token provider unavailable; load `LLMOAuth` and run `LLMOAuth.anthropic_login()` first, or pass an explicit `apikey`"))
+
+function resolve_oauth_apikey(provider::Symbol, apikey::AbstractString; backend::AbstractOAuthBackend = OAUTH_BACKEND[])
+    apikey != "OAUTH" && return apikey
+    if provider == :codex
+        token = get_codex_token(backend)
+    elseif provider == :anthropic
+        token = get_anthropic_token(backend)
+    else
+        throw(ArgumentError("Unsupported OAuth provider: $(provider)"))
+    end
+    token isa AbstractString && !isempty(token) || throw(ArgumentError("OAuth token provider for $(provider) must return a non-empty String token"))
+    return token
+end
+
 function stream(
         f::Function, agent::Agent, state::AgentState, input::AgentTurnInput, abort::Abort;
         model::Union{Nothing, Model} = nothing, http_kw = (;), kw...
@@ -505,9 +526,7 @@ function stream(
         return finalize_stream!(state, input, assistant_message, usage, stop_reason)
     elseif model.api == "anthropic-messages"
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
-        if apikey == "OAUTH"
-            apikey = anthropic_login()
-        end
+        apikey = resolve_oauth_apikey(:anthropic, apikey)
         is_oauth = startswith(apikey, "sk-ant-oat")
         tool_name_map, tool_name_reverse_map = anthropic_tool_name_maps(agent.tools, is_oauth)
         tools = anthropic_build_tools(agent.tools, tool_name_map)
@@ -791,6 +810,7 @@ function stream(
         return finalize_stream!(state, input, assistant_message, usage, stop_reason)
     elseif model.api == "openai-codex-responses"
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
+        apikey = resolve_oauth_apikey(:codex, apikey)
         account_id = get(() -> nothing, kw_nt, :account_id)
         account_id === nothing && (account_id = get(() -> nothing, kw_nt, :accountId))
         account_id = resolve_codex_account_id(account_id, String(apikey))

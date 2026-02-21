@@ -1,0 +1,14 @@
+[deps]
+LLMOAuth = "f3f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2d"
+Slack = "4d517630-ce0d-4555-8fa7-416d9f8f5684"
+Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
+Vo = "46916a23-5c37-4b23-b62b-45b422578c04"
+
+[sources]
+LLMOAuth = {path = "../../LLMOAuth"}
+Slack = {url = "https://github.com/quinnj/Slack.jl.git"}
+Telegram = {url = "https://github.com/quinnj/Telegram.jl.git"}
+Vo = {path = "../../Vo"}
+
+[compat]
+julia = "1.10"
