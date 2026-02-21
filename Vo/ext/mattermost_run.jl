@@ -1,12 +1,11 @@
-using Agentif, Vo, Mattermost, Telegram, Dates
+using Agentif, Vo, Mattermost
 
-const MattermostExt = Base.get_extension(Agentif, :AgentifMattermostExt)
+include(joinpath(dirname(pathof(Vo)), "..", "examples", "heartbeat_poll_source.jl"))
 
-Vo.init!(; name="ando")
-Mattermost.with_mattermost(ENV["MATTERMOST_TOKEN"], ENV["MATTERMOST_URL"]) do
-    MattermostExt.run_mattermost_bot(;
-        on_delete = post_id -> Vo.scrub_post_id!(Vo.get_current_assistant(), post_id),
-    ) do msg
-        Vo.evaluate(Vo.get_current_assistant(), msg)
-    end
-end
+const VoMMExt = Base.get_extension(Vo, :VoMattermostExt)
+
+hb = HeartbeatPollSource(interval_minutes=30)
+mm = VoMMExt.MattermostTriggerSource(;
+    on_delete = post_id -> Vo.scrub_post_id!(Vo.get_current_assistant(), post_id),
+)
+Vo.run(; name="ando", event_sources=Vo.EventSource[hb, mm])

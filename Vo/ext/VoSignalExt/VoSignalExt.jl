@@ -1,37 +1,12 @@
-module AgentifSignalExt
+module VoSignalExt
 
 using Signal
 import Agentif
-using Logging
-using ScopedValues: @with
+import Vo
+export SignalTriggerSource
 
-export run_signal_bot
+# === Channel (unchanged from AgentifSignalExt) ===
 
-"""
-    run_signal_bot(handler; number=ENV["SIGNAL_NUMBER"], base_url=ENV["SIGNAL_API_URL"], kwargs...)
-
-Start a Signal bot that listens for incoming messages via WebSocket and calls
-`handler(text::String)` for each one, with the appropriate `AbstractChannel`
-scoped via `Agentif.with_channel`.
-
-Requires a signal-cli-rest-api instance running in json-rpc mode.
-"""
-function run_signal_bot(handler::Function;
-        number::AbstractString = ENV["SIGNAL_NUMBER"],
-        base_url::AbstractString = get(ENV, "SIGNAL_API_URL", "http://127.0.0.1:8080"),
-        error_handler::Union{Function, Nothing} = nothing,
-        kwargs...)
-    @info "AgentifSignalExt: Starting Signal bot" number=number base_url=base_url
-
-    Signal.with_signal(String(number); base_url=String(base_url)) do
-        Signal.run_websocket(; error_handler, kwargs...) do envelope
-            _handle_envelope(handler, envelope)
-        end
-    end
-end
-
-# SignalChannel — streams responses to a Signal conversation
-# Note: Signal has no concept of "public" groups — all groups are private.
 mutable struct SignalChannel <: Agentif.AbstractChannel
     recipient::String
     client::Signal.Client
@@ -47,20 +22,21 @@ function Agentif.start_streaming(ch::SignalChannel)
             Signal.send_streaming_message(ch.recipient)
         end
     end
-    return ch.sm
 end
 
-function Agentif.append_to_stream(ch::SignalChannel, sm::Signal.StreamingMessage, delta::AbstractString)
+function Agentif.append_to_stream(ch::SignalChannel, delta::AbstractString)
+    sm = ch.sm
+    sm === nothing && return
     Signal.with_client(ch.client) do
         append!(sm, String(delta))
     end
 end
 
-function Agentif.finish_streaming(::SignalChannel, ::Signal.StreamingMessage)
-    return nothing
-end
+Agentif.finish_streaming(::SignalChannel) = nothing
 
-function Agentif.close_channel(ch::SignalChannel, sm::Signal.StreamingMessage)
+function Agentif.close_channel(ch::SignalChannel)
+    sm = ch.sm
+    sm === nothing && return
     Signal.with_client(ch.client) do
         Signal.finish!(sm)
     end
@@ -82,7 +58,6 @@ function Agentif.is_group(ch::SignalChannel)
 end
 
 function Agentif.is_private(ch::SignalChannel)
-    # Signal groups are always private (no public channel concept)
     return true
 end
 
@@ -98,12 +73,10 @@ function _handle_envelope(handler::Function, envelope::Signal.Envelope)
     text = dm.message
     (text === nothing || isempty(text)) && return
 
-    # Extract user identity
     user_id = envelope.sourceNumber !== nothing ? string(envelope.sourceNumber) :
               envelope.source !== nothing ? string(envelope.source) : ""
     user_name = envelope.sourceName !== nothing ? string(envelope.sourceName) : user_id
 
-    # Determine reply target: group or direct
     is_group_chat = dm.groupInfo !== nothing && dm.groupInfo.groupId !== nothing
     recipient = if is_group_chat
         Signal.group_recipient(dm.groupInfo.groupId)
@@ -112,19 +85,45 @@ function _handle_envelope(handler::Function, envelope::Signal.Envelope)
         user_id
     end
 
-    # Detect direct ping: DM (non-group) is always direct; Signal has no @mention concept
     direct_ping = !is_group_chat
 
-    @info "AgentifSignalExt: Processing message" recipient=recipient user_id=user_id is_group=is_group_chat direct_ping=direct_ping text_length=length(text)
+    @info "VoSignalExt: Processing message" recipient=recipient user_id=user_id is_group=is_group_chat direct_ping=direct_ping text_length=length(text)
 
     Threads.@spawn try
         ch = SignalChannel(recipient, Signal._get_client(), nothing, user_id, user_name, is_group_chat)
         Agentif.with_channel(ch) do
-            @with Agentif.DIRECT_PING => direct_ping handler(text)
+            handler(text)
         end
     catch e
-        @error "AgentifSignalExt: handler error" recipient=recipient exception=(e, catch_backtrace())
+        @error "VoSignalExt: handler error" recipient=recipient exception=(e, catch_backtrace())
     end
 end
 
-end # module AgentifSignalExt
+# === TriggerSource ===
+
+struct SignalTriggerSource <: Vo.TriggerSource
+    name::String
+    number::String
+    base_url::String
+end
+
+function SignalTriggerSource(;
+        name::String="signal",
+        number::AbstractString=ENV["SIGNAL_NUMBER"],
+        base_url::AbstractString=get(ENV, "SIGNAL_API_URL", "http://127.0.0.1:8080"),
+    )
+    SignalTriggerSource(name, String(number), String(base_url))
+end
+
+Vo.source_name(s::SignalTriggerSource) = s.name
+
+function Vo.run(handler::Function, source::SignalTriggerSource)
+    @info "VoSignalExt: Starting Signal bot" number=source.number base_url=source.base_url
+    Signal.with_signal(source.number; base_url=source.base_url) do
+        Signal.run_websocket() do envelope
+            _handle_envelope(handler, envelope)
+        end
+    end
+end
+
+end # module VoSignalExt

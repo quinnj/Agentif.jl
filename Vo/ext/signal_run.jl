@@ -1,8 +1,6 @@
 using Agentif, Vo, Signal
 
-const SignalExt = Base.get_extension(Agentif, :AgentifSignalExt)
+const VoSignalExt = Base.get_extension(Vo, :VoSignalExt)
 
-Vo.init!()
-SignalExt.run_signal_bot() do msg
-    Vo.evaluate(Vo.get_current_assistant(), msg)
-end
+source = VoSignalExt.SignalTriggerSource()
+Vo.run(; event_sources=Vo.EventSource[source])

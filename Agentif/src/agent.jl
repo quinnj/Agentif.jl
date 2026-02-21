@@ -3,7 +3,6 @@ const AgentMiddleware = Function
 
 @kwarg struct Agent
     id::Union{Nothing, String} = nothing
-    name::Union{Nothing, String} = nothing
     prompt::String
     model::Model
     apikey::String
@@ -14,7 +13,6 @@ end
 with_prompt(agent::Agent, prompt::String) = Agent(
     ;
     id = agent.id,
-    name = agent.name,
     prompt,
     model = agent.model,
     apikey = agent.apikey,
@@ -25,7 +23,6 @@ with_prompt(agent::Agent, prompt::String) = Agent(
 with_tools(agent::Agent, tools::Vector{AgentTool}) = Agent(
     ;
     id = agent.id,
-    name = agent.name,
     prompt = agent.prompt,
     model = agent.model,
     apikey = agent.apikey,

@@ -1,8 +1,6 @@
 using Agentif, Vo, Slack
 
-const SlackExt = Base.get_extension(Agentif, :AgentifSlackExt)
+const VoSlackExt = Base.get_extension(Vo, :VoSlackExt)
 
-Vo.init!()
-SlackExt.run_slack_bot() do msg
-    Vo.evaluate(Vo.get_current_assistant(), msg)
-end
+source = VoSlackExt.SlackTriggerSource()
+Vo.run(; event_sources=Vo.EventSource[source])

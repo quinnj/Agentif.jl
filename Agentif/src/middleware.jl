@@ -96,8 +96,41 @@ function evaluate_middleware(agent_handler::AgentHandler)
     end
 end
 
-function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, SessionStore}; session_id::Union{Nothing, String} = nothing)
+function _entry_metadata(ch::Union{Nothing, AbstractChannel})
+    ch === nothing && return nothing, nothing, nothing, nothing
+    user = get_current_user(ch)
+    user_id = user === nothing ? nothing : user.id
+    post_id = source_message_id(ch)
+    flags = (is_private(ch) ? 0x01 : 0x00) | (is_group(ch) ? 0x02 : 0x00)
+    return user_id, post_id, channel_id(ch), Int(flags)
+end
+
+function current_session_entry_metadata()
+    return _entry_metadata(CURRENT_CHANNEL[])
+end
+
+function _create_search_session_tool(store::SessionStore)
+    return @tool(
+        "Search past session history (previous conversations) for relevant context. Returns matching snippets from past interactions.",
+        search_session_history(query::String, limit::Union{Nothing, Int}=nothing) = begin
+            n = limit === nothing ? 10 : limit
+            ch = CURRENT_CHANNEL[]
+            ch_id = ch !== nothing ? channel_id(ch) : nothing
+            results = search_sessions(store, query; limit=n, current_channel_id=ch_id)
+            isempty(results) && return "No matching session history found for: $query"
+            lines = String[]
+            for (i, r) in enumerate(results)
+                push!(lines, "--- Result $i [session: $(r.session_id), score: $(round(r.score; digits=2))] ---")
+                push!(lines, r.entry_text)
+            end
+            return join(lines, "\n\n")
+        end,
+    )
+end
+
+function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, SessionStore}; session_id::Union{Nothing, String} = nothing, channel::Union{Nothing, AbstractChannel} = nothing)
     sid_ref = Ref{Union{Nothing, String}}(session_id)
+    search_tool = store === nothing ? nothing : _create_search_session_tool(store)
     return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; session_id::Union{Nothing, String} = nothing, kw...)
         store === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
         sid = session_id === nothing ? sid_ref[] : ensure_session_id(session_id)
@@ -106,9 +139,14 @@ function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, S
         current_state = load_session(store, sid)
         current_state.session_id = sid
         start_idx = length(current_state.messages)
+        agent = search_tool === nothing ? agent : with_tools(agent, vcat(agent.tools, [search_tool]))
         current_state = agent_handler(f, agent, current_state, current_input, abort; kw...)
         eval_id = CURRENT_EVALUATION_ID[]
         entry_id = eval_id === nothing ? nothing : string(eval_id)
+        # Use directly-provided channel if available; fall back to CURRENT_CHANNEL
+        # (which works when with_channel wraps the outer call, but NOT when
+        # channel_middleware is inner — that @with exits before we reach here).
+        user_id, post_id, current_channel_id, current_channel_flags = _entry_metadata(channel !== nothing ? channel : CURRENT_CHANNEL[])
         if current_state.last_compaction !== nothing
             # Compaction happened: write full state as compaction entry
             entry = SessionEntry(;
@@ -116,12 +154,16 @@ function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, S
                 created_at = time(),
                 messages = copy(current_state.messages),
                 is_compaction = true,
+                user_id = user_id,
+                post_id = post_id,
+                channel_id = current_channel_id,
+                channel_flags = current_channel_flags,
             )
             append_session_entry!(store, sid, entry)
             current_state.last_compaction = nothing
         elseif length(current_state.messages) > start_idx
             new_messages = current_state.messages[(start_idx + 1):end]
-            entry = SessionEntry(; id = entry_id, created_at = time(), messages = new_messages)
+            entry = SessionEntry(; id = entry_id, created_at = time(), messages = new_messages, user_id = user_id, post_id = post_id, channel_id = current_channel_id, channel_flags = current_channel_flags)
             append_session_entry!(store, sid, entry)
         end
         return current_state
@@ -203,7 +245,7 @@ function build_default_handler(
                 inner_handler(f, with_tools(agent, vcat(agent.tools, ch_tools)), state, current_input, abort; kw...)
         end
     end
-    handler = session_middleware(handler, session_store; session_id)
+    handler = session_middleware(handler, session_store; session_id, channel)
     handler = input_guardrail_middleware(handler, input_guardrail)
     handler = skills_middleware(handler, skill_registry)
     handler = evaluate_middleware(handler)

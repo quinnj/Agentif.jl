@@ -28,7 +28,7 @@ export Agent, Abort, abort!, isaborted, AgentHandler, AgentMiddleware
 export evaluate, stream, build_default_handler
 export steer_middleware, tool_call_middleware, queue_middleware, evaluate_middleware, session_middleware
 export input_guardrail_middleware, skills_middleware, compaction_middleware, channel_middleware
-export AbstractChannel, CURRENT_CHANNEL, DIRECT_PING, with_channel, ChannelUser
+export AbstractChannel, CURRENT_CHANNEL, with_channel, ChannelUser
 export start_streaming, append_to_stream, finish_streaming, send_message, close_channel, channel_id
 export is_group, is_private, get_current_user, source_message_id
 export OutputGuardrailAgent, DEFAULT_OUTPUT_GUARDRAIL_AGENT
@@ -49,8 +49,9 @@ export ToolCallRequestEvent, ToolExecutionStartEvent, ToolExecutionEndEvent
 export AgentMessage, UserMessage, AssistantMessage, AgentToolCall, ToolResultMessage, CompactionSummaryMessage
 export message_text, message_thinking
 export AgentState, Usage
-export SessionStore, InMemorySessionStore, FileSessionStore
+export SessionStore, InMemorySessionStore, FileSessionStore, SQLiteSessionStore, init_sqlite_session_schema!
 export SessionEntry, session_entries, session_entry_count, append_session_entry!
 export load_session, save_session!, new_session_id
+export SessionSearchResult, search_sessions, scrub_post!
 
 end

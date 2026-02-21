@@ -16,15 +16,15 @@ struct ChannelUser
 end
 
 # Interface stubs - each channel type should implement these
-# start_streaming(ch) -> stream handle (e.g. IO, StreamingMessage)
+# start_streaming(ch) -> nothing (channel should mutate itself to set up streaming state)
 function start_streaming end
-# append_to_stream(ch, stream, delta) -> nothing
+# append_to_stream(ch, delta) -> nothing
 function append_to_stream end
-# finish_streaming(ch, stream) -> nothing (called per-message on MessageEndEvent)
+# finish_streaming(ch) -> nothing (called per-message on MessageEndEvent)
 function finish_streaming end
 # send_message(ch, msg) -> nothing (non-streaming message)
 function send_message end
-# close_channel(ch, stream) -> nothing (final cleanup in finally block)
+# close_channel(ch) -> nothing (final cleanup in finally block)
 function close_channel end
 # channel_id(ch) -> String (stable identifier for session mapping)
 function channel_id end
@@ -85,45 +85,51 @@ create_channel_tools(::AbstractChannel) = AgentTool[]
 const CURRENT_CHANNEL = ScopedValue{Union{AbstractChannel, Nothing}}(nothing)
 
 """
-    DIRECT_PING
-
-ScopedValue{Bool} indicating whether the current message directly addresses the bot
-(e.g., @mention, DM, or name reference). Set by channel extensions.
-When `true`, the output guard middleware should skip evaluation and always send the response.
-"""
-const DIRECT_PING = ScopedValue{Bool}(false)
-
-"""
     with_channel(f, ch::AbstractChannel)
 
 Execute `f` with `CURRENT_CHANNEL` bound to `ch`.
 """
 with_channel(f, ch::AbstractChannel) = @with CURRENT_CHANNEL => ch f()
 
+"""
+    NO_REPLY_SENTINEL
+
+Single-character sentinel (`∅`, U+2205) that an agent can emit as the first character
+of a response to signal "no output". The channel middleware detects this on the first
+text delta and suppresses the entire response without ever starting to stream.
+Used by group chat prompts to let the agent stay silent when it has nothing to add.
+"""
+const NO_REPLY_SENTINEL = '∅'
+
 function channel_middleware(agent_handler::AgentHandler, ch::Union{Nothing, AbstractChannel})
     return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)
         ch === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
-        stream_ref = Ref{Any}(nothing)
+        streaming = false
+        suppressed = false
         try
             return @with CURRENT_CHANNEL => ch agent_handler(function (event)
                 if event isa MessageStartEvent && event.role == :assistant
-                    stream_ref[] = start_streaming(ch)
+                    streaming = false
+                    suppressed = false
                 elseif event isa MessageUpdateEvent && event.role == :assistant && event.kind == :text
-                    s = stream_ref[]
-                    s !== nothing && append_to_stream(ch, s, event.delta)
+                    if !streaming && !suppressed
+                        if !isempty(event.delta) && event.delta[1] == NO_REPLY_SENTINEL
+                            suppressed = true
+                        else
+                            start_streaming(ch)
+                            streaming = true
+                        end
+                    end
+                    streaming && append_to_stream(ch, event.delta)
                 elseif event isa MessageEndEvent && event.role == :assistant
-                    s = stream_ref[]
-                    s !== nothing && finish_streaming(ch, s)
+                    streaming && finish_streaming(ch)
                 end
                 f(event)
             end, agent, state, current_input, abort; kw...)
         finally
-            s = stream_ref[]
-            if s !== nothing
-                try
-                    close_channel(ch, s)
-                catch
-                end
+            try
+                close_channel(ch)
+            catch
             end
         end
     end

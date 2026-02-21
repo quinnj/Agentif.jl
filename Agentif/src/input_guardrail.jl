@@ -63,7 +63,6 @@ end
 function materialize_guardrail_agent(agent::Agent, guardrail::InputGuardrailAgent; model::Union{Nothing, Model} = nothing, apikey::Union{Nothing, String} = nothing)
     return Agent(;
         id = agent.id,
-        name = agent.name,
         prompt = guardrail.prompt,
         model = model === nothing ? agent.model : model,
         apikey = apikey === nothing ? agent.apikey : apikey,

@@ -1,5 +1,8 @@
 using Test
 using Agentif
+using JSON
+using LocalSearch
+using SQLite
 
 function dummy_model()
     return Model(
@@ -27,7 +30,6 @@ end
 function make_agent(; prompt = "test prompt", tools = AgentTool[])
     return Agent(
         id = "agent-1",
-        name = "agent-1",
         prompt = prompt,
         model = dummy_model(),
         apikey = "test-key",
@@ -56,6 +58,16 @@ function make_base_handler(; with_tool_call::Bool = false, call_counter = Ref(0)
     end
 end
 
+struct SessionTestChannel <: Agentif.AbstractChannel
+    id::String
+    user::Union{Nothing, Agentif.ChannelUser}
+    message_id::Union{Nothing, String}
+end
+
+Agentif.channel_id(ch::SessionTestChannel) = ch.id
+Agentif.get_current_user(ch::SessionTestChannel) = ch.user
+Agentif.source_message_id(ch::SessionTestChannel) = ch.message_id
+
 @testset "stream (MiniMax live)" begin
     provider = get(ENV, "VO_AGENT_PROVIDER", "")
     model_id = get(ENV, "VO_AGENT_MODEL", "")
@@ -69,7 +81,6 @@ end
         tool = @tool "Echo a string." echo(text::String) = text
         agent = Agent(
             id = "live-agent",
-            name = "live-agent",
             prompt = "You must call the echo tool with JSON arguments {\"text\":\"pong\"}. Do not answer directly.",
             model = model,
             apikey = apikey,
@@ -165,6 +176,175 @@ end
     result_state_2 = handler(identity, agent, AgentState(), "again", Abort())
     @test result_state_2.session_id == sid
     @test length(result_state_2.messages) > len1
+end
+
+@testset "SessionEntry metadata serialization" begin
+    entry = SessionEntry(;
+        id = "entry-1",
+        created_at = 123.0,
+        messages = AgentMessage[UserMessage("hello")],
+        is_compaction = false,
+        user_id = "U123",
+        post_id = "P123",
+        channel_id = "chan:123",
+        channel_flags = 0x03,
+    )
+    roundtrip = JSON.parse(JSON.json(entry), SessionEntry)
+    @test roundtrip.user_id == "U123"
+    @test roundtrip.post_id == "P123"
+    @test roundtrip.channel_id == "chan:123"
+    @test roundtrip.channel_flags == 3
+    @test roundtrip.id == "entry-1"
+    @test roundtrip.messages[1] isa UserMessage
+end
+
+@testset "session_middleware captures channel metadata" begin
+    store = InMemorySessionStore()
+    handler = session_middleware(make_base_handler(), store)
+    agent = make_agent()
+    channel = SessionTestChannel("chan:1", Agentif.ChannelUser("U555", "Taylor"), "post-777")
+
+    state = Agentif.with_channel(channel) do
+        handler(identity, agent, AgentState(), "hello", Abort())
+    end
+
+    entries = session_entries(store, state.session_id)
+    @test length(entries) == 1
+    @test entries[1].user_id == "U555"
+    @test entries[1].post_id == "post-777"
+    @test entries[1].channel_id == "chan:1"
+    # SessionTestChannel defaults: is_group=false, is_private=true → flags=0x01
+    @test entries[1].channel_flags == 1
+end
+
+@testset "AgentifSQLiteExt session store" begin
+    @test isdefined(Agentif, :SQLiteSessionStore)
+    store = Agentif.SQLiteSessionStore(tempname(); embed = nothing)
+    db = store.db
+    search_store = store.search_store
+    sid = "session-1"
+
+    entry = SessionEntry(;
+        id = "entry-1",
+        created_at = 1000.5,
+        messages = AgentMessage[UserMessage("hello sqlite world")],
+        user_id = "U100",
+        post_id = "P100",
+        channel_id = "chan:alpha",
+    )
+    append_session_entry!(store, sid, entry)
+
+    channel_entry = SessionEntry(;
+        id = "entry-2",
+        created_at = 1001.5,
+        messages = AgentMessage[UserMessage("second sqlite row")],
+        user_id = "U200",
+        post_id = "P200",
+        channel_id = "chan:beta",
+    )
+    append_session_entry!(store, sid, channel_entry)
+
+    @test session_entry_count(store, sid) == 2
+
+    entries = session_entries(store, sid)
+    @test length(entries) == 2
+    @test entries[1].id == "entry-1"
+    @test entries[1].user_id == "U100"
+    @test entries[1].post_id == "P100"
+    @test entries[1].channel_id == "chan:alpha"
+    @test entries[2].id == "entry-2"
+    @test entries[2].user_id == "U200"
+    @test entries[2].post_id == "P200"
+    @test entries[2].channel_id == "chan:beta"
+
+    row_iter = SQLite.DBInterface.execute(db, "SELECT entry, user_id, post_id, channel_id FROM session_entries WHERE entry_id = ?", ("entry-1",))
+    row = iterate(row_iter)
+    @test row !== nothing
+    parsed = JSON.parse(row[1].entry, SessionEntry)
+    @test parsed.id == "entry-1"
+    @test parsed.user_id == "U100"
+    @test parsed.post_id == "P100"
+    @test parsed.channel_id == "chan:alpha"
+    @test row[1].user_id == "U100"
+    @test row[1].post_id == "P100"
+    @test row[1].channel_id == "chan:alpha"
+
+    results = LocalSearch.search(search_store, "hello sqlite world"; limit = 5)
+    matches = filter(r -> startswith(r.id, "session:$(sid):entry-1"), results)
+    @test !isempty(matches)
+    @test occursin("\"id\":\"entry-1\"", matches[1].text)
+    @test occursin("\"messages\":", matches[1].text)
+    @test occursin("\"channel_id\":\"chan:alpha\"", matches[1].text)
+    tag_rows = SQLite.DBInterface.execute(
+        db,
+        "SELECT dt.tag FROM document_tags dt JOIN documents d ON d.id = dt.document_id WHERE d.key = ?",
+        ("session:$(sid):entry-1",),
+    )
+    tags = String[String(r.tag) for r in tag_rows]
+    @test "session_entry" in tags
+    # entry has no channel_flags → tagged as public
+    @test "session:public" in tags
+    @test "session:ch:chan:alpha" in tags
+end
+
+@testset "AgentifSQLiteExt schema columns" begin
+    ext = Base.get_extension(Agentif, :AgentifSQLiteExt)
+    @test ext !== nothing
+    db = SQLite.DB(tempname())
+    Agentif.init_sqlite_session_schema!(db)
+    cols = Set{String}()
+    for row in SQLite.DBInterface.execute(db, "PRAGMA table_info(session_entries)")
+        push!(cols, String(row.name))
+    end
+    @test "entry" in cols
+    @test "user_id" in cols
+    @test "post_id" in cols
+    @test "channel_id" in cols
+    @test "channel_flags" in cols
+end
+
+@testset "session search channel visibility" begin
+    store = InMemorySessionStore()
+    base_handler = make_base_handler()
+    handler = session_middleware(base_handler, store; session_id = "vis-test")
+    agent = make_agent()
+
+    # Manually append entries with different channel visibility
+    public_entry = SessionEntry(;
+        id = "pub-1", messages = AgentMessage[UserMessage("public info")],
+        channel_id = "chan:public", channel_flags = 0x02,  # is_group=true, is_private=false
+    )
+    private_entry = SessionEntry(;
+        id = "priv-1", messages = AgentMessage[UserMessage("private secret")],
+        channel_id = "chan:dm", channel_flags = 0x01,  # is_group=false, is_private=true
+    )
+    private_group_entry = SessionEntry(;
+        id = "pgrp-1", messages = AgentMessage[UserMessage("private group info")],
+        channel_id = "chan:pgroup", channel_flags = 0x03,  # is_group=true, is_private=true
+    )
+    legacy_entry = SessionEntry(;
+        id = "legacy-1", messages = AgentMessage[UserMessage("legacy data")],
+    )
+    for e in [public_entry, private_entry, private_group_entry, legacy_entry]
+        append_session_entry!(store, "vis-test", e)
+    end
+
+    # No channel context → see everything
+    all_results = search_sessions(store, "info secret data"; limit=10)
+    @test length(all_results) == 4
+
+    # From the public channel → see public + legacy + own channel, NOT other private channels
+    pub_results = search_sessions(store, "info secret data"; limit=10, current_channel_id="chan:public")
+    pub_sids = Set(r.session_id for r in pub_results)
+    @test length(pub_results) == 2  # public_entry + legacy_entry
+
+    # From the DM → see own DM + public + legacy, NOT private group
+    dm_results = search_sessions(store, "info secret data"; limit=10, current_channel_id="chan:dm")
+    @test length(dm_results) == 3  # private_entry + public_entry + legacy_entry
+
+    # From the private group → see own group + public + legacy, NOT DM
+    pgrp_results = search_sessions(store, "info secret data"; limit=10, current_channel_id="chan:pgroup")
+    @test length(pgrp_results) == 3  # private_group_entry + public_entry + legacy_entry
 end
 
 @testset "input_guardrail_middleware" begin
@@ -409,7 +589,7 @@ end
             cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 100000, maxTokens = 4096,
         )
-        agent = Agent(; id = "a", name = "a", prompt = "test", model, apikey = "k")
+        agent = Agent(; id = "a", prompt = "test", model, apikey = "k")
         config = CompactionConfig(; enabled = true, reserve_tokens = 16384, keep_recent_tokens = 5000)
         handler = compaction_middleware(base_handler, config)
 

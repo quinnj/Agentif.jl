@@ -17,30 +17,19 @@ ScopedValues = "7e506255-f358-4e82-b7e4-beb19740aa63"
 StructUtils = "ec057cc2-7a8d-4b58-b3b3-92acb9f63b42"
 
 [weakdeps]
-MSTeams = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
-Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
-Signal = "0944c9af-6677-4ce2-950b-62b1fa25f333"
-Slack = "4d517630-ce0d-4555-8fa7-416d9f8f5684"
-Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
+LocalSearch = "3edf9609-13f2-4288-b0a3-8bd6d521158e"
+SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
 
 [extensions]
-AgentifMSTeamsExt = "MSTeams"
-AgentifMattermostExt = "Mattermost"
-AgentifSignalExt = "Signal"
-AgentifSlackExt = "Slack"
-AgentifTelegramExt = "Telegram"
+AgentifSQLiteExt = ["SQLite", "LocalSearch"]
 
 [sources]
 LLMProviders = {path = "../LLMProviders"}
 Encid = {url = "https://github.com/JuliaServices/Encid.jl.git"}
 HTTP = {url = "https://github.com/JuliaWeb/HTTP.jl.git", rev = "master"}
 JSONSchema = {url = "https://github.com/JuliaIO/JSONSchema.jl.git"}
-MSTeams = {url = "https://github.com/quinnj/MSTeams.jl.git"}
-Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}
+LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}
 PtySessions = {url = "https://github.com/quinnj/PtySessions.jl.git"}
-Signal = {url = "https://github.com/quinnj/Signal.jl.git"}
-Slack = {url = "https://github.com/quinnj/Slack.jl.git"}
-Telegram = {url = "https://github.com/quinnj/Telegram.jl.git"}
 
 [compat]
 Encid = "1.0.0"
@@ -56,12 +45,9 @@ StructUtils = "2.6"
 julia = "1.8"
 
 [extras]
-MSTeams = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
-Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
-Signal = "0944c9af-6677-4ce2-950b-62b1fa25f333"
-Slack = "4d517630-ce0d-4555-8fa7-416d9f8f5684"
-Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
+LocalSearch = "3edf9609-13f2-4288-b0a3-8bd6d521158e"
+SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test"]
+test = ["Test", "SQLite", "LocalSearch"]

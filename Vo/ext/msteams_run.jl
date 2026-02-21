@@ -1,8 +1,6 @@
 using Agentif, Vo, MSTeams
 
-const MSTeamsExt = Base.get_extension(Agentif, :AgentifMSTeamsExt)
+const VoMSTeamsExt = Base.get_extension(Vo, :VoMSTeamsExt)
 
-Vo.init!()
-MSTeamsExt.run_msteams_bot() do msg
-    Vo.evaluate(Vo.get_current_assistant(), msg)
-end
+source = VoMSTeamsExt.MSTeamsTriggerSource()
+Vo.run(; event_sources=Vo.EventSource[source])

@@ -5,9 +5,12 @@ abstract type SessionStore end
     created_at::Float64 = time()
     messages::Vector{AgentMessage} = AgentMessage[]
     is_compaction::Bool = false
+    is_deleted::Bool = false
+    user_id::Union{Nothing, String} = nothing
+    post_id::Union{Nothing, String} = nothing
+    channel_id::Union{Nothing, String} = nothing
+    channel_flags::Union{Nothing, Int} = nothing
 end
-
-JSON.lower(x::SessionEntry) = (; id = x.id, created_at = x.created_at, messages = x.messages, is_compaction = x.is_compaction)
 
 mutable struct InMemorySessionStore <: SessionStore
     lock::ReentrantLock
@@ -30,6 +33,10 @@ function FileSessionStore(directory::AbstractString)
     mkpath(dir)
     return FileSessionStore(dir, ReentrantLock(), Dict{String, Vector{Int64}}(), Dict{String, Int64}(), Set{String}())
 end
+
+# Stubs for package extension (AgentifSQLiteExt)
+function SQLiteSessionStore end
+function init_sqlite_session_schema! end
 
 function ensure_session_id(session_id::String)
     isempty(session_id) && throw(ArgumentError("session_id is required"))
@@ -203,3 +210,101 @@ end
 function new_session_id()
     return string(UID8())
 end
+
+# ─── Session search ───
+
+struct SessionSearchResult
+    session_id::String
+    entry_text::String
+    score::Float64
+end
+
+function _entry_search_text(entry::SessionEntry)
+    parts = String[]
+    for msg in entry.messages
+        push!(parts, message_text(msg))
+        if msg isa AssistantMessage
+            thinking = message_thinking(msg)
+            !isempty(thinking) && push!(parts, thinking)
+        end
+    end
+    return join(parts, "\n")
+end
+
+function _matches_keywords(text::String, keywords::Vector{String})
+    isempty(keywords) && return true
+    text_lower = lowercase(text)
+    return any(kw -> occursin(kw, text_lower), keywords)
+end
+
+function _keyword_score(text::String, keywords::Vector{String})
+    text_lower = lowercase(text)
+    return count(kw -> occursin(kw, text_lower), keywords) / length(keywords)
+end
+
+# Channel visibility: entry is visible if no channel context, or entry is from
+# the current channel, or entry is from a public channel (is_private bit unset).
+# Bitmask: 0x01 = is_private, 0x02 = is_group
+function _visible_entry(entry::SessionEntry, current_channel_id::Union{Nothing, String})
+    current_channel_id === nothing && return true
+    entry.channel_id === nothing && return true
+    entry.channel_flags === nothing && return true
+    entry.channel_id == current_channel_id && return true
+    (entry.channel_flags & 0x01) == 0 && return true
+    return false
+end
+
+# Default: no results
+search_sessions(store::SessionStore, query::String; limit::Int=10, current_channel_id::Union{Nothing, String}=nothing) = SessionSearchResult[]
+
+function search_sessions(store::InMemorySessionStore, query::String; limit::Int=10, current_channel_id::Union{Nothing, String}=nothing)
+    keywords = [lowercase(k) for k in split(strip(query); keepempty=false)]
+    isempty(keywords) && return SessionSearchResult[]
+    results = SessionSearchResult[]
+    lock(store.lock) do
+        for (sid, entries) in store.entries
+            for entry in entries
+                entry.is_deleted && continue
+                _visible_entry(entry, current_channel_id) || continue
+                text = _entry_search_text(entry)
+                if _matches_keywords(text, keywords)
+                    push!(results, SessionSearchResult(sid, text, _keyword_score(text, keywords)))
+                end
+            end
+        end
+    end
+    sort!(results; by=r -> r.score, rev=true)
+    return first(results, min(limit, length(results)))
+end
+
+function search_sessions(store::FileSessionStore, query::String; limit::Int=10, current_channel_id::Union{Nothing, String}=nothing)
+    keywords = [lowercase(k) for k in split(strip(query); keepempty=false)]
+    isempty(keywords) && return SessionSearchResult[]
+    results = SessionSearchResult[]
+    lock(store.lock) do
+        isdir(store.directory) || return results
+        for fname in readdir(store.directory)
+            fpath = joinpath(store.directory, fname)
+            isfile(fpath) || continue
+            for line in eachline(fpath)
+                isempty(strip(line)) && continue
+                entry = try
+                    JSON.parse(line, SessionEntry)
+                catch
+                    continue
+                end
+                entry.is_deleted && continue
+                _visible_entry(entry, current_channel_id) || continue
+                text = _entry_search_text(entry)
+                if _matches_keywords(text, keywords)
+                    push!(results, SessionSearchResult(fname, text, _keyword_score(text, keywords)))
+                end
+            end
+        end
+    end
+    sort!(results; by=r -> r.score, rev=true)
+    return first(results, min(limit, length(results)))
+end
+
+# Default no-op: scrub_post! is implemented by store types that support it
+scrub_post!(store::SessionStore, post_id::String) = nothing
