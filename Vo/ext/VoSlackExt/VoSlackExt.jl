@@ -22,6 +22,7 @@ mutable struct SlackChannel <: Agentif.AbstractChannel
     channel_type::String
     recipient_team_id::Union{Nothing, String}
     recipient_user_id::Union{Nothing, String}
+    display_name::String
 end
 
 const STREAM_BUFFER_SIZE = 32
@@ -93,6 +94,7 @@ function Agentif.channel_id(ch::SlackChannel)
     return isempty(ch.thread_ts) ? base : "$(base):$(ch.thread_ts)"
 end
 
+Agentif.channel_name(ch::SlackChannel) = ch.display_name
 Agentif.is_group(ch::SlackChannel) = ch.channel_type in ("channel", "group", "mpim")
 Agentif.is_private(ch::SlackChannel) = ch.channel_type != "channel"
 
@@ -150,13 +152,42 @@ Keep your response concise."""
 
 # ─── EventSource ───
 
-Base.@kwdef struct SlackEventSource <: Vo.EventSource
+Base.@kwdef mutable struct SlackEventSource <: Vo.EventSource
     app_token::String = get(ENV, "SLACK_APP_TOKEN", "")
     bot_token::String = get(ENV, "SLACK_BOT_TOKEN", "")
     bot_user_id::String = get(ENV, "SLACK_BOT_USER_ID", "")
     bot_username::String = get(ENV, "SLACK_BOT_USERNAME", "")
     recipient_team_id::String = get(ENV, "SLACK_STREAM_RECIPIENT_TEAM_ID", "")
     recipient_user_id::String = get(ENV, "SLACK_STREAM_RECIPIENT_USER_ID", "")
+    web_client::Union{Nothing, Slack.WebClient} = nothing
+end
+
+function _fetch_channels(source::SlackEventSource)
+    wc = source.web_client
+    wc === nothing && return Agentif.AbstractChannel[]
+    channels = SlackChannel[]
+    cursor = nothing
+    while true
+        resp = Slack.conversations_list(wc; types="public_channel,private_channel,mpim,im", limit=200, cursor=cursor)
+        for ch_data in get(() -> [], resp, "channels")
+            ch_id = get(() -> "", ch_data, "id")
+            isempty(ch_id) && continue
+            ch_name = get(() -> "", ch_data, "name")
+            is_im = get(() -> false, ch_data, "is_im")
+            is_mpim = get(() -> false, ch_data, "is_mpim")
+            is_private = get(() -> false, ch_data, "is_private")
+            ch_type = is_im ? "im" : is_mpim ? "mpim" : is_private ? "group" : "channel"
+            push!(channels, SlackChannel(ch_id, "", "", wc, nothing, nothing, "", "", ch_type, nothing, nothing, ch_name))
+        end
+        meta = get(() -> nothing, resp, "response_metadata")
+        cursor = meta !== nothing ? get(() -> "", meta, "next_cursor") : ""
+        (cursor === nothing || isempty(cursor)) && break
+    end
+    return channels
+end
+
+function Vo.get_channels(source::SlackEventSource)
+    _fetch_channels(source)
 end
 
 Vo.get_event_types(::SlackEventSource) = Vo.EventType[MESSAGE_EVENT_TYPE, REACTION_EVENT_TYPE]
@@ -312,7 +343,7 @@ function _extract_message_event(event, web_client::Slack.WebClient, bot_user_id:
         (!isempty(bot_username) && occursin("@" * lowercase(bot_username), lower_text))
 
     user_name = user_id
-    ch = SlackChannel(channel, thread_ts, ts, web_client, nothing, nothing, user_id, user_name, channel_type, recipient_team_id, recipient_user_id)
+    ch = SlackChannel(channel, thread_ts, ts, web_client, nothing, nothing, user_id, user_name, channel_type, recipient_team_id, recipient_user_id, "")
     return SlackMessageEvent(ch, text, direct_ping)
 end
 
@@ -338,7 +369,7 @@ function _extract_reaction_event(event, web_client::Slack.WebClient, bot_user_id
 
     channel_type = _resolve_channel_type(channel, "", web_client, channel_type_cache)
     user_name = user_id
-    ch = SlackChannel(channel, reacted_to_ts, reacted_to_ts, web_client, nothing, nothing, user_id, user_name, channel_type, recipient_team_id, recipient_user_id)
+    ch = SlackChannel(channel, reacted_to_ts, reacted_to_ts, web_client, nothing, nothing, user_id, user_name, channel_type, recipient_team_id, recipient_user_id, "")
     return SlackReactionEvent(ch, emoji, user_name, reacted_to_ts)
 end
 
@@ -379,6 +410,7 @@ function Vo.start!(source::SlackEventSource, assistant::Vo.AgentAssistant)
 
     errormonitor(Threads.@spawn begin
         web_client = Slack.WebClient(; token=bot_token)
+        source.web_client = web_client
         channel_type_cache = Dict{String, String}()
         bot_user_id = string(strip(source.bot_user_id))
         bot_username = lowercase(strip(source.bot_username))
