@@ -18,6 +18,7 @@ mutable struct MSTeamsChannel <: Agentif.AbstractChannel
     conversation_type::String
     message_id::String
     io::Union{Nothing, IOBuffer}
+    display_name::String
 end
 
 function Agentif.start_streaming(ch::MSTeamsChannel)
@@ -49,6 +50,7 @@ function Agentif.send_message(ch::MSTeamsChannel, msg)
 end
 
 Agentif.channel_id(ch::MSTeamsChannel) = "msteams:$(ch.conversation_id)"
+Agentif.channel_name(ch::MSTeamsChannel) = isempty(ch.display_name) ? Agentif.channel_id(ch) : ch.display_name
 Agentif.is_group(ch::MSTeamsChannel) = ch.conversation_type != "personal"
 Agentif.is_private(ch::MSTeamsChannel) = ch.conversation_type in ("personal", "groupChat")
 
@@ -128,9 +130,11 @@ function _conversation_info(activity::AbstractDict)
     conversation = get(() -> nothing, activity, "conversation")
     conversation_id = ""
     conversation_type = "personal"
+    conversation_name = ""
 
     if conversation !== nothing
         conversation_id = _string_or_empty(get(() -> "", conversation, "id"))
+        conversation_name = _string_or_empty(get(() -> "", conversation, "name"))
         ct = _string_or_empty(get(() -> "", conversation, "conversationType"))
         if isempty(ct) && get(() -> false, conversation, "isGroup") === true
             ct = "groupChat"
@@ -138,12 +142,12 @@ function _conversation_info(activity::AbstractDict)
         !isempty(ct) && (conversation_type = ct)
     end
 
-    return conversation_id, conversation_type
+    return conversation_id, conversation_type, conversation_name
 end
 
 function _activity_channel(activity::AbstractDict, client::MSTeams.BotClient, user_id::String, user_name::String, message_id::String)
-    conversation_id, conversation_type = _conversation_info(activity)
-    return MSTeamsChannel(client, activity, user_id, user_name, conversation_id, conversation_type, message_id, nothing)
+    conversation_id, conversation_type, conversation_name = _conversation_info(activity)
+    return MSTeamsChannel(client, activity, user_id, user_name, conversation_id, conversation_type, message_id, nothing, conversation_name)
 end
 
 function _message_activity_to_event(activity::AbstractDict, client::MSTeams.BotClient)

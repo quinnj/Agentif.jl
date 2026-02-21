@@ -16,21 +16,18 @@ mutable struct SignalChannel <: Agentif.AbstractChannel
     user_name::String
     is_group_chat::Bool
     source_timestamp::Union{Nothing, String}
+    display_name::String
 end
 
-function Agentif.start_streaming(ch::SignalChannel)
-    if ch.sm === nothing
-        ch.sm = Signal.with_client(ch.client) do
-            Signal.send_streaming_message(ch.recipient)
-        end
-    end
-end
+Agentif.start_streaming(::SignalChannel) = nothing
 
 function Agentif.append_to_stream(ch::SignalChannel, delta::AbstractString)
-    sm = ch.sm
-    sm === nothing && return
     Signal.with_client(ch.client) do
-        append!(sm, String(delta))
+        if ch.sm === nothing
+            ch.sm = Signal.send_streaming_message(ch.recipient, String(delta))
+        else
+            append!(ch.sm, String(delta))
+        end
     end
 end
 
@@ -52,6 +49,7 @@ function Agentif.send_message(ch::SignalChannel, msg)
 end
 
 Agentif.channel_id(ch::SignalChannel) = "signal:$(ch.recipient)"
+Agentif.channel_name(ch::SignalChannel) = isempty(ch.display_name) ? Agentif.channel_id(ch) : ch.display_name
 Agentif.is_group(ch::SignalChannel) = ch.is_group_chat
 Agentif.is_private(::SignalChannel) = true
 
@@ -154,7 +152,7 @@ function _envelope_to_message_event(envelope::Signal.Envelope, client::Signal.Cl
         nothing
     end
 
-    ch = SignalChannel(recipient, client, nothing, user_id, user_name, is_group_chat, source_timestamp)
+    ch = SignalChannel(recipient, client, nothing, user_id, user_name, is_group_chat, source_timestamp, "")
     direct_ping = !is_group_chat
     return SignalMessageEvent(ch, text, direct_ping)
 end
