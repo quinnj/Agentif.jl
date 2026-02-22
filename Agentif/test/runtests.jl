@@ -122,40 +122,42 @@ Agentif.close_channel(ch::StreamTestChannel) = (ch.closed += 1)
     @test tool_name("literal-name") == "literal-name"
 end
 
-@testset "stream (MiniMax live)" begin
+let
     provider = get(ENV, "VO_AGENT_PROVIDER", "")
     model_id = get(ENV, "VO_AGENT_MODEL", "")
     apikey = get(ENV, "VO_AGENT_API_KEY", "")
 
-    if isempty(provider) || isempty(model_id) || isempty(apikey)
-        @info "Skipping live MiniMax tests; VO_AGENT_* env vars are not set."
+    if !isempty(provider) && !isempty(model_id) && !isempty(apikey)
+        @testset "stream (MiniMax live)" begin
+            model = getModel(provider, model_id)
+            @test model !== nothing
+            tool = @tool "Echo a string." echo(text::String) = text
+            agent = Agent(
+                id = "live-agent",
+                prompt = "You must call the echo tool with JSON arguments {\"text\":\"pong\"}. Do not answer directly.",
+                model = model,
+                apikey = apikey,
+                tools = [tool],
+            )
+            events = AgentEvent[]
+            state = AgentState()
+            result_state = stream(
+                e -> push!(events, e),
+                agent,
+                state,
+                "ping",
+                Abort();
+                tool_choice = Dict("type" => "function", "function" => Dict("name" => "echo")),
+            )
+            @test result_state isa AgentState
+            @test result_state.most_recent_stop_reason !== nothing
+            @test !isempty(result_state.messages)
+            @test !isempty(result_state.pending_tool_calls)
+            @test result_state.pending_tool_calls[1].name == "echo"
+            @test any(e -> e isa ToolCallRequestEvent, events)
+        end
     else
-        model = getModel(provider, model_id)
-        @test model !== nothing
-        tool = @tool "Echo a string." echo(text::String) = text
-        agent = Agent(
-            id = "live-agent",
-            prompt = "You must call the echo tool with JSON arguments {\"text\":\"pong\"}. Do not answer directly.",
-            model = model,
-            apikey = apikey,
-            tools = [tool],
-        )
-        events = AgentEvent[]
-        state = AgentState()
-        result_state = stream(
-            e -> push!(events, e),
-            agent,
-            state,
-            "ping",
-            Abort();
-            tool_choice = Dict("type" => "function", "function" => Dict("name" => "echo")),
-        )
-        @test result_state isa AgentState
-        @test result_state.most_recent_stop_reason !== nothing
-        @test !isempty(result_state.messages)
-        @test !isempty(result_state.pending_tool_calls)
-        @test result_state.pending_tool_calls[1].name == "echo"
-        @test any(e -> e isa ToolCallRequestEvent, events)
+        @info "Skipping live MiniMax tests; VO_AGENT_* env vars are not set."
     end
 end
 

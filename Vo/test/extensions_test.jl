@@ -184,7 +184,7 @@ end
     @test any(h -> h.id == "mattermost_reaction_default", handlers)
 
     client = Mattermost.Client("test-token", "https://example.invalid/api/v4/")
-    ch = ext.MattermostChannel("chan-1", "root-1", "post-1", client, nothing, "user-1", "alice", "D")
+    ch = ext.MattermostChannel("chan-1", "root-1", "post-1", client, nothing, "user-1", "alice", "D", "Test Channel")
 
     @test Agentif.channel_id(ch) == "mattermost:chan-1:root-1"
     @test Agentif.source_message_id(ch) == "post-1"

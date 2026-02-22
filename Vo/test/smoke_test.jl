@@ -148,7 +148,6 @@ end
     for row in SQLite.DBInterface.execute(a.db, "SELECT name FROM sqlite_master WHERE type='table'")
         push!(tables, row.name)
     end
-    @test "vo_channels" in tables
     @test "vo_event_types" in tables
     @test "vo_event_handlers" in tables
     @test "vo_handler_event_types" in tables
@@ -190,16 +189,15 @@ end
     append!(a.tools, Vo.MANAGEMENT_TOOLS)
     append!(a.tools, Vo.TEMPUS_TOOLS)
 
-    # Verify data in SQLite
-    @test count_rows(a.db, "vo_channels") == 2
+    # Verify data in SQLite / runtime registry
+    @test length(a._channels) == 2
     @test count_rows(a.db, "vo_event_types") == 1
     @test count_rows(a.db, "vo_event_handlers") == 1
 
-    # Test list_channels (reads from SQLite)
+    # Test list_channels (reads from runtime _channels dict)
     result = Vo.list_channels()
     @test occursin("slack-general", result)
     @test occursin("dm-alice", result)
-    @test occursin("MockChannel", result)
     @test occursin("group", result)
     @test occursin("public", result)
     @test occursin("private", result)
@@ -442,13 +440,13 @@ end
     )
     Vo.register_event_source!(a, es)
 
-    @test count_rows(a.db, "vo_channels") == 2
+    @test length(a._channels) == 2
     @test count_rows(a.db, "vo_event_types") == 2
     @test count_rows(a.db, "vo_event_handlers") == 1
 
-    # Registering same source again: INSERT OR IGNORE for channels/types, REPLACE for handlers
+    # Registering same source again: channels update in-place, INSERT OR IGNORE for types, REPLACE for handlers
     Vo.register_event_source!(a, es)
-    @test count_rows(a.db, "vo_channels") == 2  # no duplication
+    @test length(a._channels) == 2  # no duplication
     @test count_rows(a.db, "vo_event_types") == 2  # no duplication
     @test count_rows(a.db, "vo_event_handlers") == 1  # upsert, not duplicate
 
@@ -482,7 +480,7 @@ end
     # Agent creates a handler (simulating tool call)
     Vo.add_event_handler("user_handler", "message", "user-created", "slack-general")
     @test count_rows(a1.db, "vo_event_handlers") == 2
-    @test count_rows(a1.db, "vo_channels") == 1
+    @test length(a1._channels) == 1
     @test count_rows(a1.db, "vo_event_types") == 1
 
     # Close first db to release lock, simulating process exit
@@ -496,10 +494,9 @@ end
     Vo.CURRENT_ASSISTANT[] = a2
 
     # Purge ephemeral tables (as init! does)
-    SQLite.DBInterface.execute(a2.db, "DELETE FROM vo_channels")
     SQLite.DBInterface.execute(a2.db, "DELETE FROM vo_event_types")
 
-    @test count_rows(a2.db, "vo_channels") == 0  # purged
+    @test isempty(a2._channels)  # fresh instance, no channels registered yet
     @test count_rows(a2.db, "vo_event_types") == 0  # purged
     # Handlers survive the purge!
     @test count_rows(a2.db, "vo_event_handlers") == 2
@@ -514,7 +511,7 @@ end
     )
     Vo.register_event_source!(a2, es2)
 
-    @test count_rows(a2.db, "vo_channels") == 1  # re-populated
+    @test length(a2._channels) == 1  # re-populated
     @test count_rows(a2.db, "vo_event_types") == 1  # re-populated
     @test count_rows(a2.db, "vo_event_handlers") == 2  # both still there
 
