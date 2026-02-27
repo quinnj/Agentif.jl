@@ -260,8 +260,8 @@ end
     usage::Usage = Usage()
     pending_tool_calls::Vector{PendingToolCall} = PendingToolCall[]
     most_recent_stop_reason::Union{Nothing, Symbol} = nothing
-    session_id::Union{Nothing, String} = nothing
     last_compaction::Union{Nothing, CompactionSummaryMessage} = nothing
+    compaction_kept_count::Int = 0
 end
 
 function set!(dest::AgentState, source::AgentState)
@@ -270,7 +270,7 @@ function set!(dest::AgentState, source::AgentState)
     dest.usage = source.usage
     dest.pending_tool_calls = source.pending_tool_calls
     dest.most_recent_stop_reason = source.most_recent_stop_reason
-    dest.session_id = source.session_id
     dest.last_compaction = source.last_compaction
+    dest.compaction_kept_count = source.compaction_kept_count
     return
 end

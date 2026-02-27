@@ -12,7 +12,7 @@ using TimeZones
 export EventSource, Event, ChannelEvent, EventType, EventHandler
 export AgentConfig, AgentAssistant
 export get_channels, get_event_types, get_event_handlers, get_tools
-export get_name, get_channel, event_content, get_session_key
+export get_name, get_channel, event_content
 export register_event_source!, register_channels!, register_event_handler!, unregister_event_handler!
 export evaluate, init!, run, start!, get_current_assistant, scrub_post!
 export ReplChannel, ReplEventSource, ReplInputEvent
@@ -154,13 +154,6 @@ function _init_vo_schema!(db::SQLite.DB)
     """)
 
     SQLite.DBInterface.execute(db, """
-        CREATE TABLE IF NOT EXISTS vo_sessions (
-            session_key TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL
-        )
-    """)
-
-    SQLite.DBInterface.execute(db, """
         CREATE TABLE IF NOT EXISTS vo_agent_data (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -209,9 +202,6 @@ end
 get_name(ev::Event) = error("get_name not implemented for $(typeof(ev))")
 get_channel(ev::ChannelEvent) = error("get_channel not implemented for $(typeof(ev))")
 event_content(ev::Event) = error("event_content not implemented for $(typeof(ev))")
-get_session_key(::Event) = nothing
-get_session_key(ev::ChannelEvent) = Agentif.channel_id(get_channel(ev))
-get_followup_session_key(::Agentif.AbstractChannel) = nothing
 
 # ─── Global state ───
 
@@ -278,7 +268,6 @@ function unregister_event_handler!(assistant::AgentAssistant, handler_id::String
     db = assistant.db
     SQLite.DBInterface.execute(db, "DELETE FROM vo_handler_event_types WHERE handler_id = ?", (handler_id,))
     SQLite.DBInterface.execute(db, "DELETE FROM vo_event_handlers WHERE id = ?", (handler_id,))
-    SQLite.DBInterface.execute(db, "DELETE FROM vo_sessions WHERE session_key = ?", (handler_id,))
     return
 end
 
@@ -373,29 +362,6 @@ function _fire_tempus_job(; event_type::String)
     assistant === nothing && return
     put!(assistant.event_queue, TempusJobEvent(event_type))
     return
-end
-
-# ─── Session helper ───
-
-function _get_or_create_session(db::SQLite.DB, session_key::String)
-    result = iterate(SQLite.DBInterface.execute(db,
-        "SELECT session_id FROM vo_sessions WHERE session_key = ?", (session_key,)))
-    if result !== nothing
-        return result[1].session_id
-    end
-    sid = Agentif.new_session_id()
-    SQLite.DBInterface.execute(db,
-        "INSERT INTO vo_sessions (session_key, session_id) VALUES (?, ?)",
-        (session_key, sid))
-    return sid
-end
-
-function _bind_session_key!(db::SQLite.DB, session_key::String, session_id::String)
-    isempty(session_key) && return nothing
-    SQLite.DBInterface.execute(db,
-        "INSERT OR REPLACE INTO vo_sessions (session_key, session_id) VALUES (?, ?)",
-        (session_key, session_id))
-    return nothing
 end
 
 # ─── Management tools ───
@@ -623,7 +589,9 @@ const DB_STORE_TOOL = @tool "Store a key-value entry in your persistent scratch 
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     parsed_tags = _parse_tags(tags)
-    user_id, post_id, ch_id, ch_flags = Agentif.current_session_entry_metadata()
+    user_id, ch_id, _sch_id, ch_flags = Agentif.current_session_entry_metadata()
+    ch = Agentif.CURRENT_CHANNEL[]
+    post_id = ch !== nothing ? Agentif.entry_id(ch) : nothing
     now = time()
     lock(AGENT_DATA_WRITE_LOCK) do
         _with_busy_retry() do
@@ -798,7 +766,7 @@ include("llmtools.jl")
 
 # ─── Evaluate ───
 
-function evaluate(assistant::AgentAssistant, input; session_id::String, channel::Union{Nothing, Agentif.AbstractChannel}=nothing, kw...)
+function evaluate(assistant::AgentAssistant, input; channel::Union{Nothing, Agentif.AbstractChannel}=nothing, kw...)
     cfg = assistant.config
     model = Agentif.getModel(cfg.provider, cfg.model_id)
     model === nothing && error("Unknown model: provider=$(cfg.provider) model_id=$(cfg.model_id)")
@@ -814,7 +782,6 @@ function evaluate(assistant::AgentAssistant, input; session_id::String, channel:
     prefixed_input = input isa String ? string(ctx, "\n\n", input) : input
     return Agentif.evaluate(agent, prefixed_input;
         session_store = assistant.session_store,
-        session_id = session_id,
         channel = channel,
         compaction_config = Agentif.CompactionConfig(),
         kw...,
@@ -911,20 +878,7 @@ function _run_event_handler!(assistant::AgentAssistant, ev::Event, handler)
         return nothing
     end
     input = make_prompt(handler.prompt, ev)
-    session_key = something(get_session_key(ev), handler.id)
-    sid = _with_busy_retry() do
-        _get_or_create_session(assistant.db, session_key)
-    end
-    evaluate(assistant, input; session_id=sid, channel=ch)
-    followup_session_key = get_followup_session_key(ch)
-    if followup_session_key !== nothing
-        followup_key = String(followup_session_key)
-        if !isempty(followup_key) && followup_key != session_key
-            _with_busy_retry() do
-                _bind_session_key!(assistant.db, followup_key, sid)
-            end
-        end
-    end
+    evaluate(assistant, input; channel=ch)
     return nothing
 end
 

@@ -17,6 +17,7 @@ mutable struct SlackChannel <: Agentif.AbstractChannel
     channel::String
     thread_ts::String
     post_ts::String
+    source_ts::String
     web_client::Slack.WebClient
     sm::Union{Nothing, Slack.ChatStream}
     io::Union{Nothing, IOBuffer}
@@ -172,16 +173,28 @@ function Agentif.get_current_user(ch::SlackChannel)
     return Agentif.ChannelUser(ch.user_id, ch.user_name)
 end
 
-Agentif.source_message_id(ch::SlackChannel) = isempty(ch.post_ts) ? nothing : ch.post_ts
+Agentif.entry_id(ch::SlackChannel) = isempty(ch.source_ts) ? nothing : ch.source_ts
+Agentif.response_entry_id(ch::SlackChannel) = isempty(ch.post_ts) ? nothing : ch.post_ts
+Agentif.parent_branch_id(ch::SlackChannel) = isempty(ch.thread_ts) ? nothing : "slack:$(ch.channel)"
+Agentif.branch_entry_id(ch::SlackChannel) = isempty(ch.thread_ts) ? nothing : ch.thread_ts
+Agentif.search_channel_id(ch::SlackChannel) = "slack:$(ch.channel)"
 
-function Vo.get_followup_session_key(ch::SlackChannel)
-    if !isempty(ch.thread_ts)
-        return Agentif.channel_id(ch)
+function Agentif.create_channel_tools(ch::SlackChannel)
+    ts = ch.source_ts
+    channel = ch.channel
+    web_client = ch.web_client
+    (isempty(ts) || isempty(channel)) && return Agentif.AgentTool[]
+    react_fn = function react_to_message(emoji_name::String)
+        API_CALL_FN[](web_client, "reactions.add";
+            json=Dict("channel" => channel, "timestamp" => ts, "name" => emoji_name))
+        return """{"status":"ok","emoji":"$emoji_name","channel":"$channel","timestamp":"$ts"}"""
     end
-    if !isempty(ch.post_ts)
-        return "slack:$(ch.channel):$(ch.post_ts)"
-    end
-    return nothing
+    react_tool = Agentif.AgentTool{typeof(react_fn), @NamedTuple{emoji_name::String}}(;
+        name = "react_to_message",
+        description = "React to the user's message with an emoji instead of (or in addition to) sending a text reply. Use this for simple acknowledgments, approvals, or expressing sentiment without a full response. Common emoji names: thumbsup, white_check_mark, eyes, heart, laughing, tada, thinking, thumbsdown, warning, x",
+        func = react_fn,
+    )
+    return Agentif.AgentTool[react_tool]
 end
 
 # ─── Channel Events ───
@@ -256,7 +269,7 @@ function _fetch_channels(source::SlackEventSource)
             is_mpim = get(() -> false, ch_data, "is_mpim")
             is_private = get(() -> false, ch_data, "is_private")
             ch_type = is_im ? "im" : is_mpim ? "mpim" : is_private ? "group" : "channel"
-            push!(channels, SlackChannel(ch_id, "", "", wc, nothing, nothing, "", "", ch_type, nothing, nothing, ch_name))
+            push!(channels, SlackChannel(ch_id, "", "", "", wc, nothing, nothing, "", "", ch_type, nothing, nothing, ch_name))
         end
         meta = get(() -> nothing, resp, "response_metadata")
         cursor = meta !== nothing ? get(() -> "", meta, "next_cursor") : ""
@@ -422,7 +435,7 @@ function _extract_message_event(event, web_client::Slack.WebClient, bot_user_id:
         (!isempty(bot_username) && occursin("@" * lowercase(bot_username), lower_text))
 
     user_name = user_id
-    ch = SlackChannel(channel, thread_ts, ts, web_client, nothing, nothing, user_id, user_name, channel_type, recipient_team_id, recipient_user_id, "")
+    ch = SlackChannel(channel, thread_ts, ts, ts, web_client, nothing, nothing, user_id, user_name, channel_type, recipient_team_id, recipient_user_id, "")
     return SlackMessageEvent(ch, text, direct_ping)
 end
 
@@ -448,7 +461,7 @@ function _extract_reaction_event(event, web_client::Slack.WebClient, bot_user_id
 
     channel_type = _resolve_channel_type(channel, "", web_client, channel_type_cache)
     user_name = user_id
-    ch = SlackChannel(channel, reacted_to_ts, reacted_to_ts, web_client, nothing, nothing, user_id, user_name, channel_type, recipient_team_id, recipient_user_id, "")
+    ch = SlackChannel(channel, reacted_to_ts, reacted_to_ts, "", web_client, nothing, nothing, user_id, user_name, channel_type, recipient_team_id, recipient_user_id, "")
     return SlackReactionEvent(ch, emoji, user_name, reacted_to_ts)
 end
 

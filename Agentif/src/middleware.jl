@@ -107,9 +107,10 @@ function _entry_metadata(ch::Union{Nothing, AbstractChannel})
     ch === nothing && return nothing, nothing, nothing, nothing
     user = get_current_user(ch)
     user_id = user === nothing ? nothing : user.id
-    post_id = source_message_id(ch)
-    flags = (is_private(ch) ? 0x01 : 0x00) | (is_group(ch) ? 0x02 : 0x00)
-    return user_id, post_id, channel_id(ch), Int(flags)
+    ch_id = channel_id(ch)
+    sch_id = search_channel_id(ch)
+    flags = Int((is_private(ch) ? 0x01 : 0x00) | (is_group(ch) ? 0x02 : 0x00))
+    return user_id, ch_id, sch_id, flags
 end
 
 function current_session_entry_metadata()
@@ -122,13 +123,13 @@ function _create_search_session_tool(store::SessionStore)
         search_session_history(query::String, limit::Union{Nothing, Int}=nothing) = begin
             n = limit === nothing ? 10 : limit
             ch = CURRENT_CHANNEL[]
-            ch_id = ch !== nothing ? channel_id(ch) : nothing
-            results = search_sessions(store, query; limit=n, current_channel_id=ch_id)
+            sch_id = ch !== nothing ? search_channel_id(ch) : nothing
+            results = search_sessions(store, query; limit=n, current_search_channel_id=sch_id)
             isempty(results) && return "No matching session history found for: $query"
             lines = String[]
             max_chars = 4000
             for (i, r) in enumerate(results)
-                push!(lines, "--- Result $i [session: $(r.session_id), score: $(round(r.score; digits=2))] ---")
+                push!(lines, "--- Result $i [entry: $(r.entry_id), score: $(round(r.score; digits=2))] ---")
                 text = r.entry_text
                 if length(text) > max_chars
                     text = first(text, max_chars) * "\n... [truncated, $(length(r.entry_text)) chars total]"
@@ -140,67 +141,109 @@ function _create_search_session_tool(store::SessionStore)
     )
 end
 
-function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, SessionStore}; session_id::Union{Nothing, String} = nothing, channel::Union{Nothing, AbstractChannel} = nothing)
-    sid_ref = Ref{Union{Nothing, String}}(session_id === nothing ? nothing : ensure_session_id(session_id))
-    sid_by_channel = Dict{String, String}()
-    sid_lock = ReentrantLock()
+function _maybe_fork_branch!(store::SessionStore, ch::AbstractChannel, bid::String)
+    get_branch_leaf(store, bid) !== nothing && return  # already seeded
+    fork_eid = branch_entry_id(ch)
+    if fork_eid !== nothing && get_entry(store, fork_eid) !== nothing
+        set_branch_leaf!(store, bid, fork_eid)
+        return
+    end
+    pbid = parent_branch_id(ch)
+    if pbid !== nothing
+        parent_leaf = get_branch_leaf(store, pbid)
+        parent_leaf !== nothing && set_branch_leaf!(store, bid, parent_leaf)
+    end
+    return
+end
+
+function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, SessionStore}; channel::Union{Nothing, AbstractChannel} = nothing)
     search_tool = store === nothing ? nothing : _create_search_session_tool(store)
-    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; session_id::Union{Nothing, String} = nothing, kw...)
+    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)
         store === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
         current_channel = channel === nothing ? CURRENT_CHANNEL[] : channel
-        current_channel_id = current_channel === nothing ? nothing : channel_id(current_channel)
-        sid = if session_id === nothing
-            lock(sid_lock) do
-                if current_channel_id === nothing
-                    sid_ref[] === nothing && (sid_ref[] = new_session_id())
-                    sid_ref[]
-                else
-                    get!(() -> new_session_id(), sid_by_channel, current_channel_id)
+        current_channel === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
+
+        bid = branch_id(current_channel)
+        # Capture entry_id BEFORE eval (post_ts gets mutated during streaming)
+        captured_eid = entry_id(current_channel)
+
+        return lock_branch(store, bid) do
+            _maybe_fork_branch!(store, current_channel, bid)
+            current_state, entry_boundaries = load_branch_with_boundaries(store, bid)
+            pre_eval_msg_count = length(current_state.messages)
+            current_leaf = get_branch_leaf(store, bid)
+
+            agent = search_tool === nothing ? agent : with_tools(agent, vcat(agent.tools, [search_tool]))
+            current_state = agent_handler(f, agent, current_state, current_input, abort; kw...)
+
+            # Resolve final entry ID
+            final_eid = something(captured_eid, response_entry_id(current_channel), string(UID8()))
+            user_id, ch_id, sch_id, ch_flags = _entry_metadata(current_channel)
+
+            if current_state.last_compaction !== nothing
+                # Compaction happened: create compaction entry + eval entry
+                kept_count = current_state.compaction_kept_count
+                first_kept_eid = nothing
+                if kept_count > 0 && pre_eval_msg_count > 0
+                    first_kept_original_idx = pre_eval_msg_count - kept_count + 1
+                    for b in entry_boundaries
+                        if b.message_start <= first_kept_original_idx <= b.message_end
+                            first_kept_eid = b.entry_id
+                            break
+                        end
+                    end
                 end
-            end
-        else
-            ensure_session_id(session_id)
-        end
-        if session_id !== nothing
-            lock(sid_lock) do
-                if current_channel_id === nothing
-                    sid_ref[] = sid
+
+                compaction_entry = SessionEntry(;
+                    id = string(UID8()),
+                    parent_id = current_leaf,
+                    messages = AgentMessage[current_state.last_compaction],
+                    is_compaction = true,
+                    first_kept_entry_id = first_kept_eid,
+                    user_id = user_id,
+                    channel_id = ch_id,
+                    search_channel_id = sch_id,
+                    channel_flags = ch_flags,
+                )
+                append_entry!(store, compaction_entry)
+
+                # New messages added after compaction: skip summary (1) + kept (N)
+                new_messages = current_state.messages[kept_count + 2:end]
+                if !isempty(new_messages)
+                    eval_entry = SessionEntry(;
+                        id = final_eid,
+                        parent_id = compaction_entry.id,
+                        messages = new_messages,
+                        user_id = user_id,
+                        channel_id = ch_id,
+                        search_channel_id = sch_id,
+                        channel_flags = ch_flags,
+                    )
+                    append_entry!(store, eval_entry)
+                    set_branch_leaf!(store, bid, final_eid)
                 else
-                    sid_by_channel[current_channel_id] = sid
+                    set_branch_leaf!(store, bid, compaction_entry.id)
                 end
+                current_state.last_compaction = nothing
+                current_state.compaction_kept_count = 0
+            elseif length(current_state.messages) > pre_eval_msg_count
+                # No compaction: save new messages as a single entry
+                new_messages = current_state.messages[pre_eval_msg_count + 1:end]
+                eval_entry = SessionEntry(;
+                    id = final_eid,
+                    parent_id = current_leaf,
+                    messages = new_messages,
+                    user_id = user_id,
+                    channel_id = ch_id,
+                    search_channel_id = sch_id,
+                    channel_flags = ch_flags,
+                )
+                append_entry!(store, eval_entry)
+                set_branch_leaf!(store, bid, final_eid)
             end
+
+            return current_state
         end
-        current_state = load_session(store, sid)
-        current_state.session_id = sid
-        start_idx = length(current_state.messages)
-        agent = search_tool === nothing ? agent : with_tools(agent, vcat(agent.tools, [search_tool]))
-        current_state = agent_handler(f, agent, current_state, current_input, abort; kw...)
-        eval_id = CURRENT_EVALUATION_ID[]
-        entry_id = eval_id === nothing ? nothing : string(eval_id)
-        # Use directly-provided channel if available; fall back to CURRENT_CHANNEL
-        # (which works when with_channel wraps the outer call, but NOT when
-        # channel_middleware is inner — that @with exits before we reach here).
-        user_id, post_id, current_channel_id, current_channel_flags = _entry_metadata(current_channel)
-        if current_state.last_compaction !== nothing
-            # Compaction happened: write full state as compaction entry
-            entry = SessionEntry(;
-                id = entry_id,
-                created_at = time(),
-                messages = copy(current_state.messages),
-                is_compaction = true,
-                user_id = user_id,
-                post_id = post_id,
-                channel_id = current_channel_id,
-                channel_flags = current_channel_flags,
-            )
-            append_session_entry!(store, sid, entry)
-            current_state.last_compaction = nothing
-        elseif length(current_state.messages) > start_idx
-            new_messages = current_state.messages[(start_idx + 1):end]
-            entry = SessionEntry(; id = entry_id, created_at = time(), messages = new_messages, user_id = user_id, post_id = post_id, channel_id = current_channel_id, channel_flags = current_channel_flags)
-            append_session_entry!(store, sid, entry)
-        end
-        return current_state
     end
 end
 
@@ -257,7 +300,6 @@ function build_default_handler(
         steer_queue::Union{Nothing, Channel{AgentTurnInput}} = nothing,
         message_queue::Union{Nothing, Channel{AgentTurnInput}} = nothing,
         session_store::Union{Nothing, SessionStore} = nothing,
-        session_id::Union{Nothing, String} = nothing,
         input_guardrail::Union{Nothing, Bool, Function} = nothing,
         skill_registry::Union{Nothing, SkillRegistry} = nothing,
         channel::Union{Nothing, AbstractChannel} = nothing,
@@ -279,7 +321,7 @@ function build_default_handler(
                 inner_handler(f, with_tools(agent, vcat(agent.tools, ch_tools)), state, current_input, abort; kw...)
         end
     end
-    handler = session_middleware(handler, session_store; session_id, channel)
+    handler = session_middleware(handler, session_store; channel)
     handler = input_guardrail_middleware(handler, input_guardrail)
     handler = skills_middleware(handler, skill_registry)
     handler = evaluate_middleware(handler)
@@ -299,7 +341,6 @@ function evaluate(
         steer_queue::Union{Nothing, Channel{AgentTurnInput}} = nothing,
         message_queue::Union{Nothing, Channel{AgentTurnInput}} = nothing,
         session_store::Union{Nothing, SessionStore} = nothing,
-        session_id::Union{Nothing, String} = nothing,
         input_guardrail::Union{Nothing, Bool, Function} = nothing,
         skill_registry::Union{Nothing, SkillRegistry} = nothing,
         channel::Union{Nothing, AbstractChannel} = nothing,
@@ -310,6 +351,6 @@ function evaluate(
     if repeat_input && input isa String
         input = input * "\n\n" * input
     end
-    handler = build_default_handler(; base_handler, compaction_config, steer_queue, message_queue, session_store, session_id, input_guardrail, skill_registry, channel)
+    handler = build_default_handler(; base_handler, compaction_config, steer_queue, message_queue, session_store, input_guardrail, skill_registry, channel)
     return handler(f, agent, state, input, abort; kw...)
 end

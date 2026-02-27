@@ -59,7 +59,7 @@ function Agentif.get_current_user(ch::MSTeamsChannel)
     return Agentif.ChannelUser(ch.user_id, ch.user_name)
 end
 
-Agentif.source_message_id(ch::MSTeamsChannel) = isempty(ch.message_id) ? nothing : ch.message_id
+Agentif.entry_id(ch::MSTeamsChannel) = isempty(ch.message_id) ? nothing : ch.message_id
 
 # ─── Channel Events ───
 

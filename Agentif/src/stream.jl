@@ -923,9 +923,6 @@ function stream(
 
         session_id = pop!(codex_kw, :session_id, nothing)
         session_id === nothing && (session_id = pop!(codex_kw, :sessionId, nothing))
-        # Fall back to state.session_id (set by session_middleware) if not
-        # passed explicitly, so prompt_cache_key and session headers work.
-        session_id === nothing && (session_id = state.session_id)
 
         reasoning_effort = pop!(codex_kw, :reasoning_effort, nothing)
         reasoning_effort === nothing && (reasoning_effort = pop!(codex_kw, :reasoningEffort, nothing))

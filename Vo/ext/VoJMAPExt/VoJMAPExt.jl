@@ -37,7 +37,6 @@ struct JMAPNewEmailEvent <: Vo.Event
 end
 
 Vo.get_name(::JMAPNewEmailEvent) = "jmap_new_email"
-Vo.get_session_key(ev::JMAPNewEmailEvent) = "jmap:$(ev.account_id):thread:$(something(ev.thread_id, ev.email_id))"
 
 function Vo.event_content(ev::JMAPNewEmailEvent)
     lines = String[

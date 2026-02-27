@@ -63,20 +63,6 @@ if HAS_GITHUB
         "owner/repo", "bob")
     @test Vo.get_name(ev_pr) == "github_pull_request"
 
-    # Session key for PR events groups by PR number
-    @test Vo.get_session_key(ev_pr) == "github:owner/repo:pull_request:42"
-
-    # Session key for issue events
-    ev_issue = ext.GitHubWebhookEvent("issues", "opened",
-        Dict{String,Any}("action" => "opened", "issue" => Dict{String,Any}(
-            "title" => "Bug report", "number" => 7, "html_url" => "https://github.com/owner/repo/issues/7",
-        )),
-        "owner/repo", "carol")
-    @test Vo.get_session_key(ev_issue) == "github:owner/repo:issue:7"
-
-    # Session key for push events
-    @test Vo.get_session_key(ev_push) == "github:owner/repo:push:refs/heads/main"
-
     # Event content formatting
     content_pr = Vo.event_content(ev_pr)
     @test occursin("owner/repo", content_pr)
@@ -109,7 +95,6 @@ if HAS_GITHUB
             "issue" => Dict{String,Any}("title" => "Bug report", "number" => 7),
         ),
         "owner/repo", "eve")
-    @test Vo.get_session_key(ev_comment) == "github:owner/repo:issue:7"
     content_comment = Vo.event_content(ev_comment)
     @test occursin("LGTM!", content_comment)
     @test occursin("Bug report", content_comment)
@@ -291,7 +276,7 @@ end
     @test Vo.get_name(msg_event) == "slack_message"
     @test Agentif.channel_id(Vo.get_channel(msg_event)) == "slack:C123:1700000000.123"
     @test !msg_event.direct_ping
-    @test Agentif.source_message_id(Vo.get_channel(msg_event)) == "1700000000.123"
+    @test Agentif.entry_id(Vo.get_channel(msg_event)) == "1700000000.123"
     @test Vo.event_content(msg_event) == "[U123]: hello"
 
     private_msg = Slack.SlackMessageEvent(
@@ -367,12 +352,12 @@ end
     @test ext._channel_type_from_info(nothing) === nothing
 
     # Streaming should be allowed for IM without recipient IDs, but not for channel/group.
-    stream_im = ext.SlackChannel("D111", "1700000000.500", "", web_client, nothing, nothing, "", "", "im", nothing, nothing, "")
+    stream_im = ext.SlackChannel("D111", "1700000000.500", "", "", web_client, nothing, nothing, "", "", "im", nothing, nothing, "")
     Agentif.start_streaming(stream_im)
     @test stream_im.sm !== nothing
     @test stream_im.io === nothing
 
-    stream_channel_missing_recipients = ext.SlackChannel("C111", "1700000000.600", "", web_client, nothing, nothing, "", "", "channel", nothing, nothing, "")
+    stream_channel_missing_recipients = ext.SlackChannel("C111", "1700000000.600", "", "", web_client, nothing, nothing, "", "", "channel", nothing, nothing, "")
     Agentif.start_streaming(stream_channel_missing_recipients)
     @test stream_channel_missing_recipients.sm === nothing
     @test stream_channel_missing_recipients.io !== nothing
@@ -399,7 +384,7 @@ end
         end
 
         markdown = "# Heading\n- item\n```julia\nx = 1\n```"
-        out_ch = ext.SlackChannel("C123", "", "", web_client, nothing, nothing, "", "", "channel", nothing, nothing, "")
+        out_ch = ext.SlackChannel("C123", "", "", "", web_client, nothing, nothing, "", "", "channel", nothing, nothing, "")
         Agentif.send_message(out_ch, markdown)
         @test length(api_calls) == 1
         @test isempty(fallback_calls)
@@ -409,7 +394,7 @@ end
         @test api_calls[1].json["blocks"][1]["type"] == "markdown"
         @test api_calls[1].json["blocks"][1]["text"] == markdown
         @test out_ch.post_ts == "1700000009.111"
-        @test Vo.get_followup_session_key(out_ch) == "slack:C123:1700000009.111"
+        @test Agentif.response_entry_id(out_ch) == "1700000009.111"
 
         # If markdown blocks are rejected, fallback to classic mrkdwn text.
         ext.API_CALL_FN[] = function (client, _api_method; json=nothing, kwargs...)
@@ -424,7 +409,7 @@ end
             )
             throw(Slack.SlackApiError("invalid blocks", resp))
         end
-        threaded_ch = ext.SlackChannel("C123", "1700000000.999", "", web_client, nothing, nothing, "", "", "channel", nothing, nothing, "")
+        threaded_ch = ext.SlackChannel("C123", "1700000000.999", "", "", web_client, nothing, nothing, "", "", "channel", nothing, nothing, "")
         Agentif.send_message(threaded_ch, markdown)
         @test length(fallback_calls) == 1
         @test fallback_calls[1].channel == "C123"
@@ -433,7 +418,7 @@ end
         @test fallback_calls[1].mrkdwn == true
         @test fallback_calls[1].parse == "none"
         @test threaded_ch.post_ts == "1700000010.222"
-        @test Vo.get_followup_session_key(threaded_ch) == Agentif.channel_id(threaded_ch)
+        @test Agentif.response_entry_id(threaded_ch) == "1700000010.222"
     finally
         ext.API_CALL_FN[] = original_api_call_fn
         ext.CHAT_POST_MESSAGE_FN[] = original_chat_post_message_fn
@@ -532,10 +517,10 @@ end
     @test any(h -> h.id == "mattermost_reaction_default", handlers)
 
     client = Mattermost.Client("test-token", "https://example.invalid/api/v4/")
-    ch = ext.MattermostChannel("chan-1", "root-1", "post-1", client, nothing, nothing, "user-1", "alice", "D", "Test Channel")
+    ch = ext.MattermostChannel("chan-1", "root-1", "post-1", "post-1", client, nothing, nothing, "user-1", "alice", "D", "Test Channel")
 
     @test Agentif.channel_id(ch) == "mattermost:chan-1:root-1"
-    @test Agentif.source_message_id(ch) == "post-1"
+    @test Agentif.entry_id(ch) == "post-1"
     @test !Agentif.is_group(ch)
     @test Agentif.is_private(ch)
     user = Agentif.get_current_user(ch)
@@ -608,7 +593,7 @@ end
         end
 
         # Streaming uses Mattermost's streaming API, not plain IO buffering.
-        stream_ch = ext.MattermostChannel("chan-stream", "root-stream", "", client, nothing, nothing, "", "", "D", "")
+        stream_ch = ext.MattermostChannel("chan-stream", "root-stream", "", "", client, nothing, nothing, "", "", "D", "")
         Mattermost.with_client(client) do
             Agentif.start_streaming(stream_ch)
             Agentif.append_to_stream(stream_ch, "Hello")
@@ -622,11 +607,11 @@ end
         @test stream_ch.sm === nothing
         @test stream_ch.io === nothing
         @test stream_ch.post_id == "stream-post-1"
-        @test Vo.get_followup_session_key(stream_ch) == Agentif.channel_id(stream_ch)
+        @test Agentif.response_entry_id(stream_ch) == "stream-post-1"
 
         # Outgoing send should preserve markdown text and record post_id.
         markdown = "# Heading\n- item\n```julia\nx = 1\n```"
-        out_ch = ext.MattermostChannel("chan-out", "", "", client, nothing, nothing, "", "", "O", "")
+        out_ch = ext.MattermostChannel("chan-out", "", "", "", client, nothing, nothing, "", "", "O", "")
         Mattermost.with_client(client) do
             Agentif.send_message(out_ch, markdown)
         end
@@ -634,14 +619,14 @@ end
         @test create_post_calls[end].message == markdown
         @test create_post_calls[end].root_id === nothing
         @test out_ch.post_id == "post-1"
-        @test Vo.get_followup_session_key(out_ch) == "mattermost:chan-out:post-1"
+        @test Agentif.response_entry_id(out_ch) == "post-1"
 
-        threaded_out = ext.MattermostChannel("chan-out", "root-123", "", client, nothing, nothing, "", "", "O", "")
+        threaded_out = ext.MattermostChannel("chan-out", "root-123", "", "", client, nothing, nothing, "", "", "O", "")
         Mattermost.with_client(client) do
             Agentif.send_message(threaded_out, markdown)
         end
         @test create_post_calls[end].root_id == "root-123"
-        @test Vo.get_followup_session_key(threaded_out) == Agentif.channel_id(threaded_out)
+        @test Agentif.response_entry_id(threaded_out) == "post-2"
 
         function posted_event(; user_id="U1", message="hello", channel_id="chan-top", root_id="", post_id="post-top", post_type="", sender_name="alice", channel_type="O")
             post_payload = Mattermost.JSON.Object(
@@ -664,7 +649,7 @@ end
             )
         end
 
-        # Top-level post should map to per-thread session key via post_id root.
+        # Top-level post maps to base channel (no thread suffix).
         Mattermost.with_client(client) do
             ext._handle_posted(posted_event(), "UBOT", "vo", assistant)
         end
@@ -672,7 +657,7 @@ end
         ev_post = take!(assistant.event_queue)
         @test ev_post isa ext.MattermostMessageEvent
         @test !ev_post.direct_ping
-        @test Agentif.channel_id(Vo.get_channel(ev_post)) == "mattermost:chan-top:post-top"
+        @test Agentif.channel_id(Vo.get_channel(ev_post)) == "mattermost:chan-top"
 
         # Mention in a group channel should direct-ping.
         Mattermost.with_client(client) do
@@ -763,7 +748,7 @@ end
     @test Vo.event_content(msg_event) == "hello signal"
     ch = Vo.get_channel(msg_event)
     @test Agentif.channel_id(ch) == "signal:+12223334444"
-    @test Agentif.source_message_id(ch) == "1700000000000"
+    @test Agentif.entry_id(ch) == "1700000000000"
     @test !Agentif.is_group(ch)
     @test Agentif.is_private(ch)
     tools = Agentif.create_channel_tools(ch)
@@ -818,7 +803,7 @@ end
     @test Agentif.channel_id(msg_channel) == "msteams:conv-1"
     @test Agentif.is_group(msg_channel)
     @test !Agentif.is_private(msg_channel)
-    @test Agentif.source_message_id(msg_channel) == "activity-1"
+    @test Agentif.entry_id(msg_channel) == "activity-1"
     @test Vo.event_content(msg_event) == "[Alice]: hello teams"
 
     dm_activity = Dict{String, Any}(

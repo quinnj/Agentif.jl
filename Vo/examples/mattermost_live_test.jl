@@ -98,7 +98,7 @@ function run_tests()
     ║  6. Delete: post a msg then delete it    ║
     ║  7. REPL: test a"..." macro              ║
     ║  8. Agent data: store + search           ║
-    ║  9. Show sessions table                  ║
+    ║  9. Show branches + entries tables         ║
     ║  0. Quit                                 ║
     ╚══════════════════════════════════════════╝
     """)
@@ -167,11 +167,11 @@ function run_tests()
             # Verify
             sleep(1)
             rows = collect(SQLite.DBInterface.execute(assistant.db,
-                "SELECT is_deleted FROM session_entries WHERE post_id = ?", (post_id,)))
+                "SELECT is_deleted FROM session_entries WHERE entry_id = ?", (post_id,)))
             if !isempty(rows)
-                println("   📊 Session entries with post_id=$(post_id): $(length(rows)), is_deleted=$(rows[1].is_deleted)")
+                println("   📊 Session entries with entry_id=$(post_id): $(length(rows)), is_deleted=$(rows[1].is_deleted)")
             else
-                println("   📊 No session entries found for post_id=$(post_id) (may not have been stored yet)")
+                println("   📊 No session entries found for entry_id=$(post_id) (may not have been stored yet)")
             end
 
         elseif choice == "7"
@@ -186,26 +186,29 @@ function run_tests()
             println("   After bot replies, send choice 8b to verify.")
 
         elseif choice == "9"
-            println("\n📊 Sessions table:")
+            println("\n📊 Branches table:")
             rows = collect(SQLite.DBInterface.execute(assistant.db,
-                "SELECT session_key, session_id FROM vo_sessions"))
+                "SELECT branch_id, leaf_entry_id FROM session_branches"))
             if isempty(rows)
                 println("   (empty)")
             else
                 for r in rows
-                    println("   $(r.session_key) → $(r.session_id)")
+                    leaf = r.leaf_entry_id === missing ? "-" : r.leaf_entry_id
+                    println("   $(r.branch_id) → leaf=$(leaf)")
                 end
             end
             println("\n📊 Session entries (last 10):")
             rows = collect(SQLite.DBInterface.execute(assistant.db,
-                "SELECT id, session_id, post_id, is_deleted, channel_id FROM session_entries ORDER BY id DESC LIMIT 10"))
+                "SELECT rowid, entry_id, parent_id, is_deleted, is_compaction, channel_id, search_channel_id FROM session_entries ORDER BY rowid DESC LIMIT 10"))
             if isempty(rows)
                 println("   (empty)")
             else
                 for r in rows
                     del = r.is_deleted == 1 ? " [DELETED]" : ""
-                    pid = r.post_id === missing ? "-" : r.post_id
-                    println("   #$(r.id) session=$(r.session_id) post=$(pid) ch=$(r.channel_id)$(del)")
+                    comp = r.is_compaction == 1 ? " [COMPACTION]" : ""
+                    pid = r.parent_id === missing ? "-" : r.parent_id
+                    sch = r.search_channel_id === missing ? "-" : r.search_channel_id
+                    println("   #$(r.rowid) eid=$(r.entry_id) parent=$(pid) ch=$(r.channel_id) sch=$(sch)$(del)$(comp)")
                 end
             end
 

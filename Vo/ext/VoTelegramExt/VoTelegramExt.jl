@@ -198,6 +198,7 @@ end
 Agentif.channel_id(ch::TelegramChannel) = "telegram:$(ch.chat_id)"
 Agentif.is_group(ch::TelegramChannel) = ch.chat_type in ("group", "supergroup", "channel")
 Agentif.is_private(ch::TelegramChannel) = ch.chat_type in ("private", "group")
+Agentif.entry_id(ch::TelegramChannel) = ch.message_id === nothing ? nothing : string(ch.message_id)
 
 function Agentif.get_current_user(ch::TelegramChannel)
     isempty(ch.user_id) && return nothing

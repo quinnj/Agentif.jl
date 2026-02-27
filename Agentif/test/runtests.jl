@@ -95,7 +95,7 @@ end
 
 Agentif.channel_id(ch::SessionTestChannel) = ch.id
 Agentif.get_current_user(ch::SessionTestChannel) = ch.user
-Agentif.source_message_id(ch::SessionTestChannel) = ch.message_id
+Agentif.entry_id(ch::SessionTestChannel) = ch.message_id
 
 mutable struct StreamTestChannel <: Agentif.AbstractChannel
     id::String
@@ -268,17 +268,17 @@ end
     store = InMemorySessionStore()
     call_counter = Ref(0)
     base_handler = make_base_handler(; call_counter)
-    handler = session_middleware(base_handler, store)
+    ch = SessionTestChannel("chan:test", nothing, "msg-1")
+    handler = session_middleware(base_handler, store; channel=ch)
     agent = make_agent()
     state = AgentState()
     result_state = handler(identity, agent, state, "hello", Abort())
-    @test result_state.session_id !== nothing
-    sid = result_state.session_id
-    @test haskey(store.sessions, sid)
+    @test get_branch_leaf(store, "chan:test") !== nothing
 
     len1 = length(result_state.messages)
-    result_state_2 = handler(identity, agent, AgentState(), "again", Abort())
-    @test result_state_2.session_id == sid
+    ch2 = SessionTestChannel("chan:test", nothing, "msg-2")
+    handler2 = session_middleware(base_handler, store; channel=ch2)
+    result_state_2 = handler2(identity, agent, AgentState(), "again", Abort())
     @test length(result_state_2.messages) > len1
 end
 
@@ -289,21 +289,22 @@ end
     ch1 = SessionTestChannel("chan:iso-1", Agentif.ChannelUser("U1", "One"), "p1")
     ch2 = SessionTestChannel("chan:iso-2", Agentif.ChannelUser("U2", "Two"), "p2")
 
-    s1 = Agentif.with_channel(ch1) do
+    Agentif.with_channel(ch1) do
         handler(identity, agent, AgentState(), "hello from one", Abort())
     end
-    s2 = Agentif.with_channel(ch2) do
+    Agentif.with_channel(ch2) do
         handler(identity, agent, AgentState(), "hello from two", Abort())
     end
-    s1_again = Agentif.with_channel(ch1) do
+    ch1b = SessionTestChannel("chan:iso-1", Agentif.ChannelUser("U1", "One"), "p1b")
+    Agentif.with_channel(ch1b) do
         handler(identity, agent, AgentState(), "followup one", Abort())
     end
 
-    @test s1.session_id !== s2.session_id
-    @test s1_again.session_id == s1.session_id
+    # Different channels have different branches
+    @test get_branch_leaf(store, "chan:iso-1") !== get_branch_leaf(store, "chan:iso-2")
 
-    st1 = load_session(store, s1.session_id)
-    st2 = load_session(store, s2.session_id)
+    st1 = load_branch(store, "chan:iso-1")
+    st2 = load_branch(store, "chan:iso-2")
     t1 = join([message_text(m) for m in st1.messages if m isa UserMessage], "\n")
     t2 = join([message_text(m) for m in st2.messages if m isa UserMessage], "\n")
     @test occursin("hello from one", t1)
@@ -320,14 +321,14 @@ end
         messages = AgentMessage[UserMessage("hello")],
         is_compaction = false,
         user_id = "U123",
-        post_id = "P123",
         channel_id = "chan:123",
+        search_channel_id = "chan:123",
         channel_flags = 0x03,
     )
     roundtrip = JSON.parse(JSON.json(entry), SessionEntry)
     @test roundtrip.user_id == "U123"
-    @test roundtrip.post_id == "P123"
     @test roundtrip.channel_id == "chan:123"
+    @test roundtrip.search_channel_id == "chan:123"
     @test roundtrip.channel_flags == 3
     @test roundtrip.id == "entry-1"
     @test roundtrip.messages[1] isa UserMessage
@@ -339,46 +340,36 @@ end
     agent = make_agent()
     channel = SessionTestChannel("chan:1", Agentif.ChannelUser("U555", "Taylor"), "post-777")
 
-    state = Agentif.with_channel(channel) do
+    Agentif.with_channel(channel) do
         handler(identity, agent, AgentState(), "hello", Abort())
     end
 
-    entries = session_entries(store, state.session_id)
-    @test length(entries) == 1
-    @test entries[1].user_id == "U555"
-    @test entries[1].post_id == "post-777"
-    @test entries[1].channel_id == "chan:1"
+    leaf_id = get_branch_leaf(store, "chan:1")
+    @test leaf_id !== nothing
+    entry = get_entry(store, leaf_id)
+    @test entry !== nothing
+    @test entry.user_id == "U555"
+    @test entry.channel_id == "chan:1"
+    @test entry.search_channel_id == "chan:1"
     # SessionTestChannel defaults: is_group=false, is_private=true → flags=0x01
-    @test entries[1].channel_flags == 1
+    @test entry.channel_flags == 1
 end
 
-@testset "FileSessionStore tolerates malformed entries" begin
-    mktempdir() do tmpdir
-        store = FileSessionStore(tmpdir)
-        sid = "file-session"
-        append_session_entry!(store, sid, SessionEntry(; id = "entry-1", messages = AgentMessage[UserMessage("hello")]))
+@testset "InMemorySessionStore tree-structured lineage" begin
+    store = InMemorySessionStore()
+    # Build a 3-entry linear chain: e1 → e2 → e3
+    append_entry!(store, SessionEntry(; id="e1", messages=AgentMessage[UserMessage("hello")]))
+    append_entry!(store, SessionEntry(; id="e2", parent_id="e1", messages=AgentMessage[UserMessage("world")]))
+    append_entry!(store, SessionEntry(; id="e3", parent_id="e2", messages=AgentMessage[UserMessage("!")]))
+    set_branch_leaf!(store, "branch-1", "e3")
 
-        path = joinpath(tmpdir, sid)
-        open(path, "a") do io
-            write(io, "{bad json")
-            write(io, '\n')
-        end
+    state = load_branch(store, "branch-1")
+    user_msgs = [Agentif.message_text(m) for m in state.messages if m isa UserMessage]
+    @test user_msgs == ["hello", "world", "!"]
 
-        append_session_entry!(store, sid, SessionEntry(; id = "entry-2", messages = AgentMessage[UserMessage("world")]))
-
-        entries = session_entries(store, sid)
-        @test length(entries) == 2
-        @test [e.id for e in entries] == ["entry-1", "entry-2"]
-
-        loaded = load_session(store, sid)
-        user_messages = [Agentif.message_text(m) for m in loaded.messages if m isa UserMessage]
-        @test user_messages == ["hello", "world"]
-
-        search_results = search_sessions(store, "hello world"; limit = 1)
-        @test length(search_results) == 1
-        @test search_results[1].session_id == sid
-        @test isempty(search_sessions(store, "hello world"; limit = 0))
-    end
+    # Search
+    results = search_sessions(store, "hello world"; limit=5)
+    @test !isempty(results)
 end
 
 @testset "AgentifSQLiteExt session store" begin
@@ -386,55 +377,49 @@ end
     store = Agentif.SQLiteSessionStore(tempname(); embed = nothing)
     db = store.db
     search_store = store.search_store
-    sid = "session-1"
 
     entry = SessionEntry(;
         id = "entry-1",
         created_at = 1000.5,
         messages = AgentMessage[UserMessage("hello sqlite world")],
         user_id = "U100",
-        post_id = "P100",
         channel_id = "chan:alpha",
+        search_channel_id = "chan:alpha",
     )
-    append_session_entry!(store, sid, entry)
+    append_entry!(store, entry)
 
     channel_entry = SessionEntry(;
         id = "entry-2",
+        parent_id = "entry-1",
         created_at = 1001.5,
         messages = AgentMessage[UserMessage("second sqlite row")],
         user_id = "U200",
-        post_id = "P200",
         channel_id = "chan:beta",
+        search_channel_id = "chan:beta",
     )
-    append_session_entry!(store, sid, channel_entry)
+    append_entry!(store, channel_entry)
+    set_branch_leaf!(store, "branch-1", "entry-2")
 
-    @test session_entry_count(store, sid) == 2
+    @test get_entry(store, "entry-1") !== nothing
+    @test get_entry(store, "entry-2") !== nothing
+    @test get_branch_leaf(store, "branch-1") == "entry-2"
 
-    entries = session_entries(store, sid)
-    @test length(entries) == 2
-    @test entries[1].id == "entry-1"
-    @test entries[1].user_id == "U100"
-    @test entries[1].post_id == "P100"
-    @test entries[1].channel_id == "chan:alpha"
-    @test entries[2].id == "entry-2"
-    @test entries[2].user_id == "U200"
-    @test entries[2].post_id == "P200"
-    @test entries[2].channel_id == "chan:beta"
+    state = load_branch(store, "branch-1")
+    user_msgs = [Agentif.message_text(m) for m in state.messages if m isa UserMessage]
+    @test user_msgs == ["hello sqlite world", "second sqlite row"]
 
-    row_iter = SQLite.DBInterface.execute(db, "SELECT entry, user_id, post_id, channel_id FROM session_entries WHERE entry_id = ?", ("entry-1",))
+    row_iter = SQLite.DBInterface.execute(db, "SELECT entry, user_id, channel_id FROM session_entries WHERE entry_id = ?", ("entry-1",))
     row = iterate(row_iter)
     @test row !== nothing
     parsed = JSON.parse(row[1].entry, SessionEntry)
     @test parsed.id == "entry-1"
     @test parsed.user_id == "U100"
-    @test parsed.post_id == "P100"
     @test parsed.channel_id == "chan:alpha"
     @test row[1].user_id == "U100"
-    @test row[1].post_id == "P100"
     @test row[1].channel_id == "chan:alpha"
 
     results = LocalSearch.search(search_store, "hello sqlite world"; limit = 5)
-    matches = filter(r -> startswith(r.id, "session:$(sid):entry-1"), results)
+    matches = filter(r -> startswith(r.id, "session:entry:entry-1"), results)
     @test !isempty(matches)
     @test occursin("\"id\":\"entry-1\"", matches[1].text)
     @test occursin("\"messages\":", matches[1].text)
@@ -442,7 +427,7 @@ end
     tag_rows = SQLite.DBInterface.execute(
         db,
         "SELECT dt.tag FROM document_tags dt JOIN documents d ON d.id = dt.document_id WHERE d.key = ?",
-        ("session:$(sid):entry-1",),
+        ("session:entry:entry-1",),
     )
     tags = String[String(r.tag) for r in tag_rows]
     @test "session_entry" in tags
@@ -462,35 +447,34 @@ end
     end
     @test "entry" in cols
     @test "user_id" in cols
-    @test "post_id" in cols
     @test "channel_id" in cols
+    @test "search_channel_id" in cols
     @test "channel_flags" in cols
+    @test "parent_id" in cols
+    @test "first_kept_entry_id" in cols
 end
 
 @testset "session search channel visibility" begin
     store = InMemorySessionStore()
-    base_handler = make_base_handler()
-    handler = session_middleware(base_handler, store; session_id = "vis-test")
-    agent = make_agent()
 
     # Manually append entries with different channel visibility
     public_entry = SessionEntry(;
         id = "pub-1", messages = AgentMessage[UserMessage("public info")],
-        channel_id = "chan:public", channel_flags = 0x02,  # is_group=true, is_private=false
+        channel_id = "chan:public", search_channel_id = "chan:public", channel_flags = 0x02,  # is_group=true, is_private=false
     )
     private_entry = SessionEntry(;
         id = "priv-1", messages = AgentMessage[UserMessage("private secret")],
-        channel_id = "chan:dm", channel_flags = 0x01,  # is_group=false, is_private=true
+        channel_id = "chan:dm", search_channel_id = "chan:dm", channel_flags = 0x01,  # is_group=false, is_private=true
     )
     private_group_entry = SessionEntry(;
         id = "pgrp-1", messages = AgentMessage[UserMessage("private group info")],
-        channel_id = "chan:pgroup", channel_flags = 0x03,  # is_group=true, is_private=true
+        channel_id = "chan:pgroup", search_channel_id = "chan:pgroup", channel_flags = 0x03,  # is_group=true, is_private=true
     )
     legacy_entry = SessionEntry(;
         id = "legacy-1", messages = AgentMessage[UserMessage("legacy data")],
     )
     for e in [public_entry, private_entry, private_group_entry, legacy_entry]
-        append_session_entry!(store, "vis-test", e)
+        append_entry!(store, e)
     end
 
     # No channel context → see everything
@@ -498,16 +482,15 @@ end
     @test length(all_results) == 4
 
     # From the public channel → see public + legacy + own channel, NOT other private channels
-    pub_results = search_sessions(store, "info secret data"; limit=10, current_channel_id="chan:public")
-    pub_sids = Set(r.session_id for r in pub_results)
+    pub_results = search_sessions(store, "info secret data"; limit=10, current_search_channel_id="chan:public")
     @test length(pub_results) == 2  # public_entry + legacy_entry
 
     # From the DM → see own DM + public + legacy, NOT private group
-    dm_results = search_sessions(store, "info secret data"; limit=10, current_channel_id="chan:dm")
+    dm_results = search_sessions(store, "info secret data"; limit=10, current_search_channel_id="chan:dm")
     @test length(dm_results) == 3  # private_entry + public_entry + legacy_entry
 
     # From the private group → see own group + public + legacy, NOT DM
-    pgrp_results = search_sessions(store, "info secret data"; limit=10, current_channel_id="chan:pgroup")
+    pgrp_results = search_sessions(store, "info secret data"; limit=10, current_search_channel_id="chan:pgroup")
     @test length(pgrp_results) == 3  # private_group_entry + public_entry + legacy_entry
 end
 
@@ -680,35 +663,34 @@ end
     @testset "session compaction entry" begin
         # Normal entry appends messages
         state = AgentState()
-        entry1 = SessionEntry(; messages = AgentMessage[UserMessage("hello")])
+        entry1 = SessionEntry(; id="e1", messages = AgentMessage[UserMessage("hello")])
         Agentif.apply_session_entry!(state, entry1)
         @test length(state.messages) == 1
 
-        entry2 = SessionEntry(; messages = AgentMessage[
+        entry2 = SessionEntry(; id="e2", messages = AgentMessage[
             AssistantMessage(; provider = "t", api = "t", model = "t"),
             UserMessage("followup"),
         ])
         Agentif.apply_session_entry!(state, entry2)
         @test length(state.messages) == 3
 
-        # Compaction entry resets messages
+        # Compaction entry appends compaction + kept messages
         compaction_msg = CompactionSummaryMessage(; summary = "summary of prior conversation", tokens_before = 200, compacted_at = time())
         compaction_entry = SessionEntry(;
+            id="c1",
             messages = AgentMessage[compaction_msg, UserMessage("recent message")],
             is_compaction = true,
         )
         Agentif.apply_session_entry!(state, compaction_entry)
-        @test length(state.messages) == 2
-        @test state.messages[1] isa CompactionSummaryMessage
-        @test state.messages[2] isa UserMessage
-        @test message_text(state.messages[2]) == "recent message"
+        # apply_session_entry! just appends — lineage walk controls ordering
+        @test state.messages[end-1] isa CompactionSummaryMessage
+        @test state.messages[end] isa UserMessage
+        @test message_text(state.messages[end]) == "recent message"
 
         # Subsequent normal entry appends after compaction
-        entry3 = SessionEntry(; messages = AgentMessage[UserMessage("after compaction")])
+        entry3 = SessionEntry(; id="e3", messages = AgentMessage[UserMessage("after compaction")])
         Agentif.apply_session_entry!(state, entry3)
-        @test length(state.messages) == 3
-        @test state.messages[1] isa CompactionSummaryMessage
-        @test message_text(state.messages[3]) == "after compaction"
+        @test message_text(state.messages[end]) == "after compaction"
     end
 
     @testset "session_middleware writes compaction entry" begin
@@ -721,6 +703,7 @@ end
             push!(state.messages, compaction_msg)
             push!(state.messages, UserMessage("kept"))
             state.last_compaction = compaction_msg
+            state.compaction_kept_count = 1
             # Also add the assistant response
             msg = AssistantMessage(; provider = "test", api = "test", model = "test")
             Agentif.append_text!(msg, "response")
@@ -729,23 +712,17 @@ end
             state.most_recent_stop_reason = :stop
             return state
         end
-        handler = session_middleware(base_handler, store)
+        ch = SessionTestChannel("chan:compact", nothing, "msg-compact")
+        handler = session_middleware(base_handler, store; channel=ch)
         agent = make_agent()
         state = AgentState()
         result = handler(identity, agent, state, "hello", Abort())
-        sid = result.session_id
-
-        # Verify compaction entry was written
-        entries = session_entries(store, sid)
-        @test length(entries) == 1
-        @test entries[1].is_compaction == true
-        @test entries[1].messages[1] isa CompactionSummaryMessage
 
         # Verify last_compaction was cleared
         @test result.last_compaction === nothing
 
-        # Loading session should produce the compacted state
-        loaded = load_session(store, sid)
+        # Loading branch should produce the compacted state
+        loaded = load_branch(store, "chan:compact")
         @test loaded.messages[1] isa CompactionSummaryMessage
         @test loaded.messages[1].summary == "compacted"
     end

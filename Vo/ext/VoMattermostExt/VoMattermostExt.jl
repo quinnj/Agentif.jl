@@ -21,6 +21,7 @@ mutable struct MattermostChannel <: Agentif.AbstractChannel
     channel_id::String
     root_id::String
     post_id::String
+    source_post_id::String
     client::Mattermost.Client
     sm::Union{Nothing, Mattermost.StreamingMessage}
     io::Union{Nothing, IOBuffer}
@@ -35,7 +36,7 @@ function Agentif.start_streaming(ch::MattermostChannel)
         kwargs = isempty(ch.root_id) ? (;) : (; root_id=ch.root_id)
         try
             sm = Mattermost.with_client(ch.client) do
-                SEND_STREAMING_MESSAGE_FN[](ch.channel_id, "..."; min_interval=STREAM_MIN_INTERVAL_S, kwargs...)
+                SEND_STREAMING_MESSAGE_FN[](ch.channel_id, ""; min_interval=STREAM_MIN_INTERVAL_S, kwargs...)
             end
             ch.sm = sm
             if hasproperty(sm, :post_id)
@@ -128,19 +129,13 @@ function Agentif.send_message(ch::MattermostChannel, msg)
     return response
 end
 
+# A true thread reply has root_id set by the platform AND root_id differs from the message's own ID.
+# Top-level messages set root_id = post_id (self-referencing) just for reply-in-thread behavior.
+_is_thread(ch::MattermostChannel) = !isempty(ch.root_id) && ch.root_id != ch.source_post_id
+
 function Agentif.channel_id(ch::MattermostChannel)
     base = "mattermost:$(ch.channel_id)"
-    return isempty(ch.root_id) ? base : "$(base):$(ch.root_id)"
-end
-
-function Vo.get_followup_session_key(ch::MattermostChannel)
-    if !isempty(ch.root_id)
-        return Agentif.channel_id(ch)
-    end
-    if !isempty(ch.post_id)
-        return "mattermost:$(ch.channel_id):$(ch.post_id)"
-    end
-    return nothing
+    return _is_thread(ch) ? "$(base):$(ch.root_id)" : base
 end
 
 Agentif.channel_name(ch::MattermostChannel) = ch.display_name
@@ -152,10 +147,14 @@ function Agentif.get_current_user(ch::MattermostChannel)
     return Agentif.ChannelUser(ch.user_id, ch.user_name)
 end
 
-Agentif.source_message_id(ch::MattermostChannel) = isempty(ch.post_id) ? nothing : ch.post_id
+Agentif.entry_id(ch::MattermostChannel) = isempty(ch.source_post_id) ? nothing : ch.source_post_id
+Agentif.response_entry_id(ch::MattermostChannel) = isempty(ch.post_id) ? nothing : ch.post_id
+Agentif.parent_branch_id(ch::MattermostChannel) = _is_thread(ch) ? "mattermost:$(ch.channel_id)" : nothing
+Agentif.branch_entry_id(ch::MattermostChannel) = _is_thread(ch) ? ch.root_id : nothing
+Agentif.search_channel_id(ch::MattermostChannel) = "mattermost:$(ch.channel_id)"
 
 function Agentif.create_channel_tools(ch::MattermostChannel)
-    post_id = ch.post_id
+    post_id = ch.source_post_id
     client = ch.client
     isempty(post_id) && return Agentif.AgentTool[]
     react_fn = function react_to_message(emoji_name::String)
@@ -274,7 +273,7 @@ function _handle_posted(event, bot_user_id, bot_username, assistant)
 
     @info "VoMattermostExt: message" channel_id post_id direct_ping
 
-    ch = MattermostChannel(channel_id, root_id, post_id, Mattermost._get_client(), nothing, nothing, user_id, user_name, channel_type, "")
+    ch = MattermostChannel(channel_id, root_id, post_id, post_id, Mattermost._get_client(), nothing, nothing, user_id, user_name, channel_type, "")
     put!(assistant.event_queue, MattermostMessageEvent(ch, message, direct_ping))
 end
 
@@ -311,7 +310,7 @@ function _handle_reaction(event, bot_user_id, assistant)
 
     @info "VoMattermostExt: reaction" emoji=emoji_name post_id channel_id user_id
 
-    ch = MattermostChannel(channel_id, root_id, post_id, Mattermost._get_client(), nothing, nothing, user_id, user_name, "", "")
+    ch = MattermostChannel(channel_id, root_id, post_id, "", Mattermost._get_client(), nothing, nothing, user_id, user_name, "", "")
     put!(assistant.event_queue, MattermostReactionEvent(ch, emoji_name, user_name, reacted_to))
 end
 
@@ -348,7 +347,7 @@ function _fetch_channels(client::Mattermost.Client, bot_user_id::String)
     teams = Mattermost.get_teams()
     for team in teams
         for mm_ch in Mattermost.get_channels_for_user(bot_user_id, team.id)
-            push!(channels, MattermostChannel(mm_ch.id, "", "", client, nothing, nothing, "", "", mm_ch.type, mm_ch.display_name))
+            push!(channels, MattermostChannel(mm_ch.id, "", "", "", client, nothing, nothing, "", "", mm_ch.type, mm_ch.display_name))
         end
     end
     return channels

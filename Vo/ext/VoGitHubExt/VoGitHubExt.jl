@@ -19,8 +19,6 @@ end
 
 Vo.get_name(ev::GitHubWebhookEvent) = "github_$(ev.kind)"
 
-Vo.get_session_key(ev::GitHubWebhookEvent) = _session_key(ev)
-
 function Vo.event_content(ev::GitHubWebhookEvent)
     p = ev.payload
     lines = String["[GitHub $(ev.kind) event on $(ev.repo_name)]"]
@@ -293,40 +291,6 @@ end
 function _format_generic!(lines, p)
     action = _get(p, "action")
     action !== nothing && push!(lines, "Action: $action")
-end
-
-# ─── Session keys ───
-
-function _session_key(ev::GitHubWebhookEvent)
-    p = ev.payload
-    repo = ev.repo_name
-    if ev.kind == "pull_request" || ev.kind == "pull_request_review" ||
-       ev.kind == "pull_request_review_comment" || ev.kind == "pull_request_review_thread"
-        pr = get(() -> nothing, p, "pull_request")
-        pr isa AbstractDict || return "github:$repo:$(ev.kind)"
-        n = _get(pr, "number")
-        n !== nothing && return "github:$repo:pull_request:$n"
-    elseif ev.kind == "issues" || ev.kind == "issue_comment"
-        issue = get(() -> nothing, p, "issue")
-        issue isa AbstractDict || return "github:$repo:$(ev.kind)"
-        n = _get(issue, "number")
-        n !== nothing && return "github:$repo:issue:$n"
-    elseif ev.kind == "push"
-        ref = _get(p, "ref")
-        ref !== nothing && return "github:$repo:push:$ref"
-    elseif ev.kind == "discussion" || ev.kind == "discussion_comment"
-        disc = get(() -> nothing, p, "discussion")
-        disc isa AbstractDict || return "github:$repo:$(ev.kind)"
-        n = _get(disc, "number")
-        n !== nothing && return "github:$repo:discussion:$n"
-    elseif ev.kind in ("check_run", "check_suite", "workflow_run", "workflow_job")
-        obj = get(() -> nothing, p, ev.kind)
-        if obj isa AbstractDict
-            id = _get(obj, "id")
-            id !== nothing && return "github:$repo:$(ev.kind):$id"
-        end
-    end
-    return "github:$repo:$(ev.kind)"
 end
 
 # ─── Event types (one per webhook kind) ───

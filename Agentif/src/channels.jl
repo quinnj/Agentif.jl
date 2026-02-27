@@ -65,16 +65,64 @@ Default: `nothing` (no user identity available).
 function get_current_user end
 get_current_user(::AbstractChannel) = nothing
 
-"""
-    source_message_id(ch::AbstractChannel) -> Union{Nothing, String}
+# --- Session tree interface ---
 
-Return the platform-specific message ID of the incoming message that triggered
-this evaluation. Used for tracking which stored data (memories, session entries)
-originated from a specific message, enabling scrubbing on deletion.
-Default: `nothing` (no message ID tracking).
 """
-function source_message_id end
-source_message_id(::AbstractChannel) = nothing
+    branch_id(ch::AbstractChannel) -> String
+
+Which session branch does this channel map to?
+Default: `channel_id(ch)`.
+"""
+function branch_id end
+branch_id(ch::AbstractChannel) = channel_id(ch)
+
+"""
+    parent_branch_id(ch::AbstractChannel) -> Union{Nothing, String}
+
+For threads: the parent channel's branch_id (to fork from).
+Default: `nothing` (no parent branch).
+"""
+function parent_branch_id end
+parent_branch_id(::AbstractChannel) = nothing
+
+"""
+    branch_entry_id(ch::AbstractChannel) -> Union{Nothing, String}
+
+For threads: the specific parent entry to fork from.
+Default: `nothing` (fork from parent branch's current leaf).
+"""
+function branch_entry_id end
+branch_entry_id(::AbstractChannel) = nothing
+
+"""
+    entry_id(ch::AbstractChannel) -> Union{Nothing, String}
+
+Platform-specific message ID for the incoming message that triggered this
+evaluation. Used as the session entry ID, and for scrubbing on deletion.
+Default: `nothing`.
+"""
+function entry_id end
+entry_id(::AbstractChannel) = nothing
+
+"""
+    response_entry_id(ch::AbstractChannel) -> Union{Nothing, String}
+
+Platform-specific message ID for the bot's response. Used as fallback entry ID
+when `entry_id` is nothing (proactive bot messages with no incoming message).
+Default: `nothing`.
+"""
+function response_entry_id end
+response_entry_id(::AbstractChannel) = nothing
+
+"""
+    search_channel_id(ch::AbstractChannel) -> String
+
+Base channel ID (without thread) for search tagging. Threads return their
+parent channel so thread entries are discoverable from channel-level search.
+Default: `channel_id(ch)`.
+"""
+function search_channel_id end
+search_channel_id(ch::AbstractChannel) = channel_id(ch)
 
 """
     create_channel_tools(ch::AbstractChannel) -> Vector{AgentTool}

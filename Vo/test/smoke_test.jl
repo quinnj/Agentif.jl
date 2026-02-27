@@ -165,9 +165,9 @@ end
     @test "vo_event_types" in tables
     @test "vo_event_handlers" in tables
     @test "vo_handler_event_types" in tables
-    @test "vo_sessions" in tables
     @test "vo_agent_metadata" in tables
     @test "session_entries" in tables  # from AgentifSQLiteExt
+    @test "session_branches" in tables  # from AgentifSQLiteExt
     @test "tempus_jobs" in tables  # from TempusSQLiteExt
     println("  Tables: $tables")
 
@@ -390,30 +390,23 @@ end
 # ============================================================================
 # Session helper
 # ============================================================================
-@testset "Session helper" begin
+@testset "Session store branch API" begin
     a = make_test_assistant()
+    store = a.session_store
 
-    # First call creates a new session
-    sid1 = Vo._get_or_create_session(a.db, "handler-1")
-    @test !isempty(sid1)
+    # Append entries and set branch leaf
+    Agentif.append_entry!(store, Agentif.SessionEntry(; id="e1", messages=Agentif.AgentMessage[Agentif.UserMessage("hello")]))
+    Agentif.set_branch_leaf!(store, "branch-1", "e1")
+    @test Agentif.get_branch_leaf(store, "branch-1") == "e1"
 
-    # Second call returns the same session
-    sid2 = Vo._get_or_create_session(a.db, "handler-1")
-    @test sid1 == sid2
+    # Different branch has no leaf
+    @test Agentif.get_branch_leaf(store, "branch-2") === nothing
 
-    # Different handler gets different session
-    sid3 = Vo._get_or_create_session(a.db, "handler-2")
-    @test sid3 != sid1
+    # Load branch returns the state
+    state = Agentif.load_branch(store, "branch-1")
+    @test length(state.messages) == 1
 
-    # Follow-up channel key can be bound to existing session.
-    Vo._bind_session_key!(a.db, "slack:C123:1700000000.123", sid1)
-    sid4 = Vo._get_or_create_session(a.db, "slack:C123:1700000000.123")
-    @test sid4 == sid1
-
-    # Verify in SQLite
-    @test count_rows(a.db, "vo_sessions") == 3
-
-    println("  ✓ Session helper passed")
+    println("  ✓ Session store branch API passed")
 end
 
 # ============================================================================

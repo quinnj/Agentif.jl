@@ -1,58 +1,86 @@
 abstract type SessionStore end
 
 @kwarg struct SessionEntry
-    id::Union{Nothing, String} = nothing
+    id::String
+    parent_id::Union{Nothing, String} = nothing
     created_at::Float64 = time()
     messages::Vector{AgentMessage} = AgentMessage[]
     is_compaction::Bool = false
+    first_kept_entry_id::Union{Nothing, String} = nothing
     is_deleted::Bool = false
     user_id::Union{Nothing, String} = nothing
-    post_id::Union{Nothing, String} = nothing
     channel_id::Union{Nothing, String} = nothing
+    search_channel_id::Union{Nothing, String} = nothing
     channel_flags::Union{Nothing, Int} = nothing
+end
+
+struct EntryBoundary
+    entry_id::String
+    message_start::Int  # 1-based index into state.messages
+    message_end::Int
 end
 
 mutable struct InMemorySessionStore <: SessionStore
     lock::ReentrantLock
-    sessions::Dict{String, AgentState}
-    entries::Dict{String, Vector{SessionEntry}}
+    entries::Dict{String, SessionEntry}
+    branches::Dict{String, String}
+    branch_locks::Dict{String, ReentrantLock}
 end
 
-InMemorySessionStore() = InMemorySessionStore(ReentrantLock(), Dict{String, AgentState}(), Dict{String, Vector{SessionEntry}}())
-
-mutable struct FileSessionStore <: SessionStore
-    directory::String
-    lock::ReentrantLock
-    offsets::Dict{String, Vector{Int64}}
-    counts::Dict{String, Int64}
-    indexed::Set{String}
-end
-
-function FileSessionStore(directory::AbstractString)
-    dir = abspath(directory)
-    mkpath(dir)
-    return FileSessionStore(dir, ReentrantLock(), Dict{String, Vector{Int64}}(), Dict{String, Int64}(), Set{String}())
-end
+InMemorySessionStore() = InMemorySessionStore(ReentrantLock(), Dict{String, SessionEntry}(), Dict{String, String}(), Dict{String, ReentrantLock}())
 
 # Stubs for package extension (AgentifSQLiteExt)
 function SQLiteSessionStore end
 function init_sqlite_session_schema! end
 
-function ensure_session_id(session_id::String)
-    isempty(session_id) && throw(ArgumentError("session_id is required"))
-    occursin(r"[\\/]", session_id) && throw(ArgumentError("session_id must not contain path separators: $session_id"))
-    return session_id
+# ─── SessionStore interface ───
+
+function append_entry! end
+function get_entry end
+function get_branch_leaf end
+function set_branch_leaf! end
+function lock_branch end
+
+# ─── InMemorySessionStore implementations ───
+
+function append_entry!(store::InMemorySessionStore, entry::SessionEntry)
+    lock(store.lock) do
+        store.entries[entry.id] = entry
+    end
 end
 
-function session_path(store::FileSessionStore, session_id::String)
-    sid = ensure_session_id(session_id)
-    return joinpath(store.directory, sid)
+function get_entry(store::InMemorySessionStore, entry_id::String)
+    return lock(store.lock) do
+        get(store.entries, entry_id, nothing)
+    end
 end
+
+function get_branch_leaf(store::InMemorySessionStore, branch_id::String)
+    return lock(store.lock) do
+        get(store.branches, branch_id, nothing)
+    end
+end
+
+function set_branch_leaf!(store::InMemorySessionStore, branch_id::String, entry_id::String)
+    lock(store.lock) do
+        store.branches[branch_id] = entry_id
+    end
+end
+
+function lock_branch(f::Function, store::InMemorySessionStore, branch_id::String)
+    branch_lock = lock(store.lock) do
+        get!(store.branch_locks, branch_id) do
+            ReentrantLock()
+        end
+    end
+    return lock(branch_lock) do
+        f()
+    end
+end
+
+# ─── Lineage walk ───
 
 function apply_session_entry!(state::AgentState, entry::SessionEntry)
-    if entry.is_compaction
-        empty!(state.messages)
-    end
     append!(state.messages, entry.messages)
     for msg in entry.messages
         msg isa AssistantMessage || continue
@@ -61,99 +89,49 @@ function apply_session_entry!(state::AgentState, entry::SessionEntry)
     return state
 end
 
-function ensure_session_index!(store::FileSessionStore, session_id::String)
-    session_id in store.indexed && return
-    offsets = Int64[]
-    count = 0
-    path = session_path(store, session_id)
-    if isfile(path)
-        open(path, "r") do io
-            while !eof(io)
-                push!(offsets, position(io))
-                readline(io)
-                count += 1
+function _collect_lineage(store::SessionStore, leaf_entry_id::String)
+    entries = SessionEntry[]
+    compaction_idx = 0
+    stop_at = nothing
+    current_id = leaf_entry_id
+
+    while current_id !== nothing
+        entry = get_entry(store, current_id)
+        entry === nothing && break
+        push!(entries, entry)
+
+        if entry.is_compaction && compaction_idx == 0
+            compaction_idx = length(entries)
+            stop_at = entry.first_kept_entry_id
+            if stop_at === nothing
+                break  # everything compacted, no kept entries
             end
+        elseif stop_at !== nothing && entry.id == stop_at
+            break  # included the stop_at entry, done
         end
+
+        current_id = entry.parent_id
     end
-    store.offsets[session_id] = offsets
-    store.counts[session_id] = count
-    push!(store.indexed, session_id)
-    return
+
+    # entries is leaf→root order, reverse to root→leaf
+    reverse!(entries)
+
+    # If compaction found, reorder: compaction FIRST, then kept, then post-compaction
+    if compaction_idx > 0
+        comp_pos = length(entries) - compaction_idx + 1
+        compaction_entry = entries[comp_pos]
+        kept = entries[1:comp_pos-1]
+        post_compaction = entries[comp_pos+1:end]
+        entries = vcat([compaction_entry], kept, post_compaction)
+    end
+
+    return entries
 end
 
-function session_entry_count(store::InMemorySessionStore, session_id::String)
-    return lock(store.lock) do
-        entries = get(() -> SessionEntry[], store.entries, session_id)
-        return length(entries)
-    end
-end
-
-function session_entry_count(store::FileSessionStore, session_id::String)
-    return lock(store.lock) do
-        ensure_session_index!(store, session_id)
-        return get(() -> 0, store.counts, session_id)
-    end
-end
-
-function session_entries(store::InMemorySessionStore, session_id::String; start::Int = 1, limit::Union{Nothing, Int} = nothing)
-    return lock(store.lock) do
-        entries = get(() -> SessionEntry[], store.entries, session_id)
-        total = length(entries)
-        total == 0 && return SessionEntry[]
-        start = max(1, start)
-        stop = limit === nothing ? total : min(total, start + limit - 1)
-        stop < start && return SessionEntry[]
-        return entries[start:stop]
-    end
-end
-
-function session_entries(store::FileSessionStore, session_id::String; start::Int = 1, limit::Union{Nothing, Int} = nothing)
-    return lock(store.lock) do
-        ensure_session_index!(store, session_id)
-        total = get(() -> 0, store.counts, session_id)
-        total == 0 && return SessionEntry[]
-        start = max(1, start)
-        stop = limit === nothing ? total : min(total, start + limit - 1)
-        stop < start && return SessionEntry[]
-        offsets = get(() -> Int64[], store.offsets, session_id)
-        path = session_path(store, session_id)
-        entries = SessionEntry[]
-        isfile(path) || return entries
-        open(path, "r") do io
-            final_idx = min(stop, length(offsets))
-            for idx in start:final_idx
-                seek(io, offsets[idx])
-                line = readline(io)
-                isempty(strip(line)) && continue
-                parsed = try
-                    JSON.parse(line, SessionEntry)
-                catch e
-                    @warn "Skipping invalid session entry line" session_id index=idx error=sprint(showerror, e)
-                    nothing
-                end
-                parsed === nothing && continue
-                push!(entries, parsed)
-            end
-        end
-        return entries
-    end
-end
-
-function load_session(store::InMemorySessionStore, session_id::String)
-    return lock(store.lock) do
-        return get!(store.sessions, session_id) do
-            state = AgentState()
-            entries = get(() -> SessionEntry[], store.entries, session_id)
-            for entry in entries
-                apply_session_entry!(state, entry)
-            end
-            state
-        end
-    end
-end
-
-function load_session(store::FileSessionStore, session_id::String)
-    entries = session_entries(store, session_id)
+function load_branch(store::SessionStore, branch_id::String)
+    leaf_id = get_branch_leaf(store, branch_id)
+    leaf_id === nothing && return AgentState()
+    entries = _collect_lineage(store, leaf_id)
     state = AgentState()
     for entry in entries
         apply_session_entry!(state, entry)
@@ -161,72 +139,29 @@ function load_session(store::FileSessionStore, session_id::String)
     return state
 end
 
-function append_session_entry!(store::InMemorySessionStore, session_id::String, entry::SessionEntry)
-    lock(store.lock) do
-        entries = get!(() -> SessionEntry[], store.entries, session_id)
-        push!(entries, entry)
-        state = get!(() -> AgentState(), store.sessions, session_id)
+function load_branch_with_boundaries(store::SessionStore, branch_id::String)
+    leaf_id = get_branch_leaf(store, branch_id)
+    if leaf_id === nothing
+        return AgentState(), EntryBoundary[]
+    end
+    entries = _collect_lineage(store, leaf_id)
+    state = AgentState()
+    boundaries = EntryBoundary[]
+    for entry in entries
+        start_idx = length(state.messages) + 1
         apply_session_entry!(state, entry)
-    end
-    return
-end
-
-function append_session_entry!(store::FileSessionStore, session_id::String, entry::SessionEntry)
-    lock(store.lock) do
-        path = session_path(store, session_id)
-        mkpath(dirname(path))
-        open(path, "a+") do io
-            seekend(io)
-            offset = position(io)
-            write(io, JSON.json(entry))
-            write(io, '\n')
-            flush(io)
-            if session_id in store.indexed
-                offsets = get!(() -> Int64[], store.offsets, session_id)
-                push!(offsets, offset)
-                store.counts[session_id] = get(() -> 0, store.counts, session_id) + 1
-            end
+        end_idx = length(state.messages)
+        if end_idx >= start_idx
+            push!(boundaries, EntryBoundary(entry.id, start_idx, end_idx))
         end
     end
-    return
-end
-
-function save_session!(store::InMemorySessionStore, session_id::String, state::AgentState)
-    lock(store.lock) do
-        store.sessions[session_id] = state
-        entry = SessionEntry(; id = nothing, created_at = time(), messages = copy(state.messages))
-        store.entries[session_id] = [entry]
-    end
-    return
-end
-
-function save_session!(store::FileSessionStore, session_id::String, state::AgentState)
-    entry = SessionEntry(; id = nothing, created_at = time(), messages = copy(state.messages))
-    path = session_path(store, session_id)
-    lock(store.lock) do
-        mkpath(dirname(path))
-        tmp_path = string(path, ".tmp.", string(UID8()))
-        open(tmp_path, "w") do io
-            write(io, JSON.json(entry))
-            write(io, '\n')
-            flush(io)
-        end
-        mv(tmp_path, path; force = true)
-        store.offsets[session_id] = [0]
-        store.counts[session_id] = 1
-        push!(store.indexed, session_id)
-    end
-    return
-end
-
-function new_session_id()
-    return string(UID8())
+    return state, boundaries
 end
 
 # ─── Session search ───
 
 struct SessionSearchResult
-    session_id::String
+    entry_id::String
     entry_text::String
     score::Float64
 end
@@ -254,80 +189,34 @@ function _keyword_score(text::String, keywords::Vector{String})
     return count(kw -> occursin(kw, text_lower), keywords) / length(keywords)
 end
 
-# Channel visibility: entry is visible if no channel context, or entry is from
-# the current channel, or entry is from a public channel (is_private bit unset).
+# Channel visibility: entry is visible if no search context, or entry shares the
+# same base channel, or entry is from a public channel (is_private bit unset).
 # Bitmask: 0x01 = is_private, 0x02 = is_group
-function _visible_entry(entry::SessionEntry, current_channel_id::Union{Nothing, String})
-    current_channel_id === nothing && return true
-    entry.channel_id === nothing && return true
+function _visible_entry(entry::SessionEntry, current_search_channel_id::Union{Nothing, String})
+    current_search_channel_id === nothing && return true
+    entry.search_channel_id === nothing && return true
     entry.channel_flags === nothing && return true
-    entry.channel_id == current_channel_id && return true
+    entry.search_channel_id == current_search_channel_id && return true
     (entry.channel_flags & 0x01) == 0 && return true
     return false
 end
 
 # Default: no results
-search_sessions(store::SessionStore, query::String; limit::Int=10, current_channel_id::Union{Nothing, String}=nothing) = SessionSearchResult[]
+search_sessions(store::SessionStore, query::String; limit::Int=10, current_search_channel_id::Union{Nothing, String}=nothing) = SessionSearchResult[]
 
-function search_sessions(store::InMemorySessionStore, query::String; limit::Int=10, current_channel_id::Union{Nothing, String}=nothing)
+function search_sessions(store::InMemorySessionStore, query::String; limit::Int=10, current_search_channel_id::Union{Nothing, String}=nothing)
     keywords = [lowercase(k) for k in split(strip(query); keepempty=false)]
     isempty(keywords) && return SessionSearchResult[]
     results = SessionSearchResult[]
     lock(store.lock) do
-        for (sid, entries) in store.entries
-            for entry in entries
-                entry.is_deleted && continue
-                _visible_entry(entry, current_channel_id) || continue
-                text = _entry_search_text(entry)
-                if _matches_keywords(text, keywords)
-                    push!(results, SessionSearchResult(sid, text, _keyword_score(text, keywords)))
-                end
-            end
-        end
-    end
-    sort!(results; by=r -> r.score, rev=true)
-    return first(results, min(limit, length(results)))
-end
-
-function search_sessions(store::FileSessionStore, query::String; limit::Int=10, current_channel_id::Union{Nothing, String}=nothing)
-    keywords = [lowercase(k) for k in split(strip(query); keepempty=false)]
-    isempty(keywords) && return SessionSearchResult[]
-    limit <= 0 && return SessionSearchResult[]
-    results = SessionSearchResult[]
-    files = lock(store.lock) do
-        isdir(store.directory) || return String[]
-        files = Tuple{String, Float64}[]
-        for fname in readdir(store.directory)
-            fpath = joinpath(store.directory, fname)
-            isfile(fpath) || continue
-            mtime = try
-                stat(fpath).mtime
-            catch
-                0.0
-            end
-            push!(files, (fpath, mtime))
-        end
-        sort!(files; by = x -> x[2], rev = true)
-        return [f[1] for f in files]
-    end
-    for fpath in files
-        sid = basename(fpath)
-        for line in eachline(fpath)
-            isempty(strip(line)) && continue
-            entry = try
-                JSON.parse(line, SessionEntry)
-            catch
-                continue
-            end
+        for (eid, entry) in store.entries
             entry.is_deleted && continue
-            _visible_entry(entry, current_channel_id) || continue
+            _visible_entry(entry, current_search_channel_id) || continue
             text = _entry_search_text(entry)
             if _matches_keywords(text, keywords)
-                push!(results, SessionSearchResult(sid, text, _keyword_score(text, keywords)))
+                push!(results, SessionSearchResult(eid, text, _keyword_score(text, keywords)))
             end
-            length(results) >= limit * 10 && break
         end
-        length(results) >= limit * 10 && break
     end
     sort!(results; by=r -> r.score, rev=true)
     return first(results, min(limit, length(results)))
@@ -335,3 +224,15 @@ end
 
 # Default no-op: scrub_post! is implemented by store types that support it
 scrub_post!(store::SessionStore, post_id::String) = nothing
+
+function scrub_post!(store::InMemorySessionStore, post_id::String)
+    lock(store.lock) do
+        entry = get(store.entries, post_id, nothing)
+        entry === nothing && return
+        store.entries[post_id] = SessionEntry(;
+            id=entry.id, parent_id=entry.parent_id, created_at=entry.created_at,
+            is_deleted=true, channel_id=entry.channel_id,
+            search_channel_id=entry.search_channel_id, channel_flags=entry.channel_flags,
+        )
+    end
+end

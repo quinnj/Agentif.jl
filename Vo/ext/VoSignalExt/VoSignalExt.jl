@@ -58,7 +58,7 @@ function Agentif.get_current_user(ch::SignalChannel)
     return Agentif.ChannelUser(ch.user_id, ch.user_name)
 end
 
-Agentif.source_message_id(ch::SignalChannel) = ch.source_timestamp
+Agentif.entry_id(ch::SignalChannel) = ch.source_timestamp
 
 function Agentif.create_channel_tools(ch::SignalChannel)
     isempty(ch.user_id) && return Agentif.AgentTool[]

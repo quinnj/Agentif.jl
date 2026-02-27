@@ -230,6 +230,7 @@ function compact!(agent::Agent, state::AgentState, config::CompactionConfig, mod
 
     # Signal to session_middleware
     state.last_compaction = compaction_msg
+    state.compaction_kept_count = length(to_keep)
 
     return
 end
