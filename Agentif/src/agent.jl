@@ -119,28 +119,55 @@ end
 function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
     return Future{ToolResultMessage}() do
         f(ToolExecutionStartEvent(tc))
+        @debug "Tool execution started" tool = tc.name call_id = tc.call_id
         start_ns = time_ns()
         is_error = false
         output = ""
         args = nothing
         parse_error = nothing
+        parse_bt = nothing
         try
             args = parse_tool_arguments(tc.arguments, parameters(tool))
         catch e
             parse_error = e
+            parse_bt = catch_backtrace()
         end
 
         if parse_error !== nothing
             is_error = true
             raw = tc.arguments
             raw_preview = length(raw) > 500 ? string(raw[1:500], "... (truncated, length=$(length(raw)))") : raw
-            output = "Failed to parse tool arguments: $(sprint(showerror, parse_error))\nRaw arguments: $(raw_preview)"
+            parse_msg = sprint(showerror, parse_error)
+            @warn "Tool argument parsing failed" tool = tc.name call_id = tc.call_id exception = (parse_error, parse_bt)
+            output = render_tool_error_json(
+                ;
+                error_kind = "tool_argument_parse_failed",
+                message = "Failed to parse tool arguments: $(parse_msg)",
+                tool = tc.name,
+                call_id = tc.call_id,
+                exception = parse_error,
+                backtrace = parse_bt,
+                raw_arguments = raw_preview,
+                suggested_fix = "Provide a valid JSON object matching the tool schema and include all required arguments.",
+            )
         else
             try
                 output = string(tool.func(args...))
             catch e
+                bt = catch_backtrace()
                 is_error = true
-                output = sprint(showerror, e)
+                error_msg = sprint(showerror, e)
+                @error "Tool execution failed" tool = tc.name call_id = tc.call_id exception = (e, bt)
+                output = render_tool_error_json(
+                    ;
+                    error_kind = "tool_execution_failed",
+                    message = error_msg,
+                    tool = tc.name,
+                    call_id = tc.call_id,
+                    exception = e,
+                    backtrace = bt,
+                    suggested_fix = "Inspect error_kind/message and call the tool again with corrected arguments or preconditions.",
+                )
             end
         end
         max_bytes = MAX_TOOL_RESULT_BYTES[]
@@ -150,6 +177,7 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
         end
         trm = ToolResultMessage(tc.call_id, tc.name, output; is_error)
         duration_ms = Int64(div(time_ns() - start_ns, 1_000_000))
+        @debug "Tool execution completed" tool = tc.name call_id = tc.call_id duration_ms is_error output_bytes = sizeof(output)
         f(ToolExecutionEndEvent(tc, trm, duration_ms))
         return trm
     end

@@ -78,8 +78,7 @@ function create_terminal_tools(base_dir::AbstractString = pwd())
             max_output_lines::Union{Nothing, Int} = nothing,
             max_output_tokens::Union{Nothing, Int} = nothing,
         ) = begin
-            debug_pty = get(ENV, "AGENTIF_DEBUG_PTY", "") != ""
-            debug_pty && @info "exec_command start" cmd = cmd workdir = workdir shell = shell
+            @debug "exec_command start" cmd workdir shell
             cleanup_exited_sessions!(PTY_REGISTRY)
             check_session_limit_and_warn(PTY_REGISTRY)
 
@@ -178,6 +177,8 @@ function create_terminal_tools(base_dir::AbstractString = pwd())
                     events = events,
                 )
             catch err
+                bt = catch_backtrace()
+                @warn "exec_command failed" cmd work_dir exception = (err, bt)
                 remove_session!(PTY_REGISTRY, session_id; mark_status = SESSION_STATUS_ERROR, close_session = true)
                 push!(events, make_event(PTY_REGISTRY, "error"; session_id, payload = Dict("message" => string(err))))
                 return render_process_response(
@@ -206,8 +207,7 @@ function create_terminal_tools(base_dir::AbstractString = pwd())
             max_output_lines::Union{Nothing, Int} = nothing,
             max_output_tokens::Union{Nothing, Int} = nothing,
         ) = begin
-            debug_pty = get(ENV, "AGENTIF_DEBUG_PTY", "") != ""
-            debug_pty && @info "write_stdin start" session_id = session_id
+            @debug "write_stdin start" session_id chars_length = ncodeunits(chars)
 
             meta = get_session(PTY_REGISTRY, session_id)
             if meta === nothing
@@ -286,6 +286,8 @@ function create_terminal_tools(base_dir::AbstractString = pwd())
                     events = events,
                 )
             catch err
+                bt = catch_backtrace()
+                @warn "write_stdin failed" session_id exception = (err, bt)
                 remove_session!(PTY_REGISTRY, session_id; mark_status = SESSION_STATUS_UNKNOWN, close_session = true)
                 push!(events, make_event(PTY_REGISTRY, "error"; session_id, payload = Dict("message" => string(err))))
                 return render_process_response(

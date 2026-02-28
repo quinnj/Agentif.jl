@@ -31,6 +31,7 @@ function tool_call_middleware(agent_handler::AgentHandler)
         while true
             check_abort(abort)
             turn_id = UID8()
+            @debug "Agent turn started" turn_id model = agent.model.id pending_calls = length(current_state.pending_tool_calls)
             f(TurnStartEvent(turn_id))
             try
                 current_state = agent_handler(f, agent, current_state, next_input, abort; kw...)
@@ -45,6 +46,7 @@ function tool_call_middleware(agent_handler::AgentHandler)
                 end
 
                 empty!(futures) # empty futures before we push new tool call evals
+                @debug "Agent requested tool calls" turn_id tool_call_count = length(current_state.pending_tool_calls) tool_names = [tc.name for tc in current_state.pending_tool_calls]
                 for tc in current_state.pending_tool_calls
                     check_abort(abort)
                     tool = findtool(agent.tools, tc.name)
@@ -57,6 +59,7 @@ function tool_call_middleware(agent_handler::AgentHandler)
                     push!(tool_results, wait(fut))
                 end
                 check_abort(abort)
+                @debug "Tool calls completed" turn_id tool_result_count = length(tool_results) error_count = count(trm -> trm.is_error, tool_results)
                 next_input = tool_results
             finally
                 f(TurnEndEvent(turn_id, last_assistant_message(current_state), nothing))
@@ -82,6 +85,7 @@ end
 function evaluate_middleware(agent_handler::AgentHandler)
     return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)
         evaluate_id = UID8()
+        @debug "Agent evaluate started" evaluate_id model = agent.model.id tool_count = length(agent.tools) input_type = string(typeof(current_input))
         f(AgentEvaluateStartEvent(evaluate_id))
         result_state = nothing
         try
@@ -96,8 +100,14 @@ function evaluate_middleware(agent_handler::AgentHandler)
             if e isa CapturedException && e.ex isa AbortEvaluation
                 return result_state === nothing ? state : result_state
             end
+            @error "Agent evaluate failed" evaluate_id model = agent.model.id exception = (e, catch_backtrace())
             rethrow()
         finally
+            if result_state !== nothing
+                @debug "Agent evaluate completed" evaluate_id stop_reason = result_state.most_recent_stop_reason message_count = length(result_state.messages)
+            else
+                @debug "Agent evaluate completed without state" evaluate_id
+            end
             f(AgentEvaluateEndEvent(evaluate_id, result_state))
         end
     end
@@ -329,7 +339,13 @@ function build_default_handler(
     return handler
 end
 
-evaluate(agent::Agent, input::AgentTurnInput; abort::Abort = Abort(), kw...) = evaluate(identity, agent, input; abort, kw...)
+evaluate(
+    agent::Agent,
+    input::AgentTurnInput;
+    abort::Abort = Abort(),
+    level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing,
+    kw...,
+) = evaluate(identity, agent, input; abort, level, kw...)
 
 function evaluate(
         f::Function,
@@ -346,11 +362,14 @@ function evaluate(
         channel::Union{Nothing, AbstractChannel} = nothing,
         abort::Abort = Abort(),
         repeat_input::Bool = false,
+        level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing,
         kw...,
     )
     if repeat_input && input isa String
         input = input * "\n\n" * input
     end
     handler = build_default_handler(; base_handler, compaction_config, steer_queue, message_queue, session_store, input_guardrail, skill_registry, channel)
-    return handler(f, agent, state, input, abort; kw...)
+    return with_log_level(level) do
+        handler(f, agent, state, input, abort; kw...)
+    end
 end

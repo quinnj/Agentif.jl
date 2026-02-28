@@ -416,7 +416,10 @@ function create_codex_tool()
             stdout_text = fetch(output_task)
             close(process)
             stderr_text = String(take!(stderr_buf))
-            timed_out && error("Codex timed out after $(timeout) seconds")
+            if timed_out
+                @warn "Codex tool timed out" directory timeout_s = timeout
+                error("Codex timed out after $(timeout) seconds")
+            end
 
             session_id = nothing
             agent_messages = String[]
@@ -447,6 +450,7 @@ function create_codex_tool()
                             end
                             if exit_code !== nothing && exit_code != 0
                                 err = "Command failed: $(cmd)\nExit code: $(exit_code)\nOutput: $(output)"
+                                @warn "Codex command failed" directory command = cmd exit_code
                                 push!(errors, err)
                             end
                         end
@@ -455,7 +459,10 @@ function create_codex_tool()
                 end
             end
 
-            !isempty(stderr_text) && push!(errors, "Codex stderr: $(stderr_text)")
+            if !isempty(stderr_text)
+                @warn "Codex stderr output" directory stderr_preview = truncate_tool_output(stderr_text; label = "stderr")
+                push!(errors, "Codex stderr: $(stderr_text)")
+            end
 
             summary = join(agent_messages, "\n\n")
             summary = truncate_tool_output(summary; label = "Summary")

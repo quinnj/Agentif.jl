@@ -96,6 +96,38 @@ start!(::LLMToolsEventSource, ::AgentAssistant) = nothing
 
 const _NAME_RE = r"^[a-z0-9]+(-[a-z0-9]+)*$"
 
+function _assistant_log_level()
+    assistant = get_current_assistant()
+    assistant === nothing && return nothing
+    return assistant.log_level
+end
+
+function _async_tool_error_json(
+        ;
+        tool::String,
+        session_name::String,
+        operation::String,
+        error_kind::String,
+        err::Exception,
+        bt = nothing,
+        suggested_fix::Union{Nothing, String} = nothing,
+    )
+    return Agentif.render_tool_error_json(
+        ;
+        error_kind,
+        message = sprint(showerror, err),
+        tool,
+        call_id = session_name,
+        exception = err,
+        backtrace = bt,
+        suggested_fix,
+        extra = Dict(
+            "operation" => operation,
+            "session_name" => session_name,
+        ),
+    )
+end
+
 function _validate_name(es::LLMToolsEventSource, name::String)
     occursin(_NAME_RE, name) || error("Invalid name '$name': must be lowercase alphanumeric with hyphens (e.g. 'my-agent')")
     lock(es.lock) do
@@ -136,6 +168,7 @@ function _register_async_session!(
     lock(es.lock) do
         es.sessions[name] = session
     end
+    @info "LLMTools async session registered" name kind registry_id event_type
     return session
 end
 
@@ -154,6 +187,7 @@ function _cleanup_session!(es::LLMToolsEventSource, name::String)
         catch
         end
     end
+    @info "LLMTools async session cleaned up" name kind = session.kind status = session.status
     return session
 end
 
@@ -182,6 +216,7 @@ function _create_subagent_tools(es::LLMToolsEventSource)
             _validate_name(es, name)
             a = get_current_assistant()
             a === nothing && return "No assistant initialized"
+            @info "Starting worker session" name sync
             cfg = es.config
             model = Agentif.getModel(cfg.provider, cfg.model_id)
             model === nothing && error("Unknown model: provider=$(cfg.provider) model_id=$(cfg.model_id)")
@@ -192,8 +227,9 @@ function _create_subagent_tools(es::LLMToolsEventSource)
                 apikey = cfg.apikey,
                 tools = child_tools,
             )
+            level = _assistant_log_level()
             if sync
-                result_state = Agentif.evaluate(child, input_message)
+                result_state = Agentif.evaluate(child, input_message; level)
                 msg = Agentif.last_assistant_message(result_state)
                 output = msg === nothing ? "" : string(Agentif.message_text(msg))
                 return LLMTools.truncate_tool_output(output; label = "Subagent output")
@@ -204,7 +240,7 @@ function _create_subagent_tools(es::LLMToolsEventSource)
                 agent = child, state = Agentif.AgentState())
             session.task = Threads.@spawn begin
                 try
-                    result_state = Agentif.evaluate(child, input_message)
+                    result_state = Agentif.evaluate(child, input_message; level)
                     msg = Agentif.last_assistant_message(result_state)
                     output = msg === nothing ? "" : string(Agentif.message_text(msg))
                     lock(es.lock) do
@@ -217,11 +253,23 @@ function _create_subagent_tools(es::LLMToolsEventSource)
                     end
                     put!(a.event_queue, SubagentOutputEvent(event_type, name, output))
                 catch e
+                    bt = catch_backtrace()
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         s !== nothing && (s.status = "error")
                     end
-                    put!(a.event_queue, SubagentOutputEvent(event_type, name, "Error: $(sprint(showerror, e))"))
+                    @error "Sub-agent execution failed" name event_type exception = (e, bt)
+                    payload = _async_tool_error_json(
+                        ;
+                        tool = "subagent",
+                        session_name = name,
+                        operation = "start_subagent",
+                        error_kind = "subagent_execution_failed",
+                        err = e,
+                        bt,
+                        suggested_fix = "Inspect message/error_kind and retry by adjusting the prompt or input_message.",
+                    )
+                    put!(a.event_queue, SubagentOutputEvent(event_type, name, payload))
                 end
             end
             return "Sub-agent '$name' started asynchronously. You'll be notified when it completes."
@@ -242,8 +290,9 @@ function _create_subagent_tools(es::LLMToolsEventSource)
             session.status in ("running",) && error("Sub-agent '$name' is still processing. Wait for it to complete before sending another message.")
             a = get_current_assistant()
             a === nothing && return "No assistant initialized"
+            level = _assistant_log_level()
             if sync
-                result_state = Agentif.evaluate(session.agent, input_message; state = session.state)
+                result_state = Agentif.evaluate(session.agent, input_message; state = session.state, level)
                 lock(es.lock) do
                     s = get(es.sessions, name, nothing)
                     if s !== nothing
@@ -262,7 +311,7 @@ function _create_subagent_tools(es::LLMToolsEventSource)
             end
             session.task = Threads.@spawn begin
                 try
-                    result_state = Agentif.evaluate(session.agent, input_message; state = session.state)
+                    result_state = Agentif.evaluate(session.agent, input_message; state = session.state, level)
                     msg = Agentif.last_assistant_message(result_state)
                     output = msg === nothing ? "" : string(Agentif.message_text(msg))
                     lock(es.lock) do
@@ -275,11 +324,23 @@ function _create_subagent_tools(es::LLMToolsEventSource)
                     end
                     put!(a.event_queue, SubagentOutputEvent(event_type, name, output))
                 catch e
+                    bt = catch_backtrace()
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         s !== nothing && (s.status = "error")
                     end
-                    put!(a.event_queue, SubagentOutputEvent(event_type, name, "Error: $(sprint(showerror, e))"))
+                    @error "Sub-agent follow-up failed" name event_type exception = (e, bt)
+                    payload = _async_tool_error_json(
+                        ;
+                        tool = "subagent",
+                        session_name = name,
+                        operation = "message_subagent",
+                        error_kind = "subagent_followup_failed",
+                        err = e,
+                        bt,
+                        suggested_fix = "Inspect session status and the error payload, then retry with corrected input or create a fresh sub-agent.",
+                    )
+                    put!(a.event_queue, SubagentOutputEvent(event_type, name, payload))
                 end
             end
             return "Message sent to sub-agent '$name'. You'll be notified when it responds."
@@ -337,6 +398,7 @@ function _create_pty_tools(es::LLMToolsEventSource)
             cfg = es.config
             work_dir = workdir === nothing ? cfg.base_dir : workdir
             isdir(work_dir) || error("Working directory not found: $work_dir")
+            @info "Starting PTY session" name cmd work_dir sync
 
             shell_cmd = Sys.iswindows() ? "powershell" : "bash"
             full_cmd = Sys.iswindows() ? Cmd([shell_cmd, "-Command", cmd]) : Cmd([shell_cmd, "-l", "-c", cmd])
@@ -394,11 +456,23 @@ function _create_pty_tools(es::LLMToolsEventSource)
                         end
                     end
                 catch e
+                    bt = catch_backtrace()
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         s !== nothing && (s.status = "error")
                     end
-                    @error "PTY polling error" name exception = (e, catch_backtrace())
+                    @error "PTY polling error" name exception = (e, bt)
+                    payload = _async_tool_error_json(
+                        ;
+                        tool = "pty",
+                        session_name = name,
+                        operation = "pty_poll",
+                        error_kind = "pty_polling_failed",
+                        err = e,
+                        bt,
+                        suggested_fix = "List PTY sessions, then restart or kill/recreate this PTY session.",
+                    )
+                    put!(a.event_queue, PtyOutputEvent(event_type, name, payload, nothing))
                 end
             end
             return "PTY '$name' started asynchronously (cmd: $cmd). You'll be notified when output is available."
@@ -522,12 +596,23 @@ function _create_worker_tools(es::LLMToolsEventSource)
                     end
                     put!(a.event_queue, WorkerOutputEvent(event_type, name, combined))
                 catch e
+                    bt = catch_backtrace()
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         s !== nothing && (s.status = "error")
                     end
-                    errmsg = e isa CapturedException ? sprint(showerror, e.ex) : sprint(showerror, e)
-                    put!(a.event_queue, WorkerOutputEvent(event_type, name, "Error: $errmsg"))
+                    @error "Worker execution failed" name event_type exception = (e, bt)
+                    payload = _async_tool_error_json(
+                        ;
+                        tool = "worker",
+                        session_name = name,
+                        operation = "start_worker",
+                        error_kind = "worker_execution_failed",
+                        err = e,
+                        bt,
+                        suggested_fix = "Inspect worker output/error payload and retry with corrected Julia code.",
+                    )
+                    put!(a.event_queue, WorkerOutputEvent(event_type, name, payload))
                 end
             end
             return "Worker '$name' started asynchronously. You'll be notified when execution completes."
@@ -573,12 +658,23 @@ function _create_worker_tools(es::LLMToolsEventSource)
                     end
                     put!(a.event_queue, WorkerOutputEvent(event_type, name, combined))
                 catch e
+                    bt = catch_backtrace()
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         s !== nothing && (s.status = "error")
                     end
-                    errmsg = e isa CapturedException ? sprint(showerror, e.ex) : sprint(showerror, e)
-                    put!(a.event_queue, WorkerOutputEvent(event_type, name, "Error: $errmsg"))
+                    @error "Worker follow-up execution failed" name event_type exception = (e, bt)
+                    payload = _async_tool_error_json(
+                        ;
+                        tool = "worker",
+                        session_name = name,
+                        operation = "eval_worker",
+                        error_kind = "worker_followup_failed",
+                        err = e,
+                        bt,
+                        suggested_fix = "Inspect the error payload and retry with syntactically-valid Julia code that matches the worker's current state.",
+                    )
+                    put!(a.event_queue, WorkerOutputEvent(event_type, name, payload))
                 end
             end
             return "Code sent to worker '$name'. You'll be notified when execution completes."

@@ -3,6 +3,7 @@
 
 using Vo
 using Agentif
+using Logging
 using SQLite
 using Tempus
 using Test
@@ -91,6 +92,23 @@ println("=" ^ 60)
     @test occursin("America/Denver", context_prefix)
     println("  System prompt length: $(length(prompt)) chars")
     println("  ✓ Phase 1 passed")
+end
+
+@testset "Logging level configuration" begin
+    a_warn = AgentAssistant(":memory:";
+        provider = "openai-completions",
+        model_id = "gpt-4o-mini",
+        apikey = "test-key",
+        level = :warn,
+    )
+    @test a_warn.log_level == Warn
+
+    a_default = AgentAssistant(":memory:";
+        provider = "openai-completions",
+        model_id = "gpt-4o-mini",
+        apikey = "test-key",
+    )
+    @test a_default.log_level === nothing
 end
 
 # ============================================================================

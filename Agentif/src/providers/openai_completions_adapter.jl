@@ -310,7 +310,7 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             j = i
             while j <= length(transformed) && transformed[j] isa ToolResultMessage
                 tool_msg = transformed[j]::ToolResultMessage
-                text_result = message_text(tool_msg)
+                text_result = provider_tool_result_output(tool_msg)
                 has_text = !isempty(text_result)
                 tool_result_msg = OpenAICompletions.Message(;
                     role = "tool",

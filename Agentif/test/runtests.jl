@@ -3,6 +3,7 @@ using Agentif
 using Base64
 using HTTP
 using JSON
+using Logging
 using LLMOAuth
 using LocalSearch
 using SQLite
@@ -244,6 +245,59 @@ end
     trm = wait(Agentif.call_function_tool!(identity, small_tool, tc))
     @test message_text(trm) == "small"
     @test !occursin("[Tool result truncated:", message_text(trm))
+end
+
+@testset "tool error diagnostics as JSON" begin
+    exploding_tool = @tool "Always throws." explode(x::Int) = error("boom: $x")
+    tc = Agentif.PendingToolCall(; call_id = "call-explode", name = "explode", arguments = "{\"x\":7}")
+    trm = wait(Agentif.call_function_tool!(identity, exploding_tool, tc))
+    @test trm.is_error
+    payload = JSON.parse(message_text(trm))
+    @test payload["ok"] == false
+    @test payload["error_kind"] == "tool_execution_failed"
+    @test payload["tool"] == "explode"
+    @test payload["call_id"] == "call-explode"
+    @test payload["message"] == "boom: 7"
+    @test !haskey(payload, "stacktrace")
+
+    payload_debug = Agentif.with_log_level(Debug) do
+        trm_debug = wait(Agentif.call_function_tool!(identity, exploding_tool, tc))
+        JSON.parse(message_text(trm_debug))
+    end
+    @test haskey(payload_debug, "stacktrace")
+
+    tc_parse = Agentif.PendingToolCall(; call_id = "call-parse", name = "explode", arguments = "{\"missing\":1}")
+    trm_parse = wait(Agentif.call_function_tool!(identity, exploding_tool, tc_parse))
+    @test trm_parse.is_error
+    parse_payload = JSON.parse(message_text(trm_parse))
+    @test parse_payload["error_kind"] == "tool_argument_parse_failed"
+    @test parse_payload["tool"] == "explode"
+    @test haskey(parse_payload, "raw_arguments")
+end
+
+@testset "provider tool result output wrapping" begin
+    err_output = JSON.json(Dict("ok" => false, "error_kind" => "tool_execution_failed", "message" => "boom"))
+    result = ToolResultMessage("call-wrap", "explode", err_output; is_error = true)
+    wrapped = Agentif.provider_tool_result_output(result)
+    payload = JSON.parse(wrapped)
+    @test payload["ok"] == false
+    @test payload["tool_error"] == true
+    @test payload["tool"] == "explode"
+    @test payload["call_id"] == "call-wrap"
+    @test haskey(payload, "error")
+end
+
+@testset "evaluate consumes level keyword" begin
+    observed_kw = Ref{Any}(nothing)
+    base_handler = function (_f, _agent::Agent, state::AgentState, _current_input::Agentif.AgentTurnInput, _abort::Agentif.Abort; kw...)
+        observed_kw[] = kw
+        return state
+    end
+    agent = make_agent()
+    state = Agentif.evaluate(identity, agent, "hello"; base_handler, level = :debug)
+    @test state isa AgentState
+    @test observed_kw[] !== nothing
+    @test !haskey(observed_kw[], :level)
 end
 
 @testset "queue_middleware" begin

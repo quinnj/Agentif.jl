@@ -151,7 +151,7 @@ function openai_responses_input_from_message(msg::AgentMessage)
         end
         return parts
     elseif msg isa ToolResultMessage
-        output = message_text(msg)
+        output = provider_tool_result_output(msg)
         call_id_raw, _ = _responses_split_compound_id(msg.call_id)
         return Any[
             Dict(
@@ -181,7 +181,7 @@ function openai_responses_build_full_input(agent::Agent, state::AgentState, inpu
     elseif input isa Vector{ToolResultMessage}
         for result in input
             call_id_raw, _ = _responses_split_compound_id(result.call_id)
-            push!(items, Dict("type" => "function_call_output", "call_id" => call_id_raw, "output" => message_text(result)))
+            push!(items, Dict("type" => "function_call_output", "call_id" => call_id_raw, "output" => provider_tool_result_output(result)))
         end
     end
     return items

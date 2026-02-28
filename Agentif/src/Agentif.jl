@@ -1,6 +1,6 @@
 module Agentif
 
-using Base64, Dates, HTTP, InteractiveUtils, JSON, JSONSchema, Logging, PtySessions, ScopedValues, StructUtils
+using Base64, Dates, HTTP, InteractiveUtils, JSON, JSONSchema, Logging, LoggingExtras, PtySessions, ScopedValues, StructUtils
 using Encid: UID8
 using LLMProviders
 using LLMProviders: Model, getModel, getProviders, getModels, calculateCost, registerModel!, discover_models!
@@ -13,6 +13,7 @@ include("util.jl")
 include("tools.jl")  # Must come before messages.jl (PendingToolCall used in AgentState)
 include("messages.jl")
 include("events.jl")
+include("logging_config.jl")
 include("skills.jl")
 include("agent.jl")
 include("session.jl")
@@ -37,6 +38,7 @@ export build_output_guardrail_input, materialize_output_guardrail_agent
 export CompactionConfig, CompactionSummaryMessage, compact!
 export with_prompt, with_tools
 export CURRENT_EVALUATION_ID
+export resolve_log_level, with_log_level, debug_logging_enabled
 export Model, getModel, getProviders, getModels, calculateCost, registerModel!, discover_models!
 export OpenAIResponses, OpenAICompletions, AnthropicMessages, GoogleGenerativeAI, GoogleGeminiCli
 export @tool, tool_name, AgentTool

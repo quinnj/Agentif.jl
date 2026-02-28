@@ -100,6 +100,7 @@ function create_worker_tools()
             code::String,
             timeout_s::Union{Nothing, Int} = nothing,
         ) = begin
+            @debug "exec_code start" code_preview = truncate_description(code)
             cleanup_exited_sessions!(WORKER_REGISTRY)
             check_session_limit_and_warn(WORKER_REGISTRY)
 
@@ -153,6 +154,8 @@ function create_worker_tools()
                     extra = Dict{String, Any}("result" => result_str),
                 )
             catch err
+                bt = catch_backtrace()
+                @warn "exec_code failed" worker_id exception = (err, bt)
                 remove_session!(WORKER_REGISTRY, worker_id; mark_status = SESSION_STATUS_ERROR)
                 errmsg = err isa CapturedException ? sprint(showerror, err.ex) : string(err)
                 push!(events, make_event(WORKER_REGISTRY, "error"; session_id = worker_id,
@@ -178,6 +181,7 @@ function create_worker_tools()
             code::String,
             timeout_s::Union{Nothing, Int} = nothing,
         ) = begin
+            @debug "eval_code start" worker_id code_preview = truncate_description(code)
             meta = get_session(WORKER_REGISTRY, worker_id)
             if meta === nothing
                 return render_process_response("eval_code";
@@ -227,6 +231,8 @@ function create_worker_tools()
                     extra = Dict{String, Any}("result" => result_str),
                 )
             catch err
+                bt = catch_backtrace()
+                @warn "eval_code failed" worker_id exception = (err, bt)
                 remove_session!(WORKER_REGISTRY, worker_id; mark_status = SESSION_STATUS_ERROR)
                 errmsg = err isa CapturedException ? sprint(showerror, err.ex) : string(err)
                 push!(events, make_event(WORKER_REGISTRY, "error"; session_id = worker_id,

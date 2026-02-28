@@ -276,7 +276,7 @@ function ensure_cleanup_task_running!(reg::SessionRegistry)
                 try
                     cleanup_exited_sessions!(reg)
                 catch err
-                    @warn "Session cleanup sweep failed" error = err
+                    @warn "Session cleanup sweep failed" exception = (err, catch_backtrace())
                 end
             end
         end

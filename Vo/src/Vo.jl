@@ -4,6 +4,7 @@ using Agentif
 using Dates
 using LLMTools
 using LocalSearch
+using Logging
 using ScopedValues: @with
 using SQLite
 using Tempus
@@ -116,6 +117,7 @@ struct AgentAssistant
     session_store::Agentif.SessionStore
     tools::Vector{Agentif.AgentTool}
     scheduler::Tempus.Scheduler
+    log_level::Union{Nothing, LogLevel}
 end
 
 # ─── SQLite schema ───
@@ -766,10 +768,18 @@ include("llmtools.jl")
 
 # ─── Evaluate ───
 
-function evaluate(assistant::AgentAssistant, input; channel::Union{Nothing, Agentif.AbstractChannel}=nothing, kw...)
+function evaluate(
+        assistant::AgentAssistant,
+        input;
+        channel::Union{Nothing, Agentif.AbstractChannel} = nothing,
+        level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing,
+        kw...,
+    )
     cfg = assistant.config
     model = Agentif.getModel(cfg.provider, cfg.model_id)
     model === nothing && error("Unknown model: provider=$(cfg.provider) model_id=$(cfg.model_id)")
+    effective_level = level === nothing ? assistant.log_level : Agentif.resolve_log_level(level)
+    @debug "Vo evaluate dispatch" assistant = cfg.name provider = cfg.provider model = cfg.model_id channel_id = (channel === nothing ? nothing : Agentif.channel_id(channel)) level = effective_level
     agent = Agentif.Agent(
         prompt = build_system_prompt(assistant; channel),
         model = model,
@@ -784,6 +794,7 @@ function evaluate(assistant::AgentAssistant, input; channel::Union{Nothing, Agen
         session_store = assistant.session_store,
         channel = channel,
         compaction_config = Agentif.CompactionConfig(),
+        level = effective_level,
         kw...,
     )
 end
@@ -871,46 +882,58 @@ function _resolve_event_channel(assistant::AgentAssistant, ev::Event, handler_ch
     return get(assistant._channels, handler_channel_id, nothing)
 end
 
-function _run_event_handler!(assistant::AgentAssistant, ev::Event, handler)
+function _run_event_handler!(
+        assistant::AgentAssistant,
+        ev::Event,
+        handler;
+        level::Union{Nothing, LogLevel} = assistant.log_level,
+    )
     ch = _resolve_event_channel(assistant, ev, handler.channel_id)
     if ch === nothing
         @warn "No channel available for handler" handler_id=handler.id channel_id=handler.channel_id
         return nothing
     end
     input = make_prompt(handler.prompt, ev)
-    evaluate(assistant, input; channel=ch)
+    @debug "Vo handler evaluate start" handler_id = handler.id event_name = get_name(ev) channel_id = Agentif.channel_id(ch)
+    evaluate(assistant, input; channel = ch, level = level)
+    @debug "Vo handler evaluate end" handler_id = handler.id event_name = get_name(ev)
     return nothing
 end
 
-function start_event_loop!(assistant::AgentAssistant)
+function start_event_loop!(assistant::AgentAssistant; level::Union{Nothing, LogLevel} = assistant.log_level)
     errormonitor(@async begin
-        @info "Vo: event loop started"
-        for ev in assistant.event_queue
-            @info "Vo: event received" event_type=typeof(ev)
-            nm = try
-                get_name(ev)
-            catch e
-                @error "Event dropped: failed to compute event name" event_type=typeof(ev) exception=(e, catch_backtrace())
-                continue
-            end
-            @info "Vo: event name resolved" event_name=nm
-            handlers = try
-                _event_handlers_for(assistant, nm)
-            catch e
-                @error "Event handler lookup failed" event=nm exception=(e, catch_backtrace())
-                continue
-            end
-            @info "Vo: found handlers" event_name=nm handler_count=length(handlers)
-            for handler in handlers
-                errormonitor(@async begin
-                    try
-                        @info "Vo: running handler" handler_id=handler.id event_name=nm
-                        _run_event_handler!(assistant, ev, handler)
-                        @info "Vo: handler completed" handler_id=handler.id event_name=nm
-                    catch e
-                        @error "Event handler failed" handler=handler.id event=nm exception=(e, catch_backtrace())
-                    end
-                end)
+        Agentif.with_log_level(level) do
+            @info "Vo: event loop started" level
+            for ev in assistant.event_queue
+                @debug "Vo: event received" event_type = typeof(ev)
+                nm = try
+                    get_name(ev)
+                catch e
+                    @error "Event dropped: failed to compute event name" event_type = typeof(ev) exception = (e, catch_backtrace())
+                    continue
+                end
+                @debug "Vo: event name resolved" event_name = nm
+                handlers = try
+                    _event_handlers_for(assistant, nm)
+                catch e
+                    @error "Event handler lookup failed" event = nm exception = (e, catch_backtrace())
+                    continue
+                end
+                @debug "Vo: found handlers" event_name = nm handler_count = length(handlers)
+                for handler in handlers
+                    errormonitor(@async begin
+                        Agentif.with_log_level(level) do
+                            started_at = time()
+                            try
+                                @info "Vo: running handler" handler_id = handler.id event_name = nm
+                                _run_event_handler!(assistant, ev, handler; level)
+                                @info "Vo: handler completed" handler_id = handler.id event_name = nm duration_s = round(time() - started_at; digits = 4)
+                            catch e
+                                @error "Event handler failed" handler = handler.id event = nm exception = (e, catch_backtrace())
+                            end
+                        end
+                    end)
+                end
             end
         end
     end)
@@ -927,6 +950,7 @@ function AgentAssistant(db_path::String="";
     base_dir::String=pwd(),
     enable_web::Bool=false,
     enable_coding::Bool=false,
+    level::Union{Nothing, LogLevel, Int, Symbol, AbstractString}=nothing,
 )
     db_path = isempty(db_path) ? joinpath(pwd(), "$name.sqlite") : db_path
     db = SQLite.DB(db_path)
@@ -936,19 +960,25 @@ function AgentAssistant(db_path::String="";
     tempus_store = Tempus.SQLiteStore(db)
     scheduler = Tempus.Scheduler(tempus_store)
     config = AgentConfig(; name, provider, model_id, apikey, timezone, base_dir, enable_web, enable_coding)
+    log_level = Agentif.resolve_log_level(level)
     return AgentAssistant(
         config, db,
         Dict{String, Agentif.AbstractChannel}(),
         Base.Channel{Event}(Inf),
-        session_store, Agentif.AgentTool[], scheduler,
+        session_store, Agentif.AgentTool[], scheduler, log_level,
     )
 end
 
 # ─── Lifecycle ───
 
-function init!(db_path::String=""; event_sources=nothing, kwargs...)
+function init!(
+        db_path::String = "";
+        event_sources = nothing,
+        level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing,
+        kwargs...,
+    )
     sources = event_sources === nothing ? lock(() -> collect(EVENT_SOURCES), EVENT_SOURCES_LOCK) : event_sources
-    assistant = AgentAssistant(db_path; kwargs...)
+    assistant = AgentAssistant(db_path; level, kwargs...)
     CURRENT_ASSISTANT[] = assistant
     # Purge ephemeral tables (re-populated from EventSources)
     SQLite.DBInterface.execute(assistant.db, "DELETE FROM vo_event_types")
@@ -964,7 +994,7 @@ function init!(db_path::String=""; event_sources=nothing, kwargs...)
     append!(assistant.tools, TEMPUS_TOOLS)
     append!(assistant.tools, DB_TOOLS)
     Tempus.run!(assistant.scheduler)
-    start_event_loop!(assistant)
+    start_event_loop!(assistant; level = assistant.log_level)
     for es in sources
         start!(es, assistant)
     end
