@@ -1,6 +1,7 @@
 using Test
 using HTTP
 using JSON
+using JSONSchema
 using Sockets
 using LLMProviders
 
@@ -97,8 +98,14 @@ end
     unknown_event = JSON.parse("{\"type\":\"response.unrecognized\",\"foo\":123}", OpenAIResponses.StreamEvent)
     @test unknown_event isa OpenAIResponses.UnknownStreamEvent
 
-    params_schema = OpenAIResponses.schema(@NamedTuple{required::String, optional::Union{Nothing, String}})
-    required_fields = haskey(params_schema.spec, "required") ? Set(String.(params_schema.spec["required"])) : Set{String}()
+    params_schema = OpenAIResponses.schema(
+        @NamedTuple{required::String, optional::Union{Nothing,String}},
+    )
+    params_schema_data = JSONSchema.spec(params_schema)
+    required_fields =
+        haskey(params_schema_data, "required") ?
+        Set(String.(params_schema_data["required"])) :
+        Set{String}()
     @test "required" in required_fields
     @test !("optional" in required_fields)
 end
