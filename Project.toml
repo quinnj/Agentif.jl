@@ -28,7 +28,7 @@ Claw = {path = "Claw"}
 ConcurrentUtilities = {url = "https://github.com/JuliaServices/ConcurrentUtilities.jl.git", rev = "main"}
 Encid = {url = "https://github.com/JuliaServices/Encid.jl.git"}
 HTTP = {url = "https://github.com/JuliaWeb/HTTP.jl.git", rev = "master"}
-JSONSchema = {url = "https://github.com/JuliaIO/JSONSchema.jl.git"}
+JSONSchema = {url = "https://github.com/JuliaIO/JSONSchema.jl.git", rev = "codex/agentif-schema-generation"}
 Juco = {path = "Juco"}
 LLMOAuth = {path = "LLMOAuth"}
 LLMProviders = {path = "LLMProviders"}

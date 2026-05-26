@@ -5,16 +5,16 @@ using StructUtils, JSON, JSONSchema
 
 schema(::Type{T}) where {T} = JSONSchema.schema(T; all_fields_required = false, additionalProperties = false)
 
-@omit_null @kwarg struct ToolFunction{T}
+@omit_null @kwarg struct ToolFunction
     name::String
     description::Union{Nothing, String} = nothing
-    parameters::JSONSchema.Schema{T}
+    parameters::JSONSchema.Schema
     strict::Union{Nothing, Bool} = nothing
 end
 
-@omit_null @kwarg struct FunctionTool{T}
+@omit_null @kwarg struct FunctionTool
     type::String = "function"
-    var"function"::ToolFunction{T}
+    var"function"::ToolFunction
 end
 
 const Tool = Union{FunctionTool}

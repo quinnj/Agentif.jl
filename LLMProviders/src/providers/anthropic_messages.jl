@@ -78,10 +78,10 @@ end
     content::Union{String, Vector{ContentBlock}} & (json = (choosetype = x -> x[] isa String ? String : Vector{ContentBlock},),)
 end
 
-@omit_null @kwarg struct Tool{T}
+@omit_null @kwarg struct Tool
     name::String
     description::Union{Nothing, String} = nothing
-    input_schema::JSONSchema.Schema{T}
+    input_schema::JSONSchema.Schema
 end
 
 
