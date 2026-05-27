@@ -49,6 +49,16 @@ end
     parsed = JSON.parse(JSON.json(chunk), OpenAICompletions.StreamChunk)
     @test parsed.choices[1].delta.tool_calls[1].var"function".name == "read"
 
+    req = OpenAICompletions.Request(
+        ; model = "openrouter-test",
+        messages = [OpenAICompletions.Message(; role = "user", content = "hello")],
+        stream = true,
+        provider = Dict("zdr" => true, "data_collection" => "deny"),
+    )
+    req_json = JSON.parse(JSON.json(req))
+    @test req_json["provider"]["zdr"] == true
+    @test req_json["provider"]["data_collection"] == "deny"
+
     usage_chunk = JSON.parse(
         """
         {

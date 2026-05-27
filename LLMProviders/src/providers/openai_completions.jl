@@ -159,6 +159,7 @@ end
     top_p::Union{Nothing, Float64} = nothing
     stop::Union{Nothing, Union{String, Vector{String}}} = nothing
     parallel_tool_calls::Union{Nothing, Bool} = nothing
+    provider::Union{Nothing, Any} = nothing
 end
 
 end # module OpenAICompletions
