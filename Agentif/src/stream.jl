@@ -442,10 +442,13 @@ function stream(
         end
         reasoning_effort_value = nothing
         if haskey(stream_kw, :reasoning)
-            reasoning_effort_value = stream_kw[:reasoning]
-            stream_kw = Base.structdiff(stream_kw, (; reasoning = nothing))
-            if !haskey(stream_kw, :reasoning_effort)
-                stream_kw = merge(stream_kw, (; reasoning_effort = reasoning_effort_value))
+            reasoning_value = stream_kw[:reasoning]
+            if reasoning_value isa AbstractString || reasoning_value isa Symbol
+                reasoning_effort_value = string(reasoning_value)
+                stream_kw = Base.structdiff(stream_kw, (; reasoning = nothing))
+                if !haskey(stream_kw, :reasoning_effort)
+                    stream_kw = merge(stream_kw, (; reasoning_effort = reasoning_effort_value))
+                end
             end
         end
         if haskey(stream_kw, :reasoning_effort)

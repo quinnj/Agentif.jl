@@ -150,6 +150,7 @@ end
     tool_choice::Union{Nothing, Any} = nothing
     store::Union{Nothing, Bool} = nothing
     stream_options::Union{Nothing, Any} = nothing
+    reasoning::Union{Nothing, Any} = nothing
     reasoning_effort::Union{Nothing, String} = nothing
     thinking::Union{Nothing, Any} = nothing
     reasoning_split::Union{Nothing, Bool} = nothing

@@ -54,10 +54,12 @@ end
         messages = [OpenAICompletions.Message(; role = "user", content = "hello")],
         stream = true,
         provider = Dict("zdr" => true, "data_collection" => "deny"),
+        reasoning = Dict("exclude" => true),
     )
     req_json = JSON.parse(JSON.json(req))
     @test req_json["provider"]["zdr"] == true
     @test req_json["provider"]["data_collection"] == "deny"
+    @test req_json["reasoning"]["exclude"] == true
 
     usage_chunk = JSON.parse(
         """
