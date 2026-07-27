@@ -517,7 +517,7 @@ function flush_think_tag_state(tts::ThinkTagStreamState)
 end
 
 function openai_completions_event_callback(
-        f::Function,
+        f::F,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
         ended::Base.RefValue{Bool},
@@ -526,7 +526,7 @@ function openai_completions_event_callback(
         tool_call_accumulators::Dict{Int, ToolCallAccumulator},
         abort::Abort;
         think_tag_state::Union{Nothing, ThinkTagStreamState} = nothing,
-    )
+    ) where {F <: Function}
     reasoning_buffer = ""
     leading_whitespace = ""
     saw_text = false

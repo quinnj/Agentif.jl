@@ -165,7 +165,7 @@ function google_gemini_cli_stop_reason(reason::Union{Nothing, String}, tool_call
 end
 
 function google_gemini_cli_event_callback(
-        f::Function,
+        f::F,
         agent::Agent,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
@@ -175,7 +175,7 @@ function google_gemini_cli_event_callback(
         seen_call_ids::Set{String},
         debug_stream::Bool,
         abort::Abort,
-    )
+    ) where {F <: Function}
     return function (stream, event)
         maybe_abort!(abort, stream)
         data = String(event.data)

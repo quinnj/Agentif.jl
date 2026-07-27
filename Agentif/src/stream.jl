@@ -269,9 +269,9 @@ function resolve_oauth_apikey(provider::Symbol, apikey::AbstractString; backend:
 end
 
 function stream(
-        f::Function, agent::Agent, state::AgentState, input::AgentTurnInput, abort::Abort;
+        f::F, agent::Agent, state::AgentState, input::AgentTurnInput, abort::Abort;
         model::Union{Nothing, Model} = nothing, http_kw = (;), kw...
-    )
+    ) where {F <: Function}
     model = model === nothing ? agent.model : model
     model === nothing && throw(ArgumentError("no model specified with which agent can evaluate input"))
 

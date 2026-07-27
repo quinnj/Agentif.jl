@@ -252,7 +252,7 @@ function openai_responses_stop_reason(status::Union{Nothing, String}, tool_calls
 end
 
 function openai_responses_event_callback(
-        f::Function,
+        f::F,
         agent::Agent,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
@@ -260,7 +260,7 @@ function openai_responses_event_callback(
         response_usage::Base.RefValue{Union{Nothing, OpenAIResponses.Usage}},
         response_status::Base.RefValue{Union{Nothing, String}},
         abort::Abort,
-    )
+    ) where {F <: Function}
     return function (stream, event)
         maybe_abort!(abort, stream)
         data = String(event.data)

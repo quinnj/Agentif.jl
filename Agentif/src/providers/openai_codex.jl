@@ -403,7 +403,7 @@ function codex_stop_reason(status::Union{Nothing, String}, tool_calls::Vector{Ag
 end
 
 function openai_codex_event_callback(
-        f::Function,
+        f::F,
         agent::Agent,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
@@ -412,7 +412,7 @@ function openai_codex_event_callback(
         response_status::Base.RefValue{Union{Nothing, String}},
         tool_call_accumulators::Dict{String, ToolCallAccumulator},
         abort::Abort,
-    )
+    ) where {F <: Function}
     ensure_started() = begin
         if !started[]
             started[] = true

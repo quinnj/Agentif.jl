@@ -244,7 +244,7 @@ function anthropic_stop_reason(reason::Union{Nothing, String}, tool_calls::Vecto
 end
 
 function anthropic_event_callback(
-        f::Function,
+        f::F,
         agent::Agent,
         assistant_message::AssistantMessage,
         started::Base.RefValue{Bool},
@@ -255,7 +255,7 @@ function anthropic_event_callback(
         partial_json_by_index::Dict{Int, String},
         tool_name_reverse_map::Dict{String, String},
         abort::Abort,
-    )
+    ) where {F <: Function}
     stop_on_tool_call = get(ENV, "AGENTIF_STOP_ON_TOOL_CALL", "") != ""
     return function (stream, event)
         maybe_abort!(abort, stream)

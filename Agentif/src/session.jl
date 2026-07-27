@@ -67,7 +67,7 @@ function set_branch_leaf!(store::InMemorySessionStore, branch_id::String, entry_
     end
 end
 
-function lock_branch(f::Function, store::InMemorySessionStore, branch_id::String)
+function lock_branch(f::F, store::InMemorySessionStore, branch_id::String) where {F <: Function}
     branch_lock = lock(store.lock) do
         get!(store.branch_locks, branch_id) do
             ReentrantLock()

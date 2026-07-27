@@ -364,7 +364,7 @@ evaluate(
 ) = evaluate(identity, agent, input; abort, level, kw...)
 
 function evaluate(
-        f::Function,
+        f::F,
         agent::Agent,
         input::AgentTurnInput;
         state::AgentState = AgentState(),
@@ -380,7 +380,7 @@ function evaluate(
         repeat_input::Bool = false,
         level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing,
         kw...,
-    )
+    ) where {F <: Function}
     current_input = repeat_input && input isa String ? input * "\n\n" * input : input
     handler = build_default_handler(; base_handler, compaction_config, steer_queue, message_queue, session_store, input_guardrail, skill_registry, channel)
     return with_log_level(level) do
