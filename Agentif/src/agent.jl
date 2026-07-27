@@ -129,16 +129,21 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
         try
             args = parse_tool_arguments(tc.arguments, parameters(tool))
         catch e
-            parse_error = e
-            parse_bt = catch_backtrace()
+            parse_error = caught_exception(e, "Tool arguments are invalid.")
+            parse_bt = caught_backtrace()
         end
 
         if parse_error !== nothing
             is_error = true
             raw = tc.arguments
             raw_preview = length(raw) > 500 ? string(raw[1:500], "... (truncated, length=$(length(raw)))") : raw
-            parse_msg = sprint(showerror, parse_error)
-            @warn "Tool argument parsing failed" tool = tc.name call_id = tc.call_id exception = (parse_error, parse_bt)
+            parse_msg = caught_exception_message(
+                parse_error, "Tool arguments are invalid.")
+            if TRIMMED_BUILD
+                @warn "Tool argument parsing failed" tool = tc.name call_id = tc.call_id
+            else
+                @warn "Tool argument parsing failed" tool = tc.name call_id = tc.call_id exception = (parse_error, parse_bt)
+            end
             output = render_tool_error_json(
                 ;
                 error_kind = "tool_argument_parse_failed",
@@ -154,17 +159,24 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
             try
                 output = string(tool.func(args...))
             catch e
-                bt = catch_backtrace()
+                normalized_error =
+                    caught_exception(e, "The tool could not complete the request.")
+                bt = caught_backtrace()
                 is_error = true
-                error_msg = sprint(showerror, e)
-                @error "Tool execution failed" tool = tc.name call_id = tc.call_id exception = (e, bt)
+                error_msg = caught_exception_message(
+                    normalized_error, "The tool could not complete the request.")
+                if TRIMMED_BUILD
+                    @error "Tool execution failed" tool = tc.name call_id = tc.call_id
+                else
+                    @error "Tool execution failed" tool = tc.name call_id = tc.call_id exception = (normalized_error, bt)
+                end
                 output = render_tool_error_json(
                     ;
                     error_kind = "tool_execution_failed",
                     message = error_msg,
                     tool = tc.name,
                     call_id = tc.call_id,
-                    exception = e,
+                    exception = normalized_error,
                     backtrace = bt,
                     suggested_fix = "Inspect error_kind/message and call the tool again with corrected arguments or preconditions.",
                 )
