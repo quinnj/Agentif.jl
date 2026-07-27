@@ -201,12 +201,18 @@ version = "1.4.0"
     ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
 
 [[deps.JSONSchema]]
-deps = ["Downloads", "JSON", "StructUtils", "URIs"]
-git-tree-sha1 = "80ae77ee9a2f255ac159a4e718dddbc45e78632d"
-repo-rev = "master"
+deps = ["Downloads", "JSON", "URIs"]
+git-tree-sha1 = "fc058412920f0bbf399edeaea37461bbdefc68f6"
+repo-rev = "4076c12e69f8191b611580744c42579f95e92974"
 repo-url = "https://github.com/JuliaIO/JSONSchema.jl.git"
 uuid = "7d188eb4-7ad8-530c-ae41-71a32a6d4692"
-version = "2.0.0"
+version = "1.6.0"
+
+    [deps.JSONSchema.extensions]
+    JSONSchemaJSON3Ext = "JSON3"
+
+    [deps.JSONSchema.weakdeps]
+    JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 
 [[deps.Juco]]
 deps = ["Agentif", "LLMTools"]
