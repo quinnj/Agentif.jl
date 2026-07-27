@@ -255,17 +255,24 @@ else
     model_request_kw(model::Model) = model.kw
 end
 
-function resolve_oauth_apikey(provider::Symbol, apikey::AbstractString; backend::AbstractOAuthBackend = OAUTH_BACKEND[])
-    apikey != "OAUTH" && return apikey
-    if provider == :codex
-        token = get_codex_token(backend)
-    elseif provider == :anthropic
-        token = get_anthropic_token(backend)
-    else
-        throw(ArgumentError("Unsupported OAuth provider: $(provider)"))
+if TRIMMED_BUILD
+    function resolve_oauth_apikey(provider::Symbol, apikey::AbstractString)
+        apikey != "OAUTH" && return apikey
+        throw(ArgumentError("OAuth token extensions are unavailable in a trimmed Agentif build for provider $(provider)."))
     end
-    token isa AbstractString && !isempty(token) || throw(ArgumentError("OAuth token provider for $(provider) must return a non-empty String token"))
-    return token
+else
+    function resolve_oauth_apikey(provider::Symbol, apikey::AbstractString; backend::AbstractOAuthBackend = OAUTH_BACKEND[])
+        apikey != "OAUTH" && return apikey
+        if provider == :codex
+            token = get_codex_token(backend)
+        elseif provider == :anthropic
+            token = get_anthropic_token(backend)
+        else
+            throw(ArgumentError("Unsupported OAuth provider: $(provider)"))
+        end
+        token isa AbstractString && !isempty(token) || throw(ArgumentError("OAuth token provider for $(provider) must return a non-empty String token"))
+        return token
+    end
 end
 
 function stream(
