@@ -157,7 +157,7 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
             )
         else
             try
-                output = string(tool.func(args...))
+                output = invoke_parsed_tool(tool, args)
             catch e
                 normalized_error =
                     caught_exception(e, "The tool could not complete the request.")
@@ -195,6 +195,17 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
     end
 end
 
+function invoke_parsed_tool(tool::AgentTool{F,T}, args)::String where {F,T<:NamedTuple}
+    return invoke_tool_function(tool, args::T)
+end
+
+@generated function invoke_tool_function(
+        tool::AgentTool{F,T}, args::T,
+    ) where {F,T<:NamedTuple}
+    call_args = [:(getfield(args, $idx)) for idx in 1:fieldcount(T)]
+    return :(string(getfield(tool, :func)($(call_args...))))
+end
+
 function coerce_tool_arg(value, typ)
     typ === Any && return value
     if typ isa Union
@@ -211,11 +222,11 @@ function coerce_tool_arg(value, typ)
     return convert(typ, value)
 end
 
-function parse_tool_arguments(arguments::String, params_type::Type)
+function parse_tool_arguments(arguments::String, ::Type{T})::T where {T<:NamedTuple}
     parsed = JSON.parse(arguments)
     parsed isa AbstractDict || throw(ArgumentError("tool arguments must be a JSON object"))
-    names = fieldnames(params_type)
-    types = fieldtypes(params_type)
+    names = fieldnames(T)
+    types = fieldtypes(T)
     values = Vector{Any}(undef, length(names))
     for (idx, (name, typ)) in enumerate(zip(names, types))
         key = String(name)
@@ -229,5 +240,5 @@ function parse_tool_arguments(arguments::String, params_type::Type)
             end
         end
     end
-    return NamedTuple{names}(Tuple(values))
+    return T(Tuple(values))
 end

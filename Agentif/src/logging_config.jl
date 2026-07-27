@@ -51,6 +51,17 @@ function render_tool_error_json(
         raw_arguments::Union{Nothing, String} = nothing,
         extra = Dict{String, Any}(),
     )
+    if TRIMMED_BUILD
+        return JSON.json((
+            ok = false,
+            error_kind,
+            message,
+            tool,
+            call_id,
+            suggested_fix,
+            raw_arguments,
+        ))
+    end
     payload = JSON.Object(
         "ok" => false,
         "error_kind" => error_kind,
