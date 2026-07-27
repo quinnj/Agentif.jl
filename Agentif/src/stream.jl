@@ -76,7 +76,10 @@ function normalize_mistral_tool_id(id::String)
     return normalized
 end
 
-function transform_messages(messages::Vector{AgentMessage}, model::Model; normalize_tool_call_id::Function = identity)
+function transform_messages(
+        messages::Vector{AgentMessage}, model::Model;
+        normalize_tool_call_id::Function = identity,
+    )::Vector{AgentMessage}
     tool_call_id_map = Dict{String, String}()
     transformed = AgentMessage[]
     for msg in messages
@@ -246,6 +249,12 @@ const OAUTH_BACKEND = Ref{AbstractOAuthBackend}(MissingOAuthBackend())
 get_codex_token(::AbstractOAuthBackend) = throw(ArgumentError("Codex OAuth token provider unavailable; load `LLMOAuth` and run `LLMOAuth.codex_login()` first, or pass an explicit `apikey`"))
 get_anthropic_token(::AbstractOAuthBackend) = throw(ArgumentError("Anthropic OAuth token provider unavailable; load `LLMOAuth` and run `LLMOAuth.anthropic_login()` first, or pass an explicit `apikey`"))
 
+if TRIMMED_BUILD
+    model_request_kw(::Model) = (;)
+else
+    model_request_kw(model::Model) = model.kw
+end
+
 function resolve_oauth_apikey(provider::Symbol, apikey::AbstractString; backend::AbstractOAuthBackend = OAUTH_BACKEND[])
     apikey != "OAUTH" && return apikey
     if provider == :codex
@@ -337,7 +346,7 @@ function stream(
         prompt_cache_retention !== nothing && (body["prompt_cache_retention"] = prompt_cache_retention)
 
         # Pass through model.kw (temperature, max_output_tokens, etc.)
-        for (k, v) in pairs(model.kw)
+        for (k, v) in pairs(model_request_kw(model))
             k_str = string(k)
             # Skip fields we already set or that don't belong in the body
             k_str in ("api", "provider", "baseUrl", "reasoning", "input", "cost", "contextWindow", "maxTokens", "headers", "compat", "name", "id") && continue
@@ -506,7 +515,7 @@ function stream(
             ; model = model.id,
             messages,
             stream = use_stream,
-            model.kw...,
+            model_request_kw(model)...,
             request_kw...,
         )
         headers = Dict(
@@ -698,7 +707,7 @@ function stream(
             messages,
             max_tokens,
             stream = !disable_streaming,
-            model.kw...,
+            model_request_kw(model)...,
             request_kw...,
         )
         headers = Dict(
@@ -835,7 +844,7 @@ function stream(
         request_kw = merge((; tools, systemInstruction = system_instruction), stream_kw)
         req = GoogleGenerativeAI.Request(
             ; contents,
-            model.kw...,
+            model_request_kw(model)...,
             request_kw...,
         )
         headers = Dict(
@@ -1005,8 +1014,9 @@ function stream(
         session_id !== nothing && (request_body["prompt_cache_key"] = session_id)
         max_tokens !== nothing && (request_body["max_output_tokens"] = max_tokens)
 
-        if model.kw !== nothing
-            for (k, v) in pairs(model.kw)
+        provider_kw = model_request_kw(model)
+        if provider_kw !== nothing
+            for (k, v) in pairs(provider_kw)
                 request_body[string(k)] = v
             end
         end

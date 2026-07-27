@@ -131,7 +131,7 @@ Return platform-specific tools for the current channel (e.g. emoji reactions).
 Channel extensions should specialize this for their channel types.
 Default: empty vector.
 """
-create_channel_tools(::AbstractChannel) = AgentTool[]
+create_channel_tools(::AbstractChannel) = empty_agent_tools()
 
 const CURRENT_CHANNEL = ScopedValue{Union{AbstractChannel, Nothing}}(nothing)
 

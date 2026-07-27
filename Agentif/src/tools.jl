@@ -9,6 +9,9 @@ parameters(::AgentTool{F, T}) where {F, T} = T
 tool_name(tool::AgentTool) = tool.name
 tool_name(name::AbstractString) = String(name)
 
+const EmptyAgentTool = AgentTool{typeof(identity), @NamedTuple{}}
+empty_agent_tools() = EmptyAgentTool[]
+
 @kwarg mutable struct PendingToolCall
     const call_id::String
     const name::String

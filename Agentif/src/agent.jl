@@ -26,7 +26,7 @@ end
     prompt::String
     model::Model
     apikey::String
-    tools::Vector{T} = AgentTool[]
+    tools::Vector{T} = empty_agent_tools()
     http_kw::Any = (;)  # HTTP.jl kwargs (retries, retry_delays, etc.)
 end
 

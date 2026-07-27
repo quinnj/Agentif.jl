@@ -66,7 +66,7 @@ function materialize_guardrail_agent(agent::Agent, guardrail::InputGuardrailAgen
         prompt = guardrail.prompt,
         model = model === nothing ? agent.model : model,
         apikey = apikey === nothing ? agent.apikey : apikey,
-        tools = AgentTool[],
+        tools = empty_agent_tools(),
         http_kw = agent.http_kw,
     )
 end
