@@ -153,7 +153,7 @@ Used by group chat prompts to let the agent stay silent when it has nothing to a
 const NO_REPLY_SENTINEL = '∅'
 
 function channel_middleware(agent_handler::AgentHandler, ch::Union{Nothing, AbstractChannel})
-    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...)
+    return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) where {F <: Function}
         ch === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
         streaming = false
         suppressed = false

@@ -263,8 +263,8 @@ is needed. On the first call (no previous usage data), compaction is skipped.
 function compaction_middleware(agent_handler::AgentHandler, config::CompactionConfig)
     last_input_tokens = Ref(0)
 
-    return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort;
-            model::Union{Nothing, Model} = nothing, kw...)
+    return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort;
+            model::Union{Nothing, Model} = nothing, kw...) where {F <: Function}
         if !config.enabled
             return agent_handler(f, agent, state, current_input, abort; model, kw...)
         end
