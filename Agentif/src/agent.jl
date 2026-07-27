@@ -206,39 +206,6 @@ end
     return :(string(getfield(tool, :func)($(call_args...))))
 end
 
-function coerce_tool_arg(value, typ)
-    typ === Any && return value
-    if typ isa Union
-        value === nothing && (Nothing <: typ) && return nothing
-        for candidate in Base.uniontypes(typ)
-            candidate === Nothing && continue
-            try
-                return convert(candidate, value)
-            catch
-            end
-        end
-        return value
-    end
-    return convert(typ, value)
-end
-
 function parse_tool_arguments(arguments::String, ::Type{T})::T where {T<:NamedTuple}
-    parsed = JSON.parse(arguments)
-    parsed isa AbstractDict || throw(ArgumentError("tool arguments must be a JSON object"))
-    names = fieldnames(T)
-    types = fieldtypes(T)
-    values = Vector{Any}(undef, length(names))
-    for (idx, (name, typ)) in enumerate(zip(names, types))
-        key = String(name)
-        if haskey(parsed, key)
-            values[idx] = coerce_tool_arg(get(() -> nothing, parsed, key), typ)
-        else
-            if Nothing <: typ
-                values[idx] = nothing
-            else
-                throw(ArgumentError("missing required tool argument: $(key)"))
-            end
-        end
-    end
-    return T(Tuple(values))
+    return JSON.parse(arguments, T)
 end
