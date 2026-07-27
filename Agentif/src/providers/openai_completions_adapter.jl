@@ -32,23 +32,29 @@ function openai_completions_detect_compat(model::Model)
     )
 end
 
+function openai_completions_compat_value(compat::Dict{String, Any}, key::String, default::T)::T where {T}
+    value = get(compat, key, default)
+    value isa T || throw(ArgumentError("OpenAI compatibility option `$key` must be a $(T)."))
+    return value
+end
+
 function openai_completions_resolve_compat(model::Model)
     detected = openai_completions_detect_compat(model)
     compat = model.compat
     compat === nothing && return detected
     return (;
-        supportsStore = get(() -> detected.supportsStore, compat, "supportsStore"),
-        supportsDeveloperRole = get(() -> detected.supportsDeveloperRole, compat, "supportsDeveloperRole"),
-        supportsReasoningEffort = get(() -> detected.supportsReasoningEffort, compat, "supportsReasoningEffort"),
-        supportsTools = get(() -> detected.supportsTools, compat, "supportsTools"),
-        supportsUsageInStreaming = get(() -> detected.supportsUsageInStreaming, compat, "supportsUsageInStreaming"),
-        maxTokensField = get(() -> detected.maxTokensField, compat, "maxTokensField"),
-        requiresToolResultName = get(() -> detected.requiresToolResultName, compat, "requiresToolResultName"),
-        requiresAssistantAfterToolResult = get(() -> detected.requiresAssistantAfterToolResult, compat, "requiresAssistantAfterToolResult"),
-        requiresThinkingAsText = get(() -> detected.requiresThinkingAsText, compat, "requiresThinkingAsText"),
-        requiresMistralToolIds = get(() -> detected.requiresMistralToolIds, compat, "requiresMistralToolIds"),
-        thinkingFormat = get(() -> detected.thinkingFormat, compat, "thinkingFormat"),
-        stripThinkTags = get(() -> detected.stripThinkTags, compat, "stripThinkTags"),
+        supportsStore = openai_completions_compat_value(compat, "supportsStore", detected.supportsStore),
+        supportsDeveloperRole = openai_completions_compat_value(compat, "supportsDeveloperRole", detected.supportsDeveloperRole),
+        supportsReasoningEffort = openai_completions_compat_value(compat, "supportsReasoningEffort", detected.supportsReasoningEffort),
+        supportsTools = openai_completions_compat_value(compat, "supportsTools", detected.supportsTools),
+        supportsUsageInStreaming = openai_completions_compat_value(compat, "supportsUsageInStreaming", detected.supportsUsageInStreaming),
+        maxTokensField = openai_completions_compat_value(compat, "maxTokensField", detected.maxTokensField),
+        requiresToolResultName = openai_completions_compat_value(compat, "requiresToolResultName", detected.requiresToolResultName),
+        requiresAssistantAfterToolResult = openai_completions_compat_value(compat, "requiresAssistantAfterToolResult", detected.requiresAssistantAfterToolResult),
+        requiresThinkingAsText = openai_completions_compat_value(compat, "requiresThinkingAsText", detected.requiresThinkingAsText),
+        requiresMistralToolIds = openai_completions_compat_value(compat, "requiresMistralToolIds", detected.requiresMistralToolIds),
+        thinkingFormat = openai_completions_compat_value(compat, "thinkingFormat", detected.thinkingFormat),
+        stripThinkTags = openai_completions_compat_value(compat, "stripThinkTags", detected.stripThinkTags),
     )
 end
 

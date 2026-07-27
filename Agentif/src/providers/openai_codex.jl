@@ -50,8 +50,14 @@ end
 function normalize_codex_transport(value)::Symbol
     value === nothing && return :sse
     value isa Bool && return value ? :websocket : :sse
-
-    text = lowercase(strip(string(value)))
+    text = if value isa Symbol
+        String(value)
+    elseif value isa AbstractString
+        String(value)
+    else
+        throw(ArgumentError("Unsupported codex transport value type: $(typeof(value))."))
+    end
+    text = lowercase(strip(text))
     text in ("", "sse") && return :sse
     text in ("ws", "websocket") && return :websocket
     text == "auto" && return :auto
