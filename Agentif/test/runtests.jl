@@ -119,6 +119,8 @@ Agentif.close_channel(ch::StreamTestChannel) = (ch.closed += 1)
 @testset "public API bindings" begin
     tool = @tool "Echo text." echo_text(text::String) = text
     @test tool_name(tool) == "echo_text"
+    agent = make_agent(; tools = [tool])
+    @test eltype(agent.tools) === typeof(tool)
     pending = Agentif.PendingToolCall(; call_id = "call-1", name = "echo_pending", arguments = "{}")
     @test tool_name(pending) == "echo_pending"
     @test tool_name("literal-name") == "literal-name"

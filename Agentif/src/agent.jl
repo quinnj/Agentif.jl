@@ -21,12 +21,12 @@ function _truncate_tool_result(output::String, max_bytes::Int)
     return truncated * "\n\n[Tool result truncated: showing first ~$(_format_byte_size(max_bytes)) of $(_format_byte_size(original_size)) total]"
 end
 
-@kwarg struct Agent
+@kwarg struct Agent{T<:AgentTool}
     id::Union{Nothing, String} = nothing
     prompt::String
     model::Model
     apikey::String
-    tools::Vector{AgentTool} = AgentTool[]
+    tools::Vector{T} = AgentTool[]
     http_kw::Any = (;)  # HTTP.jl kwargs (retries, retry_delays, etc.)
 end
 
@@ -40,7 +40,7 @@ with_prompt(agent::Agent, prompt::String) = Agent(
     http_kw = agent.http_kw,
 )
 
-with_tools(agent::Agent, tools::Vector{AgentTool}) = Agent(
+with_tools(agent::Agent, tools::Vector{T}) where {T<:AgentTool} = Agent(
     ;
     id = agent.id,
     prompt = agent.prompt,

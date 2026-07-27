@@ -68,7 +68,7 @@ end
 @omit_null @kwarg struct FunctionCall
     id::Union{Nothing, String} = nothing
     name::Union{Nothing, String} = nothing
-    args::Union{Nothing, Any} = nothing
+    args::Union{Nothing, Dict{String, Any}} = nothing
 end
 
 @omit_null @kwarg struct InlineData
