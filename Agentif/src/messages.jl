@@ -71,6 +71,17 @@ const StoredAgentMessage = Union{
     CompactionSummaryMessage,
 }
 
+function stored_agent_messages(messages::Vector{AgentMessage})
+    stored = StoredAgentMessage[]
+    sizehint!(stored, length(messages))
+    for message in messages
+        message isa StoredAgentMessage ||
+            throw(ArgumentError("Unsupported agent message type: $(typeof(message))."))
+        push!(stored, message)
+    end
+    return stored
+end
+
 const AGENT_MESSAGE_TYPE_USER = "user"
 const AGENT_MESSAGE_TYPE_ASSISTANT = "assistant"
 const AGENT_MESSAGE_TYPE_TOOL_RESULT = "tool_result"

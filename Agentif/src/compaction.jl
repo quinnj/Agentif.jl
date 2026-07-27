@@ -120,7 +120,9 @@ function find_cut_point(messages::Vector{StoredAgentMessage}, keep_recent_tokens
             # Valid cut point if the previous message is NOT an AssistantMessage
             # with pending tool calls (i.e., we're not between a tool call and
             # its results).
-            if i == 1 || !(messages[i-1] isa AssistantMessage && !isempty(messages[i-1].tool_calls))
+            previous = i == 1 ? nothing : messages[i - 1]
+            if previous === nothing ||
+                    !(previous isa AssistantMessage && !isempty(previous.tool_calls))
                 return i
             end
         end
@@ -130,7 +132,7 @@ function find_cut_point(messages::Vector{StoredAgentMessage}, keep_recent_tokens
 end
 
 find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int) =
-    find_cut_point(StoredAgentMessage[messages...], keep_recent_tokens)
+    find_cut_point(stored_agent_messages(messages), keep_recent_tokens)
 
 """
     format_messages_for_summary(messages::Vector{<:AgentMessage}) -> String
@@ -163,7 +165,7 @@ function format_messages_for_summary(messages::Vector{StoredAgentMessage})
 end
 
 format_messages_for_summary(messages::Vector{AgentMessage}) =
-    format_messages_for_summary(StoredAgentMessage[messages...])
+    format_messages_for_summary(stored_agent_messages(messages))
 
 """
     generate_summary(agent, to_discard, existing_summary, config, model) -> String
@@ -219,7 +221,10 @@ function compact!(agent::Agent, state::AgentState, config::CompactionConfig, mod
         return
     end
 
-    tokens_before = sum(estimate_message_tokens(m) for m in to_discard)
+    tokens_before = 0
+    for message in to_discard
+        tokens_before += estimate_message_tokens(message)
+    end
     if existing_summary !== nothing
         tokens_before += existing_summary.tokens_before
     end
