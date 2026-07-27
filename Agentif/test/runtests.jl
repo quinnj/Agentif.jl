@@ -295,6 +295,17 @@ end
         return state
     end
     agent = make_agent()
+    handler = @inferred Agentif.build_default_handler(;
+        base_handler,
+        compaction_config = nothing,
+        steer_queue = nothing,
+        message_queue = nothing,
+        session_store = nothing,
+        input_guardrail = nothing,
+        skill_registry = nothing,
+        channel = nothing,
+    )
+    @test handler isa Function
     state = Agentif.evaluate(identity, agent, "hello"; base_handler, level = :debug)
     @test state isa AgentState
     @test observed_kw[] !== nothing

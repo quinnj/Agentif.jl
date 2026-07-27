@@ -328,29 +328,29 @@ function build_default_handler(
         skill_registry::Union{Nothing, SkillRegistry} = nothing,
         channel::Union{Nothing, AbstractChannel} = nothing,
     )
-    handler = base_handler
-    if compaction_config !== nothing
-        handler = compaction_middleware(handler, compaction_config)
-    end
-    handler = steer_middleware(handler, steer_queue)
-    handler = channel_middleware(handler, channel)
-    handler = tool_call_middleware(handler)
+    compaction_handler = compaction_config === nothing ?
+        base_handler : compaction_middleware(base_handler, compaction_config)
+    steer_handler = steer_middleware(compaction_handler, steer_queue)
+    channel_handler = channel_middleware(steer_handler, channel)
+    tool_handler = tool_call_middleware(channel_handler)
     # Inject channel-specific tools (e.g. emoji reactions) outside the tool_call
     # loop so that findtool can resolve them when the model calls them.
-    if channel !== nothing
+    channel_tools_handler = if channel === nothing
+        tool_handler
+    else
         ch_tools = create_channel_tools(channel)
-        if !isempty(ch_tools)
-            inner_handler = handler
-            handler = (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) ->
-                inner_handler(f, with_tools(agent, vcat(agent.tools, ch_tools)), state, current_input, abort; kw...)
+        if isempty(ch_tools)
+            tool_handler
+        else
+            (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) ->
+                tool_handler(f, with_tools(agent, vcat(agent.tools, ch_tools)), state, current_input, abort; kw...)
         end
     end
-    handler = session_middleware(handler, session_store; channel)
-    handler = input_guardrail_middleware(handler, input_guardrail)
-    handler = skills_middleware(handler, skill_registry)
-    handler = evaluate_middleware(handler)
-    handler = queue_middleware(handler, message_queue)
-    return handler
+    session_handler = session_middleware(channel_tools_handler, session_store; channel)
+    guardrail_handler = input_guardrail_middleware(session_handler, input_guardrail)
+    skills_handler = skills_middleware(guardrail_handler, skill_registry)
+    evaluate_handler = evaluate_middleware(skills_handler)
+    return queue_middleware(evaluate_handler, message_queue)
 end
 
 evaluate(
@@ -379,11 +379,9 @@ function evaluate(
         level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing,
         kw...,
     )
-    if repeat_input && input isa String
-        input = input * "\n\n" * input
-    end
+    current_input = repeat_input && input isa String ? input * "\n\n" * input : input
     handler = build_default_handler(; base_handler, compaction_config, steer_queue, message_queue, session_store, input_guardrail, skill_registry, channel)
     return with_log_level(level) do
-        handler(f, agent, state, input, abort; kw...)
+        handler(f, agent, state, current_input, abort; kw...)
     end
 end
