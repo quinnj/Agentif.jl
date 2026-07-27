@@ -4,8 +4,8 @@ if TRIMMED_BUILD
     caught_exception(::Any, message::String)::ErrorException = ErrorException(message)
     caught_exception_message(::Any, message::String)::String = message
     caught_backtrace() = nothing
-    capture_caught_exception(::Any)::CapturedException =
-        capture(ErrorException("Asynchronous agent operation failed."))
+    capture_caught_exception(::Any)::ErrorException =
+        ErrorException("Asynchronous agent operation failed.")
 else
     caught_exception(value, message::String)::Exception =
         value isa Exception ? value : ErrorException(message)

@@ -165,10 +165,10 @@ end
 Use the agent's model to generate a structured summary of discarded messages.
 """
 function generate_summary(
-        agent::Agent, to_discard::Vector{AgentMessage},
+        agent::Agent{T}, to_discard::Vector{AgentMessage},
         existing_summary::Union{Nothing, CompactionSummaryMessage},
         config::CompactionConfig, model::Model,
-    )
+    ) where {T<:AgentTool}
     prompt = if existing_summary !== nothing
         replace(COMPACTION_UPDATE_PROMPT, "%s" => existing_summary.summary)
     else
@@ -178,7 +178,7 @@ function generate_summary(
     conversation_text = format_messages_for_summary(to_discard)
     summary_input = "Summarize this conversation:\n\n$conversation_text"
 
-    summary_agent = Agent(; prompt, model, apikey = agent.apikey, tools = AgentTool[])
+    summary_agent = Agent(; prompt, model, apikey = agent.apikey, tools = T[])
     result = stream(identity, summary_agent, AgentState(), summary_input, Abort())
     return message_text(last_assistant_message(result))
 end
