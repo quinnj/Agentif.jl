@@ -1,4 +1,6 @@
 const TRIMMED_BUILD = get(ENV, "LE_TRIMMED_BUILD", "") == "1"
+const ToolArguments =
+    TRIMMED_BUILD ? Dict{String, JSON.JSONText} : Dict{String, Any}
 
 if TRIMMED_BUILD
     caught_exception(::Any, message::String)::ErrorException = ErrorException(message)

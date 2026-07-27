@@ -25,6 +25,10 @@ const CODEX_DEFAULT_RETRY_BASE_MS = 1000
 const CODEX_DEFAULT_RETRY_MAX_MS = 60000
 const CODEX_RETRYABLE_ERROR_REGEX = r"rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused|connection.?reset|reset.?before.?headers|terminated|temporar"i
 
+@kwarg struct CodexAuthClaims
+    chatgpt_account_id::Union{Nothing, String} = nothing
+end
+
 function resolve_codex_url(base_url::AbstractString)
     raw = strip(String(base_url))
     raw = isempty(raw) ? CODEX_BASE_URL : raw
@@ -110,6 +114,77 @@ function codex_retry_settings!(kw::Dict{Symbol, Any})
     return (; max_retries, retry_base_ms, retry_max_ms)
 end
 
+function trimmed_codex_options(kw::NamedTuple)
+    account_id = if hasproperty(kw, :account_id)
+        string(getproperty(kw, :account_id))
+    elseif hasproperty(kw, :accountId)
+        string(getproperty(kw, :accountId))
+    else
+        nothing
+    end
+    session_id = if hasproperty(kw, :session_id)
+        string(getproperty(kw, :session_id))
+    elseif hasproperty(kw, :sessionId)
+        string(getproperty(kw, :sessionId))
+    else
+        nothing
+    end
+    reasoning_effort = if hasproperty(kw, :reasoning_effort)
+        string(getproperty(kw, :reasoning_effort))
+    elseif hasproperty(kw, :reasoningEffort)
+        string(getproperty(kw, :reasoningEffort))
+    elseif hasproperty(kw, :reasoning)
+        string(getproperty(kw, :reasoning))
+    else
+        nothing
+    end
+    reasoning_summary = if hasproperty(kw, :reasoning_summary)
+        string(getproperty(kw, :reasoning_summary))
+    elseif hasproperty(kw, :reasoningSummary)
+        string(getproperty(kw, :reasoningSummary))
+    else
+        nothing
+    end
+    text_verbosity = if hasproperty(kw, :text_verbosity)
+        string(getproperty(kw, :text_verbosity))
+    elseif hasproperty(kw, :textVerbosity)
+        string(getproperty(kw, :textVerbosity))
+    else
+        nothing
+    end
+    transport_value = if hasproperty(kw, :transport)
+        getproperty(kw, :transport)
+    elseif hasproperty(kw, :transportMode)
+        getproperty(kw, :transportMode)
+    elseif hasproperty(kw, :websocket)
+        getproperty(kw, :websocket)
+    elseif hasproperty(kw, :websockets)
+        getproperty(kw, :websockets)
+    else
+        nothing
+    end
+    transport = normalize_codex_transport(transport_value)
+    retry_settings = (
+        max_retries = codex_env_int(
+            "AGENTIF_CODEX_MAX_RETRIES", CODEX_DEFAULT_MAX_RETRIES),
+        retry_base_ms = codex_env_int(
+            "AGENTIF_CODEX_RETRY_BASE_MS", CODEX_DEFAULT_RETRY_BASE_MS),
+        retry_max_ms = codex_env_int(
+            "AGENTIF_CODEX_RETRY_MAX_MS", CODEX_DEFAULT_RETRY_MAX_MS),
+    )
+    return (;
+        account_id,
+        session_id,
+        reasoning_effort,
+        reasoning_summary,
+        text_verbosity,
+        include_opt = nothing,
+        max_tokens = nothing,
+        transport,
+        retry_settings,
+    )
+end
+
 function build_codex_tools(tools::Vector{AgentTool})
     isempty(tools) && return nothing
     provider_tools = Vector{Dict{String, Any}}()
@@ -151,11 +226,15 @@ function codex_account_id_from_access_token(access_token::AbstractString)
     parts = split(String(access_token), ".")
     length(parts) == 3 || return nothing
     try
-        payload = JSON.parse(Vector{UInt8}(codeunits(decode_base64url(parts[2]))))
-        auth_claims = get(() -> nothing, payload, CODEX_JWT_CLAIM_PATH)
-        auth_claims isa AbstractDict || return nothing
-        account_id = get(() -> nothing, auth_claims, "chatgpt_account_id")
-        return (account_id isa AbstractString && !isempty(account_id)) ? String(account_id) : nothing
+        payload = JSON.parse(
+            Vector{UInt8}(codeunits(decode_base64url(parts[2]))),
+            Dict{String, JSON.JSONText},
+        )
+        auth_json = get(payload, CODEX_JWT_CLAIM_PATH, nothing)
+        auth_json === nothing && return nothing
+        auth_claims = JSON.parse(auth_json.value, CodexAuthClaims)
+        account_id = auth_claims.chatgpt_account_id
+        return (account_id !== nothing && !isempty(account_id)) ? account_id : nothing
     catch
         return nothing
     end

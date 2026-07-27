@@ -187,7 +187,13 @@ function generate_summary(
     summary_input = "Summarize this conversation:\n\n$conversation_text"
 
     summary_agent = Agent(;
-        prompt, model, apikey = agent.apikey, tools = empty_agent_tools())
+        prompt,
+        model,
+        apikey = agent.apikey,
+        tools = empty_agent_tools(),
+        http_kw = agent.http_kw,
+        api = agent.api,
+    )
     result = stream(identity, summary_agent, AgentState(), summary_input, Abort())
     return message_text(last_assistant_message(result))
 end

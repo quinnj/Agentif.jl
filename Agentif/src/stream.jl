@@ -46,13 +46,11 @@ end
 
 new_call_id(prefix::String) = string(prefix, "-", string(UID8()))
 
-function parse_tool_arguments(arguments::String)
+function parse_tool_arguments(arguments::String)::ToolArguments
     try
-        parsed = JSON.parse(arguments)
-        parsed isa AbstractDict || return Dict{String, Any}()
-        return Dict{String, Any}(parsed)
+        return JSON.parse(arguments, ToolArguments)
     catch
-        return Dict{String, Any}()
+        return ToolArguments()
     end
 end
 
@@ -76,10 +74,31 @@ function normalize_mistral_tool_id(id::String)
     return normalized
 end
 
+function flush_pending_tool_results!(
+        normalized::Vector{StoredAgentMessage},
+        pending::Vector{ToolCallContent},
+        resolved::Set{String},
+    )
+    isempty(pending) && return
+    for call in pending
+        if !(call.id in resolved)
+            push!(normalized, ToolResultMessage(;
+                call_id = call.id,
+                name = call.name,
+                content = ToolResultContentBlock[TextContent("No result provided")],
+                is_error = true,
+            ))
+        end
+    end
+    empty!(pending)
+    empty!(resolved)
+    return
+end
+
 function transform_messages(
         messages::Vector{StoredAgentMessage}, model::Model;
-        normalize_tool_call_id::Function = identity,
-    )::Vector{StoredAgentMessage}
+        normalize_tool_call_id::F = identity,
+    )::Vector{StoredAgentMessage} where {F}
     tool_call_id_map = Dict{String, String}()
     transformed = StoredAgentMessage[]
     for msg in messages
@@ -132,26 +151,9 @@ function transform_messages(
     pending = ToolCallContent[]
     resolved = Set{String}()
 
-    function flush_pending!()
-        isempty(pending) && return
-        for call in pending
-            if !(call.id in resolved)
-                push!(normalized, ToolResultMessage(;
-                    call_id = call.id,
-                    name = call.name,
-                    content = ToolResultContentBlock[TextContent("No result provided")],
-                    is_error = true,
-                ))
-            end
-        end
-        empty!(pending)
-        empty!(resolved)
-        return
-    end
-
     for msg in transformed
         if msg isa AssistantMessage
-            flush_pending!()
+            flush_pending_tool_results!(normalized, pending, resolved)
             push!(normalized, msg)
             empty!(pending)
             empty!(resolved)
@@ -162,11 +164,11 @@ function transform_messages(
             !isempty(pending) && push!(resolved, msg.call_id)
             push!(normalized, msg)
         else
-            flush_pending!()
+            flush_pending_tool_results!(normalized, pending, resolved)
             push!(normalized, msg)
         end
     end
-    flush_pending!()
+    flush_pending_tool_results!(normalized, pending, resolved)
     return normalized
 end
 
@@ -972,9 +974,16 @@ function stream(
     elseif api isa Val{Symbol("openai-codex-responses")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         apikey = resolve_oauth_apikey(:codex, apikey)
-        account_id = get(() -> nothing, kw_nt, :account_id)
-        account_id === nothing && (account_id = get(() -> nothing, kw_nt, :accountId))
-        account_id = resolve_codex_account_id(account_id, String(apikey))
+        if TRIMMED_BUILD
+            codex_options = trimmed_codex_options(kw_nt)
+            account_id = resolve_codex_account_id(
+                codex_options.account_id, String(apikey))
+        else
+            account_id = get(() -> nothing, kw_nt, :account_id)
+            account_id === nothing &&
+                (account_id = get(() -> nothing, kw_nt, :accountId))
+            account_id = resolve_codex_account_id(account_id, String(apikey))
+        end
         account_id === nothing && throw(ArgumentError("Missing `account_id` for openai-codex provider and unable to infer it from access token"))
 
         assistant_message = assistant_message_for_model(model; response_id = state.response_id)
@@ -984,27 +993,44 @@ function stream(
         response_status = Ref{Union{Nothing, String}}(nothing)
         tool_call_accumulators = Dict{String, ToolCallAccumulator}()
 
-        codex_kw = Dict{Symbol, Any}(pairs(kw_nt))
-        haskey(codex_kw, :instructions) && delete!(codex_kw, :instructions)
-        haskey(codex_kw, :account_id) && delete!(codex_kw, :account_id)
-        haskey(codex_kw, :accountId) && delete!(codex_kw, :accountId)
+        if TRIMMED_BUILD
+            codex_kw = (;)
+            session_id = codex_options.session_id
+            reasoning_effort = codex_options.reasoning_effort
+            reasoning_summary = codex_options.reasoning_summary
+            text_verbosity = codex_options.text_verbosity
+            include_opt = codex_options.include_opt
+            max_tokens = codex_options.max_tokens
+            transport = codex_options.transport
+            retry_settings = codex_options.retry_settings
+        else
+            codex_kw = Dict{Symbol, Any}(pairs(kw_nt))
+            haskey(codex_kw, :instructions) && delete!(codex_kw, :instructions)
+            haskey(codex_kw, :account_id) && delete!(codex_kw, :account_id)
+            haskey(codex_kw, :accountId) && delete!(codex_kw, :accountId)
 
-        session_id = pop!(codex_kw, :session_id, nothing)
-        session_id === nothing && (session_id = pop!(codex_kw, :sessionId, nothing))
+            session_id = pop!(codex_kw, :session_id, nothing)
+            session_id === nothing &&
+                (session_id = pop!(codex_kw, :sessionId, nothing))
 
-        reasoning_effort = pop!(codex_kw, :reasoning_effort, nothing)
-        reasoning_effort === nothing && (reasoning_effort = pop!(codex_kw, :reasoningEffort, nothing))
-        if reasoning_effort === nothing && haskey(codex_kw, :reasoning)
-            reasoning_effort = pop!(codex_kw, :reasoning, nothing)
+            reasoning_effort = pop!(codex_kw, :reasoning_effort, nothing)
+            reasoning_effort === nothing &&
+                (reasoning_effort = pop!(codex_kw, :reasoningEffort, nothing))
+            if reasoning_effort === nothing && haskey(codex_kw, :reasoning)
+                reasoning_effort = pop!(codex_kw, :reasoning, nothing)
+            end
+            reasoning_summary = pop!(codex_kw, :reasoning_summary, nothing)
+            reasoning_summary === nothing &&
+                (reasoning_summary = pop!(codex_kw, :reasoningSummary, nothing))
+            text_verbosity = pop!(codex_kw, :textVerbosity, nothing)
+            text_verbosity === nothing &&
+                (text_verbosity = pop!(codex_kw, :text_verbosity, nothing))
+            include_opt = pop!(codex_kw, :include, nothing)
+            max_tokens = pop!(codex_kw, :maxTokens, nothing)
+            transport = normalize_codex_transport(codex_pop_option!(
+                codex_kw, :transport, :transportMode, :websocket, :websockets))
+            retry_settings = codex_retry_settings!(codex_kw)
         end
-        reasoning_summary = pop!(codex_kw, :reasoning_summary, nothing)
-        reasoning_summary === nothing && (reasoning_summary = pop!(codex_kw, :reasoningSummary, nothing))
-        text_verbosity = pop!(codex_kw, :textVerbosity, nothing)
-        text_verbosity === nothing && (text_verbosity = pop!(codex_kw, :text_verbosity, nothing))
-        include_opt = pop!(codex_kw, :include, nothing)
-        max_tokens = pop!(codex_kw, :maxTokens, nothing)
-        transport = normalize_codex_transport(codex_pop_option!(codex_kw, :transport, :transportMode, :websocket, :websockets))
-        retry_settings = codex_retry_settings!(codex_kw)
 
         tools = build_codex_tools(agent.tools)
         current_input = codex_build_input(agent, state, input, model)
@@ -1028,8 +1054,10 @@ function stream(
                 request_body[string(k)] = v
             end
         end
-        for (k, v) in codex_kw
-            request_body[string(k)] = v
+        if !TRIMMED_BUILD
+            for (k, v) in codex_kw
+                request_body[string(k)] = v
+            end
         end
 
         transform_request_body!(

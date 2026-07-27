@@ -345,14 +345,18 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
                 if compat.requiresAssistantAfterToolResult
                     push!(messages, OpenAICompletions.Message(; role = "assistant", content = "I have processed the tool results."))
                 end
+                content = OpenAICompletions.ContentPart[
+                    OpenAICompletions.ContentPart(;
+                        type = "text",
+                        text = "Attached image(s) from tool result:",
+                    ),
+                ]
+                append!(content, image_blocks)
                 push!(
                     messages,
                     OpenAICompletions.Message(;
                         role = "user",
-                        content = OpenAICompletions.ContentPart[
-                            OpenAICompletions.ContentPart(; type = "text", text = "Attached image(s) from tool result:"),
-                            image_blocks...,
-                        ],
+                        content,
                     ),
                 )
                 last_role = "user"

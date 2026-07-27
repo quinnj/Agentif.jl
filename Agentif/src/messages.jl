@@ -30,7 +30,7 @@ end
     type::String = "toolCall"
     id::String
     name::String
-    arguments::Dict{String, Any}
+    arguments::ToolArguments
     thoughtSignature::Union{Nothing, String} = nothing
 end
 

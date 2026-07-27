@@ -85,6 +85,15 @@ end
 function provider_tool_result_output(result::ToolResultMessage)
     output = message_text(result)
     result.is_error || return output
+    if TRIMMED_BUILD
+        return JSON.json((
+            ok = false,
+            tool_error = true,
+            tool = result.name,
+            call_id = result.call_id,
+            message = output,
+        ))
+    end
     parsed_output = try
         JSON.parse(output)
     catch
