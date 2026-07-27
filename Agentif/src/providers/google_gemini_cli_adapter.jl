@@ -12,7 +12,7 @@ function google_gemini_cli_build_tools(tools::Vector{AgentTool})
 end
 
 function google_gemini_cli_build_contents(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
-    context = AgentMessage[]
+    context = StoredAgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
         push!(context, msg)

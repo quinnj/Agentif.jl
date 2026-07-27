@@ -100,7 +100,7 @@ function openai_responses_normalize_tool_call_id(id::String, model::Model)
 end
 
 function openai_responses_transformed_messages(state::AgentState, input::AgentTurnInput, model::Model)
-    raw_messages = AgentMessage[]
+    raw_messages = StoredAgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
         push!(raw_messages, msg)

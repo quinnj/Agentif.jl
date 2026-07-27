@@ -82,7 +82,7 @@ function estimate_message_tokens(msg::AgentMessage)
 end
 
 """
-    find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int) -> Int
+    find_cut_point(messages::Vector{<:AgentMessage}, keep_recent_tokens::Int) -> Int
 
 Walk backwards from the end of messages, accumulating token estimates.
 Returns the index of the first message to KEEP (messages[1:idx-1] get compacted).
@@ -92,7 +92,7 @@ AssistantMessage that is not preceded by an unresolved tool call. This avoids
 splitting tool-call/result pairs while still allowing compaction in long
 tool-call loops that have no intermediate UserMessages.
 """
-function find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int)
+function find_cut_point(messages::Vector{StoredAgentMessage}, keep_recent_tokens::Int)
     length(messages) <= 1 && return 0
 
     accumulated = 0
@@ -129,12 +129,15 @@ function find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int)
     return 0  # no valid cut point found
 end
 
+find_cut_point(messages::Vector{AgentMessage}, keep_recent_tokens::Int) =
+    find_cut_point(StoredAgentMessage[messages...], keep_recent_tokens)
+
 """
-    format_messages_for_summary(messages::Vector{AgentMessage}) -> String
+    format_messages_for_summary(messages::Vector{<:AgentMessage}) -> String
 
 Format discarded messages as readable text for the summarization prompt.
 """
-function format_messages_for_summary(messages::Vector{AgentMessage})
+function format_messages_for_summary(messages::Vector{StoredAgentMessage})
     parts = String[]
     for msg in messages
         if msg isa UserMessage
@@ -159,13 +162,16 @@ function format_messages_for_summary(messages::Vector{AgentMessage})
     return join(parts, "\n\n")
 end
 
+format_messages_for_summary(messages::Vector{AgentMessage}) =
+    format_messages_for_summary(StoredAgentMessage[messages...])
+
 """
     generate_summary(agent, to_discard, existing_summary, config, model) -> String
 
 Use the agent's model to generate a structured summary of discarded messages.
 """
 function generate_summary(
-        agent::Agent, to_discard::Vector{AgentMessage},
+        agent::Agent, to_discard::Vector{StoredAgentMessage},
         existing_summary::Union{Nothing, CompactionSummaryMessage},
         config::CompactionConfig, model::Model,
     )

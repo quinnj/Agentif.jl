@@ -58,7 +58,7 @@ function openai_completions_resolve_compat(model::Model)
     )
 end
 
-function openai_completions_has_tool_history(messages::Vector{AgentMessage})
+function openai_completions_has_tool_history(messages::Vector{StoredAgentMessage})
     for msg in messages
         if msg isa ToolResultMessage
             return true
@@ -169,7 +169,7 @@ end
 
 function openai_completions_build_messages(agent::Agent, state::AgentState, input::AgentTurnInput, model::Model)
     compat = openai_completions_resolve_compat(model)
-    raw_messages = AgentMessage[]
+    raw_messages = StoredAgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
         push!(raw_messages, msg)

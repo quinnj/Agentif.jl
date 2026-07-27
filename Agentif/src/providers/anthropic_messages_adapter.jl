@@ -51,8 +51,8 @@ function anthropic_tool_result_block(result::ToolResultMessage)
     )
 end
 
-function anthropic_insert_missing_tool_results(messages::Vector{AgentMessage})
-    normalized = AgentMessage[]
+function anthropic_insert_missing_tool_results(messages::Vector{StoredAgentMessage})
+    normalized = StoredAgentMessage[]
     pending = ToolCallContent[]
     resolved = Set{String}()
     function flush_pending!()
@@ -181,7 +181,7 @@ function anthropic_message_from_agent(msg::AgentMessage, tool_name_map::Dict{Str
 end
 
 function anthropic_build_messages(agent::Agent, state::AgentState, input::AgentTurnInput, tool_name_map::Dict{String, String}, model::Model)
-    context = AgentMessage[]
+    context = StoredAgentMessage[]
     for msg in state.messages
         include_in_context(msg) || continue
         push!(context, msg)

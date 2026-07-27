@@ -77,11 +77,11 @@ function normalize_mistral_tool_id(id::String)
 end
 
 function transform_messages(
-        messages::Vector{AgentMessage}, model::Model;
+        messages::Vector{StoredAgentMessage}, model::Model;
         normalize_tool_call_id::Function = identity,
-    )::Vector{AgentMessage}
+    )::Vector{StoredAgentMessage}
     tool_call_id_map = Dict{String, String}()
-    transformed = AgentMessage[]
+    transformed = StoredAgentMessage[]
     for msg in messages
         if msg isa CompactionSummaryMessage
             push!(transformed, msg)
@@ -128,7 +128,7 @@ function transform_messages(
         end
     end
 
-    normalized = AgentMessage[]
+    normalized = StoredAgentMessage[]
     pending = ToolCallContent[]
     resolved = Set{String}()
 
@@ -279,6 +279,7 @@ function stream(
         f::F, agent::Agent, state::AgentState, input::AgentTurnInput, abort::Abort;
         model::Union{Nothing, Model} = nothing, http_kw = (;), kw...
     ) where {F <: Function}
+    api = model === nothing ? agent.api : Val(Symbol(model.api))
     model = model === nothing ? agent.model : model
     model === nothing && throw(ArgumentError("no model specified with which agent can evaluate input"))
 
@@ -296,7 +297,7 @@ function stream(
     end
     apikey = apikey_override === nothing ? agent.apikey : apikey_override
 
-    if model.api == "openai-responses"
+    if api isa Val{Symbol("openai-responses")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         assistant_message = assistant_message_for_model(model; response_id = state.response_id)
         started = Ref(false)
@@ -438,7 +439,7 @@ function stream(
         stop_reason = openai_responses_stop_reason(response_status[], assistant_message.tool_calls)
         isaborted(abort) && (stop_reason = :aborted)
         return finalize_stream!(state, input, assistant_message, usage, stop_reason)
-    elseif model.api == "openai-completions"
+    elseif api isa Val{Symbol("openai-completions")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         compat = openai_completions_resolve_compat(model)
         messages, has_tool_history = openai_completions_build_messages(agent, state, input, model)
@@ -664,7 +665,7 @@ function stream(
         stop_reason = openai_completions_stop_reason(latest_finish[], assistant_message.tool_calls)
         isaborted(abort) && (stop_reason = :aborted)
         return finalize_stream!(state, input, assistant_message, usage, stop_reason)
-    elseif model.api == "anthropic-messages"
+    elseif api isa Val{Symbol("anthropic-messages")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         apikey = resolve_oauth_apikey(:anthropic, apikey)
         is_oauth = startswith(apikey, "sk-ant-oat")
@@ -834,7 +835,7 @@ function stream(
             isaborted(abort) && (final_stop = :aborted)
             return finalize_stream!(state, input, assistant_message, usage, final_stop)
         end
-    elseif model.api == "google-generative-ai"
+    elseif api isa Val{Symbol("google-generative-ai")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         tools = google_generative_build_tools(agent.tools)
         contents = google_generative_build_contents(agent, state, input, model)
@@ -893,7 +894,7 @@ function stream(
         stop_reason = google_generative_stop_reason(latest_finish[], assistant_message.tool_calls)
         isaborted(abort) && (stop_reason = :aborted)
         return finalize_stream!(state, input, assistant_message, usage, stop_reason)
-    elseif model.api == "google-gemini-cli"
+    elseif api isa Val{Symbol("google-gemini-cli")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         tools = google_gemini_cli_build_tools(agent.tools)
         contents = google_gemini_cli_build_contents(agent, state, input, model)
@@ -968,7 +969,7 @@ function stream(
         stop_reason = google_gemini_cli_stop_reason(latest_finish[], assistant_message.tool_calls)
         isaborted(abort) && (stop_reason = :aborted)
         return finalize_stream!(state, input, assistant_message, usage, stop_reason)
-    elseif model.api == "openai-codex-responses"
+    elseif api isa Val{Symbol("openai-codex-responses")}
         apikey isa AbstractString || throw(ArgumentError("apikey must be a String for provider $(model.provider)"))
         apikey = resolve_oauth_apikey(:codex, apikey)
         account_id = get(() -> nothing, kw_nt, :account_id)

@@ -4,7 +4,7 @@ abstract type SessionStore end
     id::String
     parent_id::Union{Nothing, String} = nothing
     created_at::Float64 = time()
-    messages::Vector{AgentMessage} = AgentMessage[]
+    messages::Vector{StoredAgentMessage} = StoredAgentMessage[]
     is_compaction::Bool = false
     first_kept_entry_id::Union{Nothing, String} = nothing
     is_deleted::Bool = false
