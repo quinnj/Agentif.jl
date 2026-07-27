@@ -346,7 +346,9 @@ function build_default_handler(
                 tool_handler(f, with_tools(agent, vcat(agent.tools, ch_tools)), state, current_input, abort; kw...)
         end
     end
-    session_handler = session_middleware(channel_tools_handler, session_store; channel)
+    session_handler = session_store === nothing ?
+        channel_tools_handler :
+        session_middleware(channel_tools_handler, session_store; channel)
     guardrail_handler = input_guardrail_middleware(session_handler, input_guardrail)
     skills_handler = skills_middleware(guardrail_handler, skill_registry)
     evaluate_handler = evaluate_middleware(skills_handler)
