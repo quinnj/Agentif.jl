@@ -115,6 +115,62 @@ end
 
     msg = JSON.parse("{\"role\":\"user\",\"content\":\"hi\"}", AnthropicMessages.Message)
     @test msg.content == "hi"
+
+    # redacted_thinking parses as a first-class block
+    redacted_event = JSON.parse(
+        "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"EmwKAhgB\"}}",
+        AnthropicMessages.StreamEvent,
+    )
+    @test redacted_event isa AnthropicMessages.StreamContentBlockStartEvent
+    @test redacted_event.content_block isa AnthropicMessages.RedactedThinkingBlock
+    @test redacted_event.content_block.data == "EmwKAhgB"
+
+    # redacted_thinking serializes back to the wire shape for replay
+    lowered = JSON.parse(JSON.json(AnthropicMessages.RedactedThinkingBlock(; data = "opaque")))
+    @test lowered["type"] == "redacted_thinking"
+    @test lowered["data"] == "opaque"
+
+    # unknown content block types parse to the catch-all instead of throwing
+    unknown_block_event = JSON.parse(
+        "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_1\",\"name\":\"web_search\",\"input\":{}}}",
+        AnthropicMessages.StreamEvent,
+    )
+    @test unknown_block_event isa AnthropicMessages.StreamContentBlockStartEvent
+    @test unknown_block_event.content_block isa AnthropicMessages.UnknownContentBlock
+    @test unknown_block_event.content_block.type == "server_tool_use"
+
+    # unknown delta types parse to the catch-all instead of throwing
+    unknown_delta_event = JSON.parse(
+        "{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"citations_delta\",\"citation\":{\"type\":\"web_search_result_location\"}}}",
+        AnthropicMessages.StreamEvent,
+    )
+    @test unknown_delta_event isa AnthropicMessages.StreamContentBlockDeltaEvent
+    @test unknown_delta_event.delta isa AnthropicMessages.UnknownContentBlockDelta
+    @test unknown_delta_event.delta.type == "citations_delta"
+
+    # non-streaming Response tolerates unknown and redacted blocks
+    response = JSON.parse(
+        """
+        {
+          "id": "msg_1",
+          "model": "claude-test",
+          "role": "assistant",
+          "stop_reason": "end_turn",
+          "content": [
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "x"}},
+            {"type": "redacted_thinking", "data": "opaque"},
+            {"type": "text", "text": "done"}
+          ],
+          "usage": {"input_tokens": 3, "output_tokens": 5}
+        }
+        """,
+        AnthropicMessages.Response,
+    )
+    @test response.content[1] isa AnthropicMessages.UnknownContentBlock
+    @test response.content[2] isa AnthropicMessages.RedactedThinkingBlock
+    @test response.content[2].data == "opaque"
+    @test response.content[3] isa AnthropicMessages.TextBlock
+    @test response.content[3].text == "done"
 end
 
 @testset "GoogleGenerativeAI" begin

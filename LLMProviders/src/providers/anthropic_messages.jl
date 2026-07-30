@@ -27,6 +27,11 @@ end
     signature::Union{Nothing, String} = nothing
 end
 
+@omit_null @kwarg struct RedactedThinkingBlock
+    type::String = "redacted_thinking"
+    data::String = ""
+end
+
 @omit_null @kwarg struct ImageSource
     type::String = "base64"
     media_type::String
@@ -54,14 +59,26 @@ const ToolResultContentBlock = Union{TextBlock, ImageBlock}
     is_error::Union{Nothing, Bool} = nothing
 end
 
-const ContentBlock = Union{TextBlock, ThinkingBlock, ImageBlock, ToolUseBlock, ToolResultBlock}
+# Catch-all so unrecognized content block types (e.g. server_tool_use) parse
+# without throwing; mirrors OpenAIResponses.UnknownOutput.
+@omit_null @kwarg struct UnknownContentBlock
+    type::Union{Nothing, String} = nothing
+end
+
+const ContentBlock = Union{TextBlock, ThinkingBlock, RedactedThinkingBlock, ImageBlock, ToolUseBlock, ToolResultBlock, UnknownContentBlock}
 
 JSON.@choosetype ContentBlock x -> begin
-    type = x.type[]
+    type = try
+        x.type[]
+    catch
+        nothing
+    end
     if type == "text"
         return TextBlock
     elseif type == "thinking"
         return ThinkingBlock
+    elseif type == "redacted_thinking"
+        return RedactedThinkingBlock
     elseif type == "image"
         return ImageBlock
     elseif type == "tool_use"
@@ -69,7 +86,7 @@ JSON.@choosetype ContentBlock x -> begin
     elseif type == "tool_result"
         return ToolResultBlock
     else
-        return Any
+        return UnknownContentBlock
     end
 end
 
@@ -132,10 +149,19 @@ end
     partial_json::String
 end
 
-const ContentBlockDelta = Union{TextDelta, ThinkingDelta, SignatureDelta, InputJsonDelta}
+# Catch-all so unrecognized delta types (e.g. citations_delta) parse without throwing.
+@omit_null @kwarg struct UnknownContentBlockDelta
+    type::Union{Nothing, String} = nothing
+end
+
+const ContentBlockDelta = Union{TextDelta, ThinkingDelta, SignatureDelta, InputJsonDelta, UnknownContentBlockDelta}
 
 JSON.@choosetype ContentBlockDelta x -> begin
-    type = x.type[]
+    type = try
+        x.type[]
+    catch
+        nothing
+    end
     if type == "text_delta"
         return TextDelta
     elseif type == "thinking_delta"
@@ -145,7 +171,7 @@ JSON.@choosetype ContentBlockDelta x -> begin
     elseif type == "input_json_delta"
         return InputJsonDelta
     else
-        return Any
+        return UnknownContentBlockDelta
     end
 end
 

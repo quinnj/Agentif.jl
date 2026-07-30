@@ -18,6 +18,10 @@ end
     type::String = "thinking"
     thinking::String
     thinkingSignature::Union{Nothing, String} = nothing
+    # Anthropic redacted_thinking: `thinking` is empty and `thinkingSignature`
+    # carries the opaque `data` payload for replay. Defaults to false so
+    # previously persisted sessions load unchanged.
+    redacted::Bool = false
 end
 
 @kwarg mutable struct ImageContent <: ContentBlock
@@ -153,7 +157,7 @@ function set_last_text!(msg::AssistantMessage, text::String)
 end
 
 JSON.lower(x::TextContent) = (; type = x.type, text = x.text, textSignature = x.textSignature)
-JSON.lower(x::ThinkingContent) = (; type = x.type, thinking = x.thinking, thinkingSignature = x.thinkingSignature)
+JSON.lower(x::ThinkingContent) = (; type = x.type, thinking = x.thinking, thinkingSignature = x.thinkingSignature, redacted = x.redacted)
 JSON.lower(x::ImageContent) = (; type = x.type, data = x.data, mimeType = x.mimeType)
 JSON.lower(x::ToolCallContent) = (;
     type = x.type,

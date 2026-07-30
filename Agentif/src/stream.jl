@@ -38,6 +38,105 @@ const DEFAULT_HTTP_KW = (;
     retry_non_idempotent = true,  # Retry POST requests
 )
 
+# ── SSE-safe retry ────────────────────────────────────────────────────────────
+# HTTP.jl's transport-level retry sits above the layer that feeds SSE events to
+# `sse_callback`, so a connection drop mid-stream would replay the entire
+# response into the same stateful callback closures (doubling text/thinking
+# deltas and corrupting tool-call accumulators). For SSE requests we therefore
+# disable transport retry (`retry = false`) and retry at this level instead,
+# but only while no SSE event has been delivered yet.
+
+# Transient statuses worth retrying before any event has been delivered.
+const SSE_RETRYABLE_STATUSES = (408, 429, 500, 502, 503, 504, 599)
+
+sse_retryable_status(status::Integer) = Int(status) in SSE_RETRYABLE_STATUSES
+
+# Recoverable connection-level failures (EOF/IO errors, connect failures, TLS
+# errors) — never StatusError (handled separately) and never interrupts.
+function sse_recoverable_connection_error(err)
+    (err isa InterruptException || err isa StopStreaming || err isa HTTP.StatusError) && return false
+    err isa Exception || return false
+    return codex_retryable_exception(err) || HTTP.RetryRequest.isrecoverable(err)
+end
+
+function sse_retryable_error(err)
+    err isa HTTP.StatusError && return sse_retryable_status(err.status)
+    return sse_recoverable_connection_error(err)
+end
+
+# Wrap a provider `sse_callback` so the very first delivered event flips
+# `events_seen` (before the provider closure runs, so even a callback that
+# throws still counts as delivery).
+function sse_tracking_callback(callback::Function, events_seen::Base.RefValue{Bool})
+    return function (stream, event)
+        events_seen[] = true
+        return callback(stream, event)
+    end
+end
+
+# Respect caller-provided `http_kw` retry overrides: `retry = false` disables
+# our retry loop entirely, and `retries = N` bounds it at N + 1 attempts.
+function sse_retry_attempts(http_kw::NamedTuple)
+    get(http_kw, :retry, true) === true || return 1
+    return max(1, Int(get(http_kw, :retries, DEFAULT_HTTP_KW.retries)) + 1)
+end
+
+"""
+    sse_request_with_retry(do_request, events_seen, abort; max_attempts, ...)
+
+Run `do_request` (an `HTTP.post` with transport-level retry disabled), retrying
+transient failures (recoverable connection errors, or `HTTP.StatusError` with a
+status in `$(SSE_RETRYABLE_STATUSES)`) with bounded exponential backoff. A
+`Retry-After` header on the failed response is honored (capped at
+`max_delay_ms`). Once any SSE event has been delivered (`events_seen[]`),
+errors are rethrown instead of retried — replaying the response would corrupt
+the stateful callback accumulators.
+"""
+function sse_request_with_retry(
+        do_request::Function,
+        events_seen::Base.RefValue{Bool},
+        abort::Abort;
+        max_attempts::Int,
+        base_delay_ms::Int = CODEX_DEFAULT_RETRY_BASE_MS,
+        max_delay_ms::Int = CODEX_DEFAULT_RETRY_MAX_MS,
+    )
+    attempt = 1
+    while true
+        isaborted(abort) && throw(StopStreaming("aborted"))
+        try
+            return do_request()
+        catch err
+            (err isa StopStreaming || err isa InterruptException) && rethrow()
+            (events_seen[] || attempt >= max_attempts || !sse_retryable_error(err)) && rethrow()
+            response = err isa HTTP.StatusError ? err.response : nothing
+            delay_s = codex_retry_delay_seconds(attempt, base_delay_ms, max_delay_ms; response)
+            attempt += 1
+            codex_sleep_with_abort!(delay_s, abort)
+        end
+    end
+end
+
+# Shared handling for a connection dropped after SSE events already flowed:
+# keep the partial message, surface the failure as an AgentErrorEvent.
+function sse_emit_stream_interrupted!(
+        f::Function,
+        assistant_message::AssistantMessage,
+        started::Base.RefValue{Bool},
+        ended::Base.RefValue{Bool},
+        err,
+    )
+    if !started[]
+        started[] = true
+        f(MessageStartEvent(:assistant, assistant_message))
+    end
+    if !ended[]
+        ended[] = true
+        f(MessageEndEvent(:assistant, assistant_message))
+    end
+    f(AgentErrorEvent(ErrorException("SSE stream interrupted: $(sprint(showerror, err))")))
+    return
+end
+
 mutable struct ToolCallAccumulator
     id::Union{Nothing, String}
     name::Union{Nothing, String}
@@ -99,10 +198,16 @@ function transform_messages(messages::Vector{AgentMessage}, model::Model; normal
                     isempty(block.text) && continue
                     push!(blocks, TextContent(; text = block.text, textSignature = is_same ? block.textSignature : nothing))
                 elseif block isa ThinkingContent
-                    isempty(block.thinking) && continue
-                    if is_same && block.thinkingSignature !== nothing && !isempty(block.thinkingSignature)
-                        push!(blocks, ThinkingContent(; thinking = block.thinking, thinkingSignature = block.thinkingSignature))
+                    has_signature = block.thinkingSignature !== nothing && !isempty(block.thinkingSignature)
+                    if is_same && has_signature
+                        # Keep signed blocks even when the visible thinking text is
+                        # empty: redacted_thinking and encrypted reasoning items
+                        # (e.g. Responses with no summary) round-trip through the
+                        # signature and must be replayed for continuity.
+                        push!(blocks, ThinkingContent(; thinking = block.thinking, thinkingSignature = block.thinkingSignature, redacted = block.redacted))
                     else
+                        isempty(block.thinking) && continue
+                        block.redacted && continue
                         push!(blocks, TextContent(; text = block.thinking))
                     end
                 elseif block isa ToolCallContent
@@ -370,23 +475,31 @@ function stream(
         )
         model.headers !== nothing && merge!(headers, model.headers)
         url = joinpath(model.baseUrl, "responses")
+        events_seen = Ref(false)
+        sse_cb = sse_tracking_callback(
+            openai_responses_event_callback(
+                f,
+                agent,
+                assistant_message,
+                started,
+                ended,
+                response_usage,
+                response_status,
+                abort,
+            ),
+            events_seen,
+        )
+        request_http_kw = merge(merged_http_kw, (; retry = false))
         try
-            HTTP.post(
-                url,
-                headers;
-                body = JSON.json(body),
-                sse_callback = openai_responses_event_callback(
-                    f,
-                    agent,
-                    assistant_message,
-                    started,
-                    ended,
-                    response_usage,
-                    response_status,
-                    abort,
-                ),
-                merged_http_kw...,
-            )
+            sse_request_with_retry(events_seen, abort; max_attempts = sse_retry_attempts(merged_http_kw)) do
+                HTTP.post(
+                    url,
+                    headers;
+                    body = JSON.json(body),
+                    sse_callback = sse_cb,
+                    request_http_kw...,
+                )
+            end
         catch e
             if e isa StopStreaming
                 # Expected abort
@@ -407,6 +520,9 @@ function stream(
                     "HTTP $(e.status): $error_body"
                 end
                 f(AgentErrorEvent(ErrorException(error_msg)))
+                response_status[] = "failed"
+            elseif events_seen[] && sse_recoverable_connection_error(e)
+                sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
                 response_status[] = "failed"
             else
                 rethrow()
@@ -512,25 +628,34 @@ function stream(
         )
         model.headers !== nothing && merge!(headers, model.headers)
         url = joinpath(model.baseUrl, "chat", "completions")
+        stream_failed = Ref(false)
         if use_stream
+            events_seen = Ref(false)
+            sse_cb = sse_tracking_callback(
+                openai_completions_event_callback(
+                    f,
+                    assistant_message,
+                    started,
+                    ended,
+                    latest_usage,
+                    latest_finish,
+                    tool_call_accumulators,
+                    abort;
+                    think_tag_state = compat.stripThinkTags ? ThinkTagStreamState() : nothing,
+                ),
+                events_seen,
+            )
+            request_http_kw = merge(merged_http_kw, (; retry = false))
             try
-                HTTP.post(
-                    url,
-                    headers;
-                    body = JSON.json(req),
-                    sse_callback = openai_completions_event_callback(
-                        f,
-                        assistant_message,
-                        started,
-                        ended,
-                        latest_usage,
-                        latest_finish,
-                        tool_call_accumulators,
-                        abort;
-                        think_tag_state = compat.stripThinkTags ? ThinkTagStreamState() : nothing,
-                    ),
-                    merged_http_kw...,
-                )
+                sse_request_with_retry(events_seen, abort; max_attempts = sse_retry_attempts(merged_http_kw)) do
+                    HTTP.post(
+                        url,
+                        headers;
+                        body = JSON.json(req),
+                        sse_callback = sse_cb,
+                        request_http_kw...,
+                    )
+                end
             catch e
                 if e isa StopStreaming
                     # Expected abort
@@ -552,6 +677,9 @@ function stream(
                     end
                     f(AgentErrorEvent(ErrorException(error_msg)))
                     latest_finish[] = "error"
+                elseif events_seen[] && sse_recoverable_connection_error(e)
+                    sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
+                    stream_failed[] = true
                 else
                     rethrow()
                 end
@@ -562,7 +690,7 @@ function stream(
                 f(MessageEndEvent(:assistant, assistant_message))
             end
 
-            if !isaborted(abort)
+            if !isaborted(abort) && !stream_failed[]
                 for idx in sort(collect(keys(tool_call_accumulators)))
                     acc = tool_call_accumulators[idx]
                     toolcall_debug(
@@ -643,6 +771,7 @@ function stream(
 
         usage = openai_completions_usage_from_response(latest_usage[])
         stop_reason = openai_completions_stop_reason(latest_finish[], assistant_message.tool_calls)
+        stream_failed[] && (stop_reason = :error)
         isaborted(abort) && (stop_reason = :aborted)
         return finalize_stream!(state, input, assistant_message, usage, stop_reason)
     elseif model.api == "anthropic-messages"
@@ -730,6 +859,12 @@ function stream(
                         thinkingSignature = block.signature,
                     )
                     push!(assistant_message.content, thinking)
+                elseif block isa AnthropicMessages.RedactedThinkingBlock
+                    push!(assistant_message.content, ThinkingContent(;
+                        thinking = "",
+                        thinkingSignature = block.data,
+                        redacted = true,
+                    ))
                 elseif block isa AnthropicMessages.ToolUseBlock
                     tool_name = anthropic_internal_tool_name(tool_name_reverse_map, block.name)
                     args = block.input isa AbstractDict ? Dict{String, Any}(block.input) : Dict{String, Any}()
@@ -759,26 +894,35 @@ function stream(
             final_stop = anthropic_stop_reason(stop_reason[], assistant_message.tool_calls)
             return finalize_stream!(state, input, assistant_message, usage, final_stop)
         else
+            events_seen = Ref(false)
+            stream_failed = Ref(false)
+            sse_cb = sse_tracking_callback(
+                anthropic_event_callback(
+                    f,
+                    agent,
+                    assistant_message,
+                    started,
+                    ended,
+                    stop_reason,
+                    latest_usage,
+                    blocks_by_index,
+                    partial_json_by_index,
+                    tool_name_reverse_map,
+                    abort,
+                ),
+                events_seen,
+            )
+            request_http_kw = merge(merged_http_kw, (; retry = false))
             try
-                HTTP.post(
-                    url,
-                    headers;
-                    body = JSON.json(req),
-                    sse_callback = anthropic_event_callback(
-                        f,
-                        agent,
-                        assistant_message,
-                        started,
-                        ended,
-                        stop_reason,
-                        latest_usage,
-                        blocks_by_index,
-                        partial_json_by_index,
-                        tool_name_reverse_map,
-                        abort,
-                    ),
-                    merged_http_kw...,
-                )
+                sse_request_with_retry(events_seen, abort; max_attempts = sse_retry_attempts(merged_http_kw)) do
+                    HTTP.post(
+                        url,
+                        headers;
+                        body = JSON.json(req),
+                        sse_callback = sse_cb,
+                        request_http_kw...,
+                    )
+                end
             catch e
                 if e isa StopStreaming
                 elseif e isa HTTP.StatusError
@@ -800,6 +944,9 @@ function stream(
                     end
                     f(AgentErrorEvent(ErrorException(error_msg)))
                     stop_reason[] = "error"
+                elseif events_seen[] && sse_recoverable_connection_error(e)
+                    sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
+                    stream_failed[] = true
                 else
                     rethrow()
                 end
@@ -812,6 +959,7 @@ function stream(
 
             usage = anthropic_usage_from_response(latest_usage[])
             final_stop = anthropic_stop_reason(stop_reason[], assistant_message.tool_calls)
+            stream_failed[] && (final_stop = :error)
             isaborted(abort) && (final_stop = :aborted)
             return finalize_stream!(state, input, assistant_message, usage, final_stop)
         end
@@ -841,26 +989,58 @@ function stream(
         )
         model.headers !== nothing && merge!(headers, model.headers)
         url = joinpath(model.baseUrl, "models", "$(model.id):streamGenerateContent")
+        events_seen = Ref(false)
+        stream_failed = Ref(false)
+        sse_cb = sse_tracking_callback(
+            google_generative_event_callback(
+                f,
+                agent,
+                assistant_message,
+                started,
+                ended,
+                latest_usage,
+                latest_finish,
+                seen_call_ids,
+                abort,
+            ),
+            events_seen,
+        )
+        request_http_kw = merge(merged_http_kw, (; retry = false))
         try
-            HTTP.post(
-                url * "?alt=sse",
-                headers;
-                body = JSON.json(req),
-                sse_callback = google_generative_event_callback(
-                    f,
-                    agent,
-                    assistant_message,
-                    started,
-                    ended,
-                    latest_usage,
-                    latest_finish,
-                    seen_call_ids,
-                    abort,
-                ),
-                merged_http_kw...,
-            )
+            sse_request_with_retry(events_seen, abort; max_attempts = sse_retry_attempts(merged_http_kw)) do
+                HTTP.post(
+                    url * "?alt=sse",
+                    headers;
+                    body = JSON.json(req),
+                    sse_callback = sse_cb,
+                    request_http_kw...,
+                )
+            end
         catch e
-            if !(e isa StopStreaming)
+            if e isa StopStreaming
+                # Expected abort
+            elseif e isa HTTP.StatusError
+                if !started[]
+                    started[] = true
+                    f(MessageStartEvent(:assistant, assistant_message))
+                end
+                if !ended[]
+                    ended[] = true
+                    f(MessageEndEvent(:assistant, assistant_message))
+                end
+                error_body = String(e.response.body)
+                error_msg = try
+                    err_json = JSON.parse(error_body)
+                    get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
+                catch
+                    "HTTP $(e.status): $error_body"
+                end
+                f(AgentErrorEvent(ErrorException(error_msg)))
+                stream_failed[] = true
+            elseif events_seen[] && sse_recoverable_connection_error(e)
+                sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
+                stream_failed[] = true
+            else
                 rethrow()
             end
         end
@@ -872,6 +1052,7 @@ function stream(
 
         usage = google_generative_usage_from_response(latest_usage[])
         stop_reason = google_generative_stop_reason(latest_finish[], assistant_message.tool_calls)
+        stream_failed[] && (stop_reason = :error)
         isaborted(abort) && (stop_reason = :aborted)
         return finalize_stream!(state, input, assistant_message, usage, stop_reason)
     elseif model.api == "google-gemini-cli"
@@ -916,27 +1097,59 @@ function stream(
         model.headers !== nothing && merge!(headers, model.headers)
 
         debug_stream = get(ENV, "AGENTIF_DEBUG_GEMINI_STREAM", "") != ""
+        events_seen = Ref(false)
+        stream_failed = Ref(false)
+        sse_cb = sse_tracking_callback(
+            google_gemini_cli_event_callback(
+                f,
+                agent,
+                assistant_message,
+                started,
+                ended,
+                latest_usage,
+                latest_finish,
+                seen_call_ids,
+                debug_stream,
+                abort,
+            ),
+            events_seen,
+        )
+        request_http_kw = merge(merged_http_kw, (; retry = false))
         try
-            HTTP.post(
-                url,
-                headers;
-                body = JSON.json(req),
-                sse_callback = google_gemini_cli_event_callback(
-                    f,
-                    agent,
-                    assistant_message,
-                    started,
-                    ended,
-                    latest_usage,
-                    latest_finish,
-                    seen_call_ids,
-                    debug_stream,
-                    abort,
-                ),
-                merged_http_kw...,
-            )
+            sse_request_with_retry(events_seen, abort; max_attempts = sse_retry_attempts(merged_http_kw)) do
+                HTTP.post(
+                    url,
+                    headers;
+                    body = JSON.json(req),
+                    sse_callback = sse_cb,
+                    request_http_kw...,
+                )
+            end
         catch e
-            if !(e isa StopStreaming)
+            if e isa StopStreaming
+                # Expected abort
+            elseif e isa HTTP.StatusError
+                if !started[]
+                    started[] = true
+                    f(MessageStartEvent(:assistant, assistant_message))
+                end
+                if !ended[]
+                    ended[] = true
+                    f(MessageEndEvent(:assistant, assistant_message))
+                end
+                error_body = String(e.response.body)
+                error_msg = try
+                    err_json = JSON.parse(error_body)
+                    get(get(() -> Dict(), err_json, "error"), "message", "HTTP $(e.status)")
+                catch
+                    "HTTP $(e.status): $error_body"
+                end
+                f(AgentErrorEvent(ErrorException(error_msg)))
+                stream_failed[] = true
+            elseif events_seen[] && sse_recoverable_connection_error(e)
+                sse_emit_stream_interrupted!(f, assistant_message, started, ended, e)
+                stream_failed[] = true
+            else
                 rethrow()
             end
         end
@@ -948,6 +1161,7 @@ function stream(
 
         usage = google_gemini_cli_usage_from_response(latest_usage[])
         stop_reason = google_gemini_cli_stop_reason(latest_finish[], assistant_message.tool_calls)
+        stream_failed[] && (stop_reason = :error)
         isaborted(abort) && (stop_reason = :aborted)
         return finalize_stream!(state, input, assistant_message, usage, stop_reason)
     elseif model.api == "openai-codex-responses"

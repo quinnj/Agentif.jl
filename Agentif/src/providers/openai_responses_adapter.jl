@@ -414,6 +414,10 @@ function openai_responses_event_callback(
             if response_id !== nothing
                 assistant_message.response_id = response_id
             end
+            if started[] && !ended[]
+                ended[] = true
+                f(MessageEndEvent(:assistant, assistant_message))
+            end
         elseif parsed isa OpenAIResponses.StreamResponseFailedEvent
             response_status[] = parsed.response.status
             response_usage[] = parsed.response.usage
@@ -435,11 +439,6 @@ function openai_responses_event_callback(
         elseif parsed isa OpenAIResponses.StreamResponseIncompleteEvent
             response_status[] = parsed.response.status
             response_usage[] = parsed.response.usage
-            if started[] && !ended[]
-                ended[] = true
-                f(MessageEndEvent(:assistant, assistant_message))
-            end
-        elseif parsed isa OpenAIResponses.StreamOutputDoneEvent || parsed isa OpenAIResponses.StreamDoneEvent
             if started[] && !ended[]
                 ended[] = true
                 f(MessageEndEvent(:assistant, assistant_message))

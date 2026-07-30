@@ -149,6 +149,13 @@ function anthropic_message_from_agent(msg::AgentMessage, tool_name_map::Dict{Str
                 isempty(strip(block.text)) && continue
                 push!(blocks, AnthropicMessages.TextBlock(; text = block.text))
             elseif block isa ThinkingContent
+                if block.redacted
+                    # Replay redacted thinking as-is; the opaque data lives in the signature slot.
+                    data = block.thinkingSignature
+                    (data === nothing || isempty(data)) && continue
+                    push!(blocks, AnthropicMessages.RedactedThinkingBlock(; data))
+                    continue
+                end
                 isempty(strip(block.thinking)) && continue
                 if block.thinkingSignature === nothing || isempty(block.thinkingSignature)
                     push!(blocks, AnthropicMessages.TextBlock(; text = block.thinking))
@@ -227,6 +234,19 @@ function anthropic_usage_from_response(u::Union{Nothing, AnthropicMessages.Usage
     return Usage(; input, output, cacheRead = cache_read, cacheWrite = cache_write, total)
 end
 
+# Merge a message_delta usage into the usage captured at message_start: only fields
+# present in the delta overwrite, so input/cache counts survive backends that only
+# send output_tokens in deltas.
+function anthropic_merge_usage(base::Union{Nothing, AnthropicMessages.Usage}, delta::AnthropicMessages.Usage)
+    base === nothing && return delta
+    return AnthropicMessages.Usage(;
+        input_tokens = delta.input_tokens === nothing ? base.input_tokens : delta.input_tokens,
+        output_tokens = delta.output_tokens === nothing ? base.output_tokens : delta.output_tokens,
+        cache_creation_input_tokens = delta.cache_creation_input_tokens === nothing ? base.cache_creation_input_tokens : delta.cache_creation_input_tokens,
+        cache_read_input_tokens = delta.cache_read_input_tokens === nothing ? base.cache_read_input_tokens : delta.cache_read_input_tokens,
+    )
+end
+
 function anthropic_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
     if !isempty(tool_calls)
         return :tool_calls
@@ -239,6 +259,14 @@ function anthropic_stop_reason(reason::Union{Nothing, String}, tool_calls::Vecto
         return :stop
     elseif reason == "end_turn"
         return :stop
+    elseif reason == "refusal"
+        return :error
+    elseif reason == "pause_turn"
+        # The server paused a long-running turn; auto-resubmitting to continue is future work.
+        return :stop
+    elseif reason == "error"
+        # Synthesized by the stream driver on HTTP errors.
+        return :error
     end
     return :stop
 end
@@ -272,6 +300,7 @@ function anthropic_event_callback(
                 assistant_message.response_id = parsed.message.id
             end
             parsed.message.stop_reason !== nothing && (stop_reason[] = parsed.message.stop_reason)
+            parsed.message.usage !== nothing && (latest_usage[] = parsed.message.usage)
             if !started[]
                 started[] = true
                 f(MessageStartEvent(:assistant, assistant_message))
@@ -288,6 +317,15 @@ function anthropic_event_callback(
                 )
                 push!(assistant_message.content, block)
                 blocks_by_index[parsed.index] = block
+            elseif parsed.content_block isa AnthropicMessages.RedactedThinkingBlock
+                # Store the opaque data in the signature slot so it can be replayed verbatim.
+                block = ThinkingContent(;
+                    thinking = "",
+                    thinkingSignature = parsed.content_block.data,
+                    redacted = true,
+                )
+                push!(assistant_message.content, block)
+                blocks_by_index[parsed.index] = block
             elseif parsed.content_block isa AnthropicMessages.ToolUseBlock
                 tool_name = anthropic_internal_tool_name(tool_name_reverse_map, parsed.content_block.name)
                 args = parsed.content_block.input isa AbstractDict ? Dict{String, Any}(parsed.content_block.input) : Dict{String, Any}()
@@ -299,6 +337,8 @@ function anthropic_event_callback(
                 push!(assistant_message.content, block)
                 blocks_by_index[parsed.index] = block
                 partial_json_by_index[parsed.index] = ""
+            elseif parsed.content_block isa AnthropicMessages.UnknownContentBlock
+                @debug "Ignoring unknown Anthropic content block" type = parsed.content_block.type index = parsed.index
             end
         elseif parsed isa AnthropicMessages.StreamContentBlockDeltaEvent
             if parsed.delta isa AnthropicMessages.TextDelta
@@ -331,6 +371,8 @@ function anthropic_event_callback(
                 partial *= parsed.delta.partial_json
                 partial_json_by_index[parsed.index] = partial
                 f(MessageUpdateEvent(:assistant, assistant_message, :tool_arguments, parsed.delta.partial_json, block.id))
+            elseif parsed.delta isa AnthropicMessages.UnknownContentBlockDelta
+                @debug "Ignoring unknown Anthropic content block delta" type = parsed.delta.type index = parsed.index
             end
         elseif parsed isa AnthropicMessages.StreamContentBlockStopEvent
             block = get(() -> nothing, blocks_by_index, parsed.index)
@@ -346,7 +388,7 @@ function anthropic_event_callback(
                 stop_on_tool_call && throw(StopStreaming("tool call arguments complete"))
             end
         elseif parsed isa AnthropicMessages.StreamMessageDeltaEvent
-            parsed.usage !== nothing && (latest_usage[] = parsed.usage)
+            parsed.usage !== nothing && (latest_usage[] = anthropic_merge_usage(latest_usage[], parsed.usage))
             delta = parsed.delta
             if delta isa AbstractDict
                 sr = get(delta, "stop_reason", nothing)

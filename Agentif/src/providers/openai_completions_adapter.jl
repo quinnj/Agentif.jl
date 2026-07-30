@@ -421,8 +421,10 @@ function strip_think_tags(text::AbstractString)
     # Implicit-open: everything before first </think> is thinking
     idx = findfirst("</think>", text)
     if idx !== nothing
-        thinking = text[1:first(idx)-1]
-        content = lstrip(text[last(idx)+1:end])
+        # prevind/nextind keep slices on char boundaries: `first(idx)-1` is a
+        # continuation byte when the char right before the tag is multi-byte
+        thinking = text[1:prevind(text, first(idx))]
+        content = lstrip(text[nextind(text, last(idx)):end])
         return thinking, content
     end
     return "", text
@@ -454,6 +456,9 @@ function process_think_tag_chunk(tts::ThinkTagStreamState, chunk::AbstractString
     buf = tts.buffer
     tts.buffer = ""
 
+    # NOTE: all slicing below must stay on char boundaries — the char right
+    # before/after an ASCII tag can be multi-byte, so raw index arithmetic
+    # (`first(idx)-1`, `end-8`) would land on continuation bytes and throw.
     while !isempty(buf)
         if tts.in_think
             # Skip explicit <think> open tag if present
@@ -461,21 +466,22 @@ function process_think_tag_chunk(tts::ThinkTagStreamState, chunk::AbstractString
                 idx = findfirst("<think>", buf)
                 if idx !== nothing && first(idx) == 1
                     tts.saw_explicit_open = true
-                    buf = buf[last(idx)+1:end]
+                    buf = buf[nextind(buf, last(idx)):end]
                     continue
                 end
             end
             # Look for closing </think>
             idx = findfirst("</think>", buf)
             if idx !== nothing
-                write(thinking, buf[1:first(idx)-1])
-                buf = buf[last(idx)+1:end]
+                write(thinking, buf[1:prevind(buf, first(idx))])
+                buf = buf[nextind(buf, last(idx)):end]
                 tts.in_think = false
             else
                 # Buffer last 8 chars in case </think> spans chunks
-                if length(buf) >= 8
-                    write(thinking, buf[1:end-8])
-                    tts.buffer = buf[end-7:end]
+                n = length(buf)
+                if n >= 8
+                    write(thinking, first(buf, n - 8))
+                    tts.buffer = last(buf, 8)
                 else
                     tts.buffer = buf
                 end
@@ -485,15 +491,16 @@ function process_think_tag_chunk(tts::ThinkTagStreamState, chunk::AbstractString
             # Look for opening <think>
             idx = findfirst("<think>", buf)
             if idx !== nothing
-                write(content, buf[1:first(idx)-1])
-                buf = buf[last(idx)+1:end]
+                write(content, buf[1:prevind(buf, first(idx))])
+                buf = buf[nextind(buf, last(idx)):end]
                 tts.in_think = true
                 tts.saw_explicit_open = true
             else
                 # Buffer last 7 chars in case <think> spans chunks
-                if length(buf) >= 7
-                    write(content, buf[1:end-7])
-                    tts.buffer = buf[end-6:end]
+                n = length(buf)
+                if n >= 7
+                    write(content, first(buf, n - 7))
+                    tts.buffer = last(buf, 7)
                 else
                     tts.buffer = buf
                 end

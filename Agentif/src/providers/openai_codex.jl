@@ -907,6 +907,10 @@ function codex_stream_sse_with_retry!(
     request_http_kw = merge(http_nt, (; retry = false, status_exception = false))
     payload = JSON.json(request_body)
     attempt = 0
+    # Once any SSE event has been delivered into the (stateful) callback,
+    # re-POSTing would replay the whole response and duplicate its content.
+    events_seen = Ref(false)
+    tracked_callback = sse_tracking_callback(callback, events_seen)
 
     while true
         isaborted(abort) && throw(StopStreaming("aborted"))
@@ -917,12 +921,12 @@ function codex_stream_sse_with_retry!(
                 url,
                 headers;
                 body = payload,
-                sse_callback = callback,
+                sse_callback = tracked_callback,
                 request_http_kw...,
             )
         catch err
             err isa StopStreaming && rethrow()
-            if attempt < max_retries && codex_retryable_exception(err)
+            if attempt < max_retries && !events_seen[] && codex_retryable_exception(err)
                 attempt += 1
                 delay_s = codex_retry_delay_seconds(attempt, retry_base_ms, retry_max_ms)
                 log_codex_debug(
@@ -947,7 +951,7 @@ function codex_stream_sse_with_retry!(
         info = parse_codex_error(resp)
         info_msg = String(get(() -> "", info, :message))
         retryable = codex_retryable_status(resp.status) || codex_retryable_message(info_msg)
-        if attempt < max_retries && retryable
+        if attempt < max_retries && !events_seen[] && retryable
             attempt += 1
             delay_s = codex_retry_delay_seconds(attempt, retry_base_ms, retry_max_ms; response = resp)
             log_codex_debug(
