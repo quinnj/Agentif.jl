@@ -104,7 +104,13 @@ end
     @test !LLMOAuth.codex_is_invalid_grant(200, "{\"access_token\": \"ok\"}")
     @test LLMOAuth.codex_is_invalid_grant(400, "{\"error\": \"invalid_grant\"}")
     @test LLMOAuth.codex_is_invalid_grant(401, "{\"error\": \"invalid_grant\", \"error_description\": \"revoked\"}")
-    @test !LLMOAuth.codex_is_invalid_grant(401, "{\"error\": \"invalid_token\"}")
+    # A 401 from the token endpoint always means the refresh token was rejected.
+    @test LLMOAuth.codex_is_invalid_grant(401, "{\"error\": \"invalid_token\"}")
+    # Real-world shape when another client rotates the token out from under us:
+    # 401, no `invalid_grant` string anywhere in the body.
+    @test LLMOAuth.codex_is_invalid_grant(401,
+        "{\"error\": {\"message\": \"Your refresh token has already been used to generate a new access token. Please try signing in again.\", \"type\": \"invalid_request_error\"}}")
+    @test LLMOAuth.codex_is_invalid_grant(400, "{\"error\": {\"message\": \"refresh token expired\"}}")
     @test !LLMOAuth.codex_is_invalid_grant(500, "{\"error\": \"invalid_grant\"}")
     @test !LLMOAuth.codex_is_invalid_grant(400, "{\"error\": \"invalid_request\"}")
 end

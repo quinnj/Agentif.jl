@@ -304,12 +304,20 @@ end
 """
     codex_is_invalid_grant(status, body) -> Bool
 
-Classify a token-endpoint response as an `invalid_grant` failure, i.e. the
-stored refresh token was revoked or expired: HTTP 400/401 with
-`invalid_grant` in the response body.
+Classify a token-endpoint response as a permanently-rejected refresh token, so the
+stored credentials can be cleared instead of failing the same way forever.
+
+A 401 from the token endpoint means the refresh token itself was rejected — retrying
+it can never succeed — so it is always terminal. Observed in the wild when another
+client (e.g. the `codex` CLI) rotates the token out from under us: HTTP 401 with
+`"type": "invalid_request_error"` and "Your refresh token has already been used",
+which carries no `invalid_grant` string. A 400 is terminal only when the body
+identifies a grant/refresh-token problem (per RFC 6749, `invalid_grant`).
 """
 function codex_is_invalid_grant(status::Integer, body::AbstractString)
-    return status in (400, 401) && occursin("invalid_grant", body)
+    status == 401 && return true
+    return status == 400 &&
+        (occursin("invalid_grant", body) || occursin("refresh token", lowercase(body)))
 end
 
 function codex_refresh_failure(status::Integer, body::AbstractString)
@@ -318,7 +326,7 @@ function codex_refresh_failure(status::Integer, body::AbstractString)
         # clear the stored credentials here; leaving a revoked refresh token in
         # place would make every future refresh fail the same way.
         rm(codex_auth_path(); force = true)
-        return ErrorException("Stored Codex credentials were revoked or expired (invalid_grant); re-run codex_login() to authenticate again")
+        return ErrorException("Stored Codex credentials were rejected (status $(status)): $(response_body_snippet(body)). They have been cleared; re-run codex_login() to authenticate again")
     end
     return ErrorException("Codex token refresh failed (status $(status)): $(response_body_snippet(body))")
 end
