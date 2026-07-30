@@ -197,29 +197,33 @@ function glob_to_regex(pattern::String)
     normalized = replace(pattern, '\\' => '/')
     out = IOBuffer()
     print(out, "^")
+    # Step by character with nextind — `idx += 1` byte-stepping throws
+    # StringIndexError on multi-byte (non-ASCII) glob patterns.
     idx = 1
-    while idx <= lastindex(normalized)
+    last_idx = lastindex(normalized)
+    while idx <= last_idx
         char = normalized[idx]
+        next = nextind(normalized, idx)
         if char == '*'
-            if idx < lastindex(normalized) && normalized[idx + 1] == '*'
+            if next <= last_idx && normalized[next] == '*'
                 print(out, ".*")
-                idx += 2
+                idx = nextind(normalized, next)
             else
                 print(out, "[^/]*")
-                idx += 1
+                idx = next
             end
             continue
         elseif char == '?'
             print(out, "[^/]")
-            idx += 1
+            idx = next
             continue
         elseif char in ('\\', '.', '+', '(', ')', '[', ']', '{', '}', '^', '$', '|')
             print(out, "\\", char)
-            idx += 1
+            idx = next
             continue
         end
         print(out, char)
-        idx += 1
+        idx = next
     end
     print(out, "\$")
     return Regex(String(take!(out)))
@@ -235,7 +239,9 @@ end
 
 
 function strip_dir_suffix(entry::String)
-    return endswith(entry, "/") ? entry[1:(end - 1)] : entry
+    # `end - 1` is byte arithmetic: with a multi-byte char right before the
+    # trailing "/", it lands on a continuation byte and throws StringIndexError.
+    return endswith(entry, "/") ? entry[1:prevind(entry, lastindex(entry))] : entry
 end
 
 function create_read_tool(base_dir::AbstractString)
@@ -344,7 +350,12 @@ Errors if: file not found, oldText not found, oldText matches more than once, or
             occurrences > 1 && throw(ArgumentError("found $(occurrences) occurrences in $(path); provide more context to make it unique"))
             idx = findfirst(oldText, content)
             idx === nothing && throw(ArgumentError("could not find the exact text in $(path)"))
-            new_content = content[1:(idx.start - 1)] * newText * content[(idx.stop + 1):end]
+            # idx is a byte range; idx.start - 1 / idx.stop + 1 can land mid-character
+            # when the surrounding text (or the last char of oldText) is multi-byte.
+            # prevind/nextind keep the splice on character boundaries; both handle the
+            # match-at-start (prevind -> 0, content[1:0] == "") and match-at-end
+            # (nextind -> ncodeunits+1, empty tail range) edges.
+            new_content = content[1:prevind(content, idx.start)] * newText * content[nextind(content, idx.stop):end]
             new_content == content && throw(ArgumentError("replacement produced identical content for $(path)"))
             open(resolved, "w") do io
                 write(io, new_content)
@@ -963,6 +974,44 @@ function get_temp_file_meta(file_id::String)
 end
 
 """
+    repair_utf8(s::AbstractString) -> String
+
+Return `s` with any invalid UTF-8 sequences replaced by U+FFFD, so the result
+is always valid UTF-8. Julia string iteration is total over malformed data:
+each invalid byte sequence yields one or more `Char`s with `isvalid(c) == false`,
+which we substitute with the replacement character.
+"""
+function repair_utf8(s::AbstractString)
+    isvalid(s) && return String(s)
+    io = IOBuffer()
+    for c in s
+        print(io, isvalid(c) ? c : '�')
+    end
+    return String(take!(io))
+end
+
+"""
+    decode_numeric_entity(entity::AbstractString) -> String
+
+Decode an HTML numeric character reference (`&#123;` or `&#x7B;`) into a string.
+Invalid input — non-parsing digits, values that overflow `Int`, values outside
+the Unicode scalar range, or surrogate code points (which would encode to
+invalid UTF-8) — yields the replacement character U+FFFD instead of throwing.
+"""
+function decode_numeric_entity(entity::AbstractString)
+    # entity is a full regex match like "&#65;" or "&#x1F600;" (ASCII by
+    # construction, so byte indexing below is safe); strip "&#" and ";"
+    body = SubString(entity, 3, prevind(entity, lastindex(entity)))
+    hex = startswith(body, "x") || startswith(body, "X")
+    digits_str = hex ? SubString(body, 2) : body
+    v = tryparse(Int, digits_str; base = hex ? 16 : 10)
+    if v === nothing || v < 0 || v > 0x10FFFF || (0xD800 <= v <= 0xDFFF)
+        return "�"
+    end
+    return string(Char(v))
+end
+
+"""
     extract_text_from_html(html::String) -> String
 
 Extract readable text from HTML, stripping tags and decoding entities.
@@ -1001,9 +1050,11 @@ function extract_text_from_html(html::String)
         text = replace(text, entity => char)
     end
 
-    # Decode numeric entities (&#123; and &#x7B;)
-    text = replace(text, r"&#(\d+);" => m -> string(Char(parse(Int, m.captures[1]))))
-    text = replace(text, r"&#x([0-9a-fA-F]+);" => m -> string(Char(parse(Int, m.captures[1], base = 16))))
+    # Decode numeric entities (&#123; and &#x7B;). The substitution function
+    # receives the full matched substring; decode_numeric_entity substitutes
+    # U+FFFD for anything unparseable, out of range, or a surrogate.
+    text = replace(text, r"&#\d+;" => decode_numeric_entity)
+    text = replace(text, r"&#x[0-9a-fA-F]+;" => decode_numeric_entity)
 
     # Normalize whitespace: collapse multiple spaces/newlines
     text = replace(text, r"[ \t]+" => " ")
@@ -1011,7 +1062,9 @@ function extract_text_from_html(html::String)
     text = replace(text, r"[ \t]+\n" => "\n")
     text = replace(text, r"\n{3,}" => "\n\n")
 
-    return String(strip(text))
+    # Defense in depth: never let invalid UTF-8 escape into tool results
+    # (it would corrupt the transcript and downstream API requests).
+    return repair_utf8(strip(text))
 end
 
 """
@@ -1716,9 +1769,10 @@ function create_web_search_tool()
                 println(output, "$i. $title")
                 println(output, "   URL: $url")
                 if !isempty(snippet)
-                    # Truncate long snippets
+                    # Truncate long snippets (char-safe: byte slicing throws on
+                    # multi-byte snippet content)
                     if length(snippet) > 200
-                        snippet = snippet[1:197] * "..."
+                        snippet = first(snippet, 197) * "..."
                     end
                     println(output, "   $snippet")
                 end

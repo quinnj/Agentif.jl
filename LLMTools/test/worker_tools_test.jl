@@ -113,6 +113,63 @@ end
         kill_worker(worker_id)
     end
 
+    @testset "truncate_description is char-safe" begin
+        @test LLMTools.truncate_description("short") == "short"
+        @test LLMTools.truncate_description(repeat("a", 100)) == repeat("a", 80) * "..."
+        out = LLMTools.truncate_description(repeat("α", 100))
+        @test out == repeat("α", 80) * "..."
+        @test isvalid(out)
+    end
+
+    @testset "exec_code timeout terminates wedged worker" begin
+        LLMTools.reset_sessions_for_tests!(LLMTools.WORKER_REGISTRY)
+        result_ref = Ref{Any}(nothing)
+        t = Threads.@spawn begin
+            result_ref[] = exec_code("while true end", 3)
+        end
+        # Guard so a timeout regression fails the test instead of hanging CI
+        # (allow generous margin for worker process startup)
+        status = timedwait(() -> istaskdone(t), 30.0)
+        @test status === :ok
+        if status === :ok
+            parsed = parse_tool_json(result_ref[])
+            @test parsed["ok"] == false
+            @test parsed["error_kind"] == "timeout"
+            @test parsed["status"] == LLMTools.SESSION_STATUS_ERROR
+            @test occursin("timed out after 3s", parsed["message"])
+        end
+        LLMTools.reset_sessions_for_tests!(LLMTools.WORKER_REGISTRY)
+    end
+
+    @testset "eval_code timeout on existing worker" begin
+        LLMTools.reset_sessions_for_tests!(LLMTools.WORKER_REGISTRY)
+        started = parse_tool_json(exec_code("1", nothing))
+        worker_id = started["session_id"]
+        @test worker_id !== nothing
+        result_ref = Ref{Any}(nothing)
+        t = Threads.@spawn begin
+            result_ref[] = eval_code(worker_id, "while true end", 3)
+        end
+        status = timedwait(() -> istaskdone(t), 30.0)
+        @test status === :ok
+        if status === :ok
+            parsed = parse_tool_json(result_ref[])
+            @test parsed["ok"] == false
+            @test parsed["error_kind"] == "timeout"
+        end
+        LLMTools.reset_sessions_for_tests!(LLMTools.WORKER_REGISTRY)
+    end
+
+    @testset "exec_code timeout that does not fire" begin
+        LLMTools.reset_sessions_for_tests!(LLMTools.WORKER_REGISTRY)
+        parsed = parse_tool_json(exec_code("21 * 2", 60))
+        @test parsed["ok"] == true
+        @test parsed["result"] == "42"
+        if parsed["session_id"] !== nothing
+            kill_worker(parsed["session_id"])
+        end
+    end
+
     @testset "stdout capture" begin
         LLMTools.reset_sessions_for_tests!(LLMTools.WORKER_REGISTRY)
         parsed = parse_tool_json(exec_code("println(\"hello from worker\")", nothing))

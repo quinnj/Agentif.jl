@@ -249,19 +249,25 @@ function register_channels!(assistant::AgentAssistant, channels)
 end
 
 function _upsert_event_handler!(db::SQLite.DB, eh::EventHandler)
-    # Transactional so a crash between the DELETE and the re-INSERTs can't leave
-    # a handler with zero subscribed event types (an automation that never fires).
-    SQLite.transaction(db) do
+    SQLite.DBInterface.execute(db,
+        "INSERT OR REPLACE INTO claw_event_handlers (id, prompt, channel_id) VALUES (?, ?, ?)",
+        (eh.id, eh.prompt, eh.channel_id))
+    # Insert new subscriptions before deleting stale ones so a crash mid-upsert
+    # can never leave the handler with zero event types (a dead automation);
+    # worst case is a transient union of old+new until the next upsert.
+    for et_name in eh.event_types
         SQLite.DBInterface.execute(db,
-            "INSERT OR REPLACE INTO claw_event_handlers (id, prompt, channel_id) VALUES (?, ?, ?)",
-            (eh.id, eh.prompt, eh.channel_id))
+            "INSERT OR IGNORE INTO claw_handler_event_types (handler_id, event_type_name) VALUES (?, ?)",
+            (eh.id, et_name))
+    end
+    if isempty(eh.event_types)
         SQLite.DBInterface.execute(db,
             "DELETE FROM claw_handler_event_types WHERE handler_id = ?", (eh.id,))
-        for et_name in eh.event_types
-            SQLite.DBInterface.execute(db,
-                "INSERT OR IGNORE INTO claw_handler_event_types (handler_id, event_type_name) VALUES (?, ?)",
-                (eh.id, et_name))
-        end
+    else
+        placeholders = join(fill("?", length(eh.event_types)), ",")
+        SQLite.DBInterface.execute(db,
+            "DELETE FROM claw_handler_event_types WHERE handler_id = ? AND event_type_name NOT IN ($placeholders)",
+            (eh.id, eh.event_types...))
     end
 end
 

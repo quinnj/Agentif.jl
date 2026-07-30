@@ -148,7 +148,9 @@ function format_messages_for_summary(messages::Vector{AgentMessage})
         elseif msg isa ToolResultMessage
             result_text = message_text(msg)
             if length(result_text) > 500
-                result_text = result_text[1:500] * "... (truncated)"
+                # first() is char-safe; result_text[1:500] is byte indexing and
+                # throws on multi-byte tool output right when compaction runs
+                result_text = first(result_text, 500) * "... (truncated)"
             end
             prefix = msg.is_error ? "Tool $(msg.name) error" : "Tool $(msg.name) result"
             push!(parts, "$prefix: $result_text")

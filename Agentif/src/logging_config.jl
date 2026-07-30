@@ -36,7 +36,9 @@ function _format_stacktrace(bt; max_chars::Int = 16_000)
     end
     stack = String(take!(io))
     length(stack) <= max_chars && return stack
-    return stack[1:max_chars] * "\n... [stacktrace truncated]"
+    # first() is char-safe; stack[1:max_chars] is byte indexing and throws when
+    # the cut lands inside a multi-byte char ('…', unicode identifiers)
+    return first(stack, max_chars) * "\n... [stacktrace truncated]"
 end
 
 function render_tool_error_json(

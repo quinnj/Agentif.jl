@@ -714,6 +714,7 @@ Arguments:
 - name (String, required): The name of an existing worker session (as given to start_worker).
 - code (String, required): Julia code to evaluate. Can reference variables/functions from prior calls.
 - run_sync (Bool, optional): If true, blocks until execution completes. Default: false (async).
+- timeout_s (Int, optional): Timeout in seconds for the evaluation. On timeout the worker process is terminated (all its state is lost) and a timeout error is reported. Default: no timeout.
 
 Example:
 - eval_worker("data-proc", "filter(row -> row.age > 30, df) |> nrow", run_sync=true)""",
@@ -721,6 +722,7 @@ Example:
             name::String,
             code::String,
             run_sync::Union{Nothing, Bool} = nothing,
+            timeout_s::Union{Nothing, Int} = nothing,
         ) = begin
             sync = run_sync === nothing ? false : run_sync
             session = _get_session(es, name, :worker)
@@ -730,7 +732,7 @@ Example:
             worker_meta === nothing && error("Worker session '$name' no longer exists in registry")
 
             if sync
-                combined, _ = LLMTools.eval_on_worker(worker_meta, code)
+                combined, _ = LLMTools.eval_on_worker(worker_meta, code; timeout_s = timeout_s)
                 lock(es.lock) do
                     session.last_used = time()
                 end
@@ -744,7 +746,7 @@ Example:
             end
             session.task = Threads.@spawn begin
                 try
-                    combined, _ = LLMTools.eval_on_worker(worker_meta, code)
+                    combined, _ = LLMTools.eval_on_worker(worker_meta, code; timeout_s = timeout_s)
                     lock(es.lock) do
                         s = get(es.sessions, name, nothing)
                         if s !== nothing

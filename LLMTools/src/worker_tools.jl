@@ -66,12 +66,45 @@ end
 
 function truncate_description(code::String, max_len::Int = 80)
     s = replace(strip(code), r"\s+" => " ")
-    return length(s) > max_len ? s[1:max_len] * "..." : s
+    # first() is char-safe; s[1:max_len] is byte indexing and throws on
+    # multi-byte code content
+    return length(s) > max_len ? first(s, max_len) * "..." : s
 end
 
-function eval_on_worker(meta::WorkerSessionMetadata, code::String)
+"""
+    WorkerEvalTimeout
+
+Thrown by [`eval_on_worker`](@ref) when an evaluation exceeds its `timeout_s`
+deadline. The wedged worker process is force-terminated before this is thrown.
+"""
+struct WorkerEvalTimeout <: Exception
+    timeout_s::Int
+end
+
+function Base.showerror(io::IO, e::WorkerEvalTimeout)
+    print(io, "worker evaluation timed out after $(e.timeout_s)s; the worker process was terminated")
+end
+
+function eval_on_worker(meta::WorkerSessionMetadata, code::String; timeout_s::Union{Nothing, Int} = nothing)
     expr = Meta.parseall(code)
-    result = remote_fetch(meta.worker, expr)
+    result = if timeout_s === nothing
+        remote_fetch(meta.worker, expr)
+    else
+        fut = remote_eval(meta.worker, expr)
+        # fut.value is ready on success and closed (with the remote exception or
+        # a WorkerTerminatedException) on failure; poll until one or the deadline.
+        status = timedwait(() -> isready(fut.value) || !isopen(fut.value), Float64(max(timeout_s, 0)))
+        if status === :timed_out
+            # A wedged worker (e.g. `while true end`) never processes a graceful
+            # shutdown request, so force-terminate the process.
+            try
+                Workers.terminate!(meta.worker, :eval_timeout)
+            catch
+            end
+            throw(WorkerEvalTimeout(timeout_s))
+        end
+        fetch(fut)
+    end
     # Small yield to let any worker stdout flush through the redirect task
     yield()
     # Read captured stdout (non-destructive peek then take)
@@ -101,7 +134,7 @@ Do NOT call this for follow-up work on an existing worker; use `eval_code` inste
 
 Arguments:
 - `code::String` — Julia code to evaluate. All expressions are executed; stdout and the return value of the last expression are captured.
-- `timeout_s::Union{Nothing, Int}` (default: nothing) — Optional timeout in seconds. `nothing` means no timeout.
+- `timeout_s::Union{Nothing, Int}` (default: nothing) — Optional timeout in seconds. `nothing` means no timeout. On timeout the worker process is terminated and a structured error with `error_kind: "timeout"` is returned.
 
 Behavior:
 - Spawns a new Julia process (~1-2s startup latency). The worker inherits the parent's active Julia project/environment.
@@ -141,7 +174,7 @@ Returns structured JSON with `ok`, `status`, `session_id` (the worker_id), `outp
                 meta = WorkerSessionMetadata(w, output_io, now, now, desc, SESSION_STATUS_RUNNING)
                 register_session!(WORKER_REGISTRY, worker_id, meta)
 
-                combined, result_str = eval_on_worker(meta, code)
+                combined, result_str = eval_on_worker(meta, code; timeout_s = timeout_s)
 
                 is_alive = !Workers.terminated(w)
                 if !is_alive
@@ -175,7 +208,8 @@ Returns structured JSON with `ok`, `status`, `session_id` (the worker_id), `outp
                 bt = catch_backtrace()
                 @warn "exec_code failed" worker_id exception = (err, bt)
                 remove_session!(WORKER_REGISTRY, worker_id; mark_status = SESSION_STATUS_ERROR)
-                errmsg = err isa CapturedException ? sprint(showerror, err.ex) : string(err)
+                errmsg = err isa CapturedException ? sprint(showerror, err.ex) :
+                    err isa WorkerEvalTimeout ? sprint(showerror, err) : string(err)
                 push!(events, make_event(WORKER_REGISTRY, "error"; session_id = worker_id,
                     payload = Dict("message" => errmsg)))
                 return render_process_response("exec_code";
@@ -185,7 +219,7 @@ Returns structured JSON with `ok`, `status`, `session_id` (the worker_id), `outp
                     wall_time_s = time() - start_time,
                     active_sessions = active_session_count(WORKER_REGISTRY),
                     events = events,
-                    error_kind = "eval_failed",
+                    error_kind = err isa WorkerEvalTimeout ? "timeout" : "eval_failed",
                     message = errmsg,
                 )
             end
@@ -200,7 +234,7 @@ Do NOT use this to start a new worker — use `exec_code` instead.
 Arguments:
 - `worker_id::Int` — ID of an existing worker, as returned by `exec_code` in the `session_id` field.
 - `code::String` — Julia code to evaluate. All expressions are executed; stdout and the return value of the last expression are captured.
-- `timeout_s::Union{Nothing, Int}` (default: nothing) — Optional timeout in seconds. `nothing` means no timeout.
+- `timeout_s::Union{Nothing, Int}` (default: nothing) — Optional timeout in seconds. `nothing` means no timeout. On timeout the worker process is terminated (all its state is lost) and a structured error with `error_kind: "timeout"` is returned.
 
 Gotchas:
 - Returns an error if the worker_id does not exist or the worker has exited. Use `list_workers` to check.
@@ -242,7 +276,7 @@ Returns structured JSON with `ok`, `status`, `session_id`, `output`, and `result
                     current === nothing || set_last_used!(current, time())
                 end
 
-                combined, result_str = eval_on_worker(meta, code)
+                combined, result_str = eval_on_worker(meta, code; timeout_s = timeout_s)
 
                 is_alive = !Workers.terminated(meta.worker)
                 if !is_alive
@@ -269,7 +303,8 @@ Returns structured JSON with `ok`, `status`, `session_id`, `output`, and `result
                 bt = catch_backtrace()
                 @warn "eval_code failed" worker_id exception = (err, bt)
                 remove_session!(WORKER_REGISTRY, worker_id; mark_status = SESSION_STATUS_ERROR)
-                errmsg = err isa CapturedException ? sprint(showerror, err.ex) : string(err)
+                errmsg = err isa CapturedException ? sprint(showerror, err.ex) :
+                    err isa WorkerEvalTimeout ? sprint(showerror, err) : string(err)
                 push!(events, make_event(WORKER_REGISTRY, "error"; session_id = worker_id,
                     payload = Dict("message" => errmsg)))
                 return render_process_response("eval_code";
@@ -280,7 +315,7 @@ Returns structured JSON with `ok`, `status`, `session_id`, `output`, and `result
                     wall_time_s = time() - start_time,
                     active_sessions = active_session_count(WORKER_REGISTRY),
                     events = events,
-                    error_kind = "eval_failed",
+                    error_kind = err isa WorkerEvalTimeout ? "timeout" : "eval_failed",
                     message = errmsg,
                 )
             end

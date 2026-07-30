@@ -58,3 +58,71 @@ end
         end
     end
 end
+
+@testset "File tools multi-byte safety" begin
+    mktempdir() do tmpdir
+        funcs = file_funcs(tmpdir)
+        read_file = funcs["read"]
+        write_file = funcs["write"]
+        edit_file = funcs["edit"]
+        find_files = funcs["find"]
+
+        @testset "edit: oldText ends with multi-byte char" begin
+            write_file("mb1.txt", "prefix café suffix")
+            msg = edit_file("mb1.txt", "café", "tea")
+            @test occursin("Successfully replaced text", msg)
+            result = read_file("mb1.txt", nothing, nothing)
+            @test isvalid(result)
+            @test result == "prefix tea suffix"
+        end
+
+        @testset "edit: match immediately preceded by multi-byte char" begin
+            write_file("mb2.txt", "héllo world")
+            msg = edit_file("mb2.txt", "llo world", "y planet")
+            @test occursin("Successfully replaced text", msg)
+            result = read_file("mb2.txt", nothing, nothing)
+            @test isvalid(result)
+            @test result == "héy planet"
+        end
+
+        @testset "edit: emoji-terminated oldText at end of file" begin
+            write_file("mb3.txt", "status: done 🎉")
+            msg = edit_file("mb3.txt", "done 🎉", "shipped 🚀")
+            @test occursin("Successfully replaced text", msg)
+            result = read_file("mb3.txt", nothing, nothing)
+            @test isvalid(result)
+            @test result == "status: shipped 🚀"
+        end
+
+        @testset "edit: multi-byte match spans whole file" begin
+            write_file("mb4.txt", "é")
+            msg = edit_file("mb4.txt", "é", "e")
+            @test occursin("Successfully replaced text", msg)
+            result = read_file("mb4.txt", nothing, nothing)
+            @test isvalid(result)
+            @test result == "e"
+        end
+
+        @testset "glob_to_regex with non-ASCII pattern" begin
+            rx = LLMTools.glob_to_regex("café*.jl")
+            @test occursin(rx, "café_test.jl")
+            @test !occursin(rx, "cafe_test.jl")
+            rx2 = LLMTools.glob_to_regex("**/déjà?.txt")
+            @test occursin(rx2, "a/b/déjàX.txt")
+            @test !occursin(rx2, "a/b/déjà.txt")
+        end
+
+        @testset "find with non-ASCII glob" begin
+            write_file("café/menu.txt", "espresso")
+            found = find_files("café/*.txt", nothing, 20)
+            @test occursin("café/menu.txt", found)
+        end
+
+        @testset "strip_dir_suffix multi-byte" begin
+            @test LLMTools.strip_dir_suffix("café/") == "café"
+            @test LLMTools.strip_dir_suffix("café") == "café"
+            @test LLMTools.strip_dir_suffix("ascii/") == "ascii"
+            @test LLMTools.strip_dir_suffix("") == ""
+        end
+    end
+end
