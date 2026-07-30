@@ -23,7 +23,7 @@ end
 
 toolcall_preview(::Nothing; limit::Int = 300) = "(nothing)"
 function toolcall_preview(s::AbstractString; limit::Int = 300)
-    return length(s) > limit ? string(s[1:limit], "...(truncated)") : s
+    return length(s) > limit ? string(first(s, limit), "...(truncated)") : s
 end
 
 function toolcall_debug(msg::AbstractString; kw...)
@@ -915,6 +915,7 @@ function stream(
         headers["Accept"] = "text/event-stream"
         model.headers !== nothing && merge!(headers, model.headers)
 
+        debug_stream = get(ENV, "AGENTIF_DEBUG_GEMINI_STREAM", "") != ""
         try
             HTTP.post(
                 url,

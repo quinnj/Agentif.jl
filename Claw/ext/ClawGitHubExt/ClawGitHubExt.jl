@@ -415,7 +415,13 @@ Claw.get_event_types(::GitHubEventSource) = ALL_EVENT_TYPES
 
 function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
     secret = strip(source.secret)
-    webhook_secret = isempty(secret) ? nothing : secret
+    # Fail closed: without a secret GitHub.jl skips HMAC verification entirely,
+    # so anyone who can reach the port can inject forged webhook events (which
+    # get evaluated as trusted agent input).
+    isempty(secret) && error(
+        "GitHubEventSource requires a webhook secret. Set GITHUB_WEBHOOK_SECRET " *
+        "(and configure the same secret on the GitHub webhook) before starting.")
+    webhook_secret = String(secret)
     repos = source.repos !== nothing ? map(GitHub.Repo, source.repos) : nothing
     host = Sockets.IPv4(source.host)
     port = source.port

@@ -136,7 +136,7 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
         if parse_error !== nothing
             is_error = true
             raw = tc.arguments
-            raw_preview = length(raw) > 500 ? string(raw[1:500], "... (truncated, length=$(length(raw)))") : raw
+            raw_preview = length(raw) > 500 ? string(first(raw, 500), "... (truncated, length=$(length(raw)))") : raw
             parse_msg = sprint(showerror, parse_error)
             @warn "Tool argument parsing failed" tool = tc.name call_id = tc.call_id exception = (parse_error, parse_bt)
             output = render_tool_error_json(

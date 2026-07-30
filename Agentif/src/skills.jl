@@ -94,11 +94,14 @@ Examples:
         skill_loader(name::String) = begin
             content = load_skill(registry, name)
             meta = get(() -> nothing, registry.skills, name)
-            hint = nothing
-            if meta !== nothing
-                hint = "Use read path=$(meta.skill_file) with offset/limit to load more."
+            max_bytes = MAX_TOOL_RESULT_BYTES[]
+            if max_bytes > 0 && sizeof(content) > max_bytes
+                hint = meta === nothing ? "" :
+                    " Use read path=$(meta.skill_file) with offset/limit to load more."
+                idx = prevind(content, max_bytes + 1)
+                content = string(content[1:idx], "\n\n[Skill truncated: showing first ~$(_format_byte_size(max_bytes)) of $(_format_byte_size(sizeof(content))) total.$(hint)]")
             end
-            return truncate_tool_output(content; label = "Skill", hint = hint)
+            return content
         end,
     )
 end

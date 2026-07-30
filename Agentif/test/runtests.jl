@@ -1063,6 +1063,42 @@ end
     @test completions_usage.total == 16
 end
 
+@testset "completions message builder terminates on empty messages" begin
+    model = Model(
+        id = "test-model", name = "test-model", api = "openai-completions",
+        provider = "test", baseUrl = "http://localhost", reasoning = false,
+        input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+        contextWindow = 100000, maxTokens = 4096,
+    )
+    agent = Agent(; id = "a", prompt = "p", model, apikey = "k")
+    state = AgentState()
+    # Empty assistant message (routinely produced by an errored/aborted turn) and
+    # an image-only user message to a text-only model: both used to `continue`
+    # without advancing the loop index, hanging the builder forever.
+    push!(state.messages, AssistantMessage(; provider = "test", api = "openai-completions", model = "test-model"))
+    push!(state.messages, UserMessage(Agentif.UserContentBlock[Agentif.ImageContent("aGk=", "image/png")]))
+    result = Ref{Any}(nothing)
+    t = @async (result[] = Agentif.openai_completions_build_messages(agent, state, "hi", model))
+    timedwait(() -> istaskdone(t), 30.0)
+    @test istaskdone(t)
+    if istaskdone(t)
+        msgs = result[]
+        @test !any(m -> m.role == "assistant", msgs)
+        @test count(m -> m.role == "user", msgs) == 1
+    end
+end
+
+@testset "utf8-safe truncation previews" begin
+    s = repeat("é", 400)  # 2-byte chars: byte-index slicing throws StringIndexError
+    p = Agentif.toolcall_preview(s; limit = 300)
+    @test endswith(p, "...(truncated)")
+    @test startswith(p, repeat("é", 300))
+    t = Agentif.truncate_text(repeat("🐳", 50), 10)  # 4-byte chars
+    @test startswith(t, repeat("🐳", 10))
+    @test occursin("[truncated 40]", t)
+end
+
 @testset "openai_responses stream shapes GPT-5 requests and keeps incomplete as length" begin
     request_body = Ref(Dict{String, Any}())
     seen_events = Agentif.AgentEvent[]

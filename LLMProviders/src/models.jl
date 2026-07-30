@@ -98,7 +98,6 @@ function calculateCost(model::Model, usage)
         "cacheWrite" => (cache_write_rate / 1000000) * usage.cacheWrite,
     )
     cost["total"] = cost["input"] + cost["output"] + cost["cacheRead"] + cost["cacheWrite"]
-    usage.cost = cost
     return cost
 end
 

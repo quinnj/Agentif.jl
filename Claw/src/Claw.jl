@@ -195,8 +195,8 @@ get_event_handlers(::EventSource) = EventHandler[]
 get_tools(::EventSource) = Agentif.AgentTool[]
 start!(::EventSource, ::AgentAssistant) = nothing
 
-function run(; event_sources=nothing, kwargs...)
-    return init!(""; event_sources, kwargs...)
+function run(; db_path::String="", event_sources=nothing, kwargs...)
+    return init!(db_path; event_sources, kwargs...)
 end
 
 # ─── Event interface ───
@@ -249,15 +249,19 @@ function register_channels!(assistant::AgentAssistant, channels)
 end
 
 function _upsert_event_handler!(db::SQLite.DB, eh::EventHandler)
-    SQLite.DBInterface.execute(db,
-        "INSERT OR REPLACE INTO claw_event_handlers (id, prompt, channel_id) VALUES (?, ?, ?)",
-        (eh.id, eh.prompt, eh.channel_id))
-    SQLite.DBInterface.execute(db,
-        "DELETE FROM claw_handler_event_types WHERE handler_id = ?", (eh.id,))
-    for et_name in eh.event_types
+    # Transactional so a crash between the DELETE and the re-INSERTs can't leave
+    # a handler with zero subscribed event types (an automation that never fires).
+    SQLite.transaction(db) do
         SQLite.DBInterface.execute(db,
-            "INSERT OR IGNORE INTO claw_handler_event_types (handler_id, event_type_name) VALUES (?, ?)",
-            (eh.id, et_name))
+            "INSERT OR REPLACE INTO claw_event_handlers (id, prompt, channel_id) VALUES (?, ?, ?)",
+            (eh.id, eh.prompt, eh.channel_id))
+        SQLite.DBInterface.execute(db,
+            "DELETE FROM claw_handler_event_types WHERE handler_id = ?", (eh.id,))
+        for et_name in eh.event_types
+            SQLite.DBInterface.execute(db,
+                "INSERT OR IGNORE INTO claw_handler_event_types (handler_id, event_type_name) VALUES (?, ?)",
+                (eh.id, et_name))
+        end
     end
 end
 
@@ -442,7 +446,7 @@ Returns one entry per handler with: ID, subscribed event types, channel, and a p
             "SELECT event_type_name FROM claw_handler_event_types WHERE handler_id = ?", (row.id,))
             push!(ets, et_row.event_type_name)
         end
-        prompt_preview = length(row.prompt) > 80 ? string(row.prompt[1:80], "...") : row.prompt
+        prompt_preview = length(row.prompt) > 80 ? string(first(row.prompt, 80), "...") : row.prompt
         push!(lines, "- $(row.id) [events: $(join(ets, ", "))] [channel: $ch_id]\n  prompt: $prompt_preview")
     end
     isempty(lines) ? "No event handlers registered" : join(lines, "\n")
@@ -1157,6 +1161,15 @@ function init!(
     CURRENT_ASSISTANT[] = assistant
     # Purge ephemeral tables (re-populated from EventSources)
     SQLite.DBInterface.execute(assistant.db, "DELETE FROM claw_event_types")
+    # Re-seed event types for persisted Tempus jobs: they are only inserted at
+    # add_job time, so the purge above would otherwise orphan them (breaking
+    # list_event_types and add_event_handler validation for those types).
+    for j in Tempus.getJobs(assistant.scheduler.store)
+        et_name = "tempus_job:$(j.name)"
+        SQLite.DBInterface.execute(assistant.db,
+            "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
+            (et_name, "Scheduled job: $(j.name)"))
+    end
     # Auto-register LLMToolsEventSource if not already provided
     if !any(es -> es isa LLMToolsEventSource, sources)
         llm_es = LLMToolsEventSource(assistant.config)
@@ -1194,7 +1207,9 @@ function Agentif.finish_streaming(ch::ReplChannel)
     notify(ch.completion)
 end
 Agentif.send_message(ch::ReplChannel, msg) = println(ch.io, msg)
-Agentif.close_channel(::ReplChannel) = nothing
+# Notify on close so `a"..."` never hangs when an evaluation errors out or the
+# response is suppressed (finish_streaming never runs on those paths).
+Agentif.close_channel(ch::ReplChannel) = notify(ch.completion)
 
 struct ReplEventSource <: EventSource end
 

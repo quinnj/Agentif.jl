@@ -296,7 +296,14 @@ function input_guardrail_middleware(agent_handler::AgentHandler, guardrail::Unio
             else
                 guardrail_agent = materialize_guardrail_agent(agent, DEFAULT_INPUT_GUARDRAIL_AGENT; model=input_guardrail_model, apikey=input_guardrail_apikey)
                 result_state = stream(identity, guardrail_agent, AgentState(), build_guardrail_input(agent.prompt, text), abort)
-                return try; JSON.parse(last_assistant_message(result_state).text, ValidUserInput).valid_user_input; catch; false; end
+                return try
+                    msg = last_assistant_message(result_state)
+                    msg === nothing && error("input guardrail produced no assistant message")
+                    JSON.parse(message_text(msg), ValidUserInput).valid_user_input
+                catch e
+                    @warn "Input guardrail evaluation failed; rejecting input" exception = (e, catch_backtrace())
+                    false
+                end
             end
         end
         result_state = agent_handler(function (event)

@@ -227,7 +227,10 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             if !("image" in model.input)
                 parts = OpenAICompletions.ContentPart[part for part in parts if part.type != "image_url"]
             end
-            isempty(parts) && continue
+            if isempty(parts)
+                i += 1
+                continue
+            end
             push!(messages, OpenAICompletions.Message(; role = "user", content = parts))
             last_role = "user"
         elseif msg isa AssistantMessage
@@ -299,6 +302,7 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
             has_extra = assistant_msg.extra !== nothing && !isempty(assistant_msg.extra)
             has_reasoning = assistant_msg.reasoning_details !== nothing
             if !has_content && assistant_msg.tool_calls === nothing && !has_extra && !has_reasoning
+                i += 1
                 continue
             end
             push!(messages, assistant_msg)
@@ -644,8 +648,10 @@ function openai_completions_event_callback(
                     if isempty(reasoning_buffer)
                         push!(new_text_parts, text_str)
                     else
-                        start_idx = lastindex(reasoning_buffer) + 1
-                        start_idx <= lastindex(text_str) && push!(new_text_parts, text_str[start_idx:end])
+                        # startswith guarantees the prefix bytes match, so the byte
+                        # after the prefix is a valid char boundary in text_str.
+                        start_idx = ncodeunits(reasoning_buffer) + 1
+                        start_idx <= ncodeunits(text_str) && push!(new_text_parts, text_str[start_idx:end])
                     end
                 else
                     push!(new_text_parts, text_str)
@@ -718,12 +724,12 @@ function openai_completions_event_callback(
                     )
                     f(MessageUpdateEvent(:assistant, assistant_message, :tool_arguments, tool_delta.function.arguments, acc.id))
                     if get(ENV, "AGENTIF_STOP_ON_TOOL_CALL", "") != "" && acc.name !== nothing && !isempty(acc.arguments)
-                        try
-                            parsed = JSON.parse(acc.arguments)
-                            parsed isa AbstractDict || throw(ArgumentError("tool arguments not object"))
-                            throw(StopStreaming("tool call arguments complete"))
+                        complete = try
+                            JSON.parse(acc.arguments) isa AbstractDict
                         catch
+                            false
                         end
+                        complete && throw(StopStreaming("tool call arguments complete"))
                     end
                 end
             end

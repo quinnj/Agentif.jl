@@ -392,7 +392,9 @@ function Claw.start!(source::TelegramEventSource, assistant::Claw.AgentAssistant
             for row in Claw.SQLite.DBInterface.execute(assistant.db,
                 "SELECT DISTINCT channel_id FROM claw_event_handlers WHERE channel_id LIKE 'telegram:%'")
                 cid = row.channel_id === missing ? "" : String(row.channel_id)
-                m = match(r"^telegram:(\d+)$", cid)
+                # Group/supergroup chat ids are negative — the sign must be accepted
+                # or persisted group handlers silently resolve to a sink after restart.
+                m = match(r"^telegram:(-?\d+)$", cid)
                 m !== nothing && push!(seed_channels, TelegramChannel(
                     parse(Int64, m.captures[1]), nothing, source.client, IOBuffer(), "", "", "private"))
             end

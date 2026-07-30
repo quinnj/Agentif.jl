@@ -619,6 +619,13 @@ end
     @test Claw.get_channel(ev) === ch
     @test Claw.event_content(ev) == "hello world"
 
+    # close_channel must notify completion so a"..." never hangs when an
+    # evaluation errors out before finish_streaming runs.
+    ch2 = Claw.ReplChannel()
+    Agentif.close_channel(ch2)
+    waiter = @async wait(ch2.completion)
+    @test timedwait(() -> istaskdone(waiter), 5.0) == :ok
+
     println("  ✓ REPL EventSource passed")
 end
 

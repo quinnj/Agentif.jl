@@ -208,7 +208,7 @@ function transform_request_body!(
                         string(output)
                     end
                     if length(text) > 16000
-                        text = string(text[1:16000], "\n...[truncated]")
+                        text = string(first(text, 16000), "\n...[truncated]")
                     end
                     push!(
                         mapped, Dict(
@@ -391,7 +391,7 @@ function codex_usage_from_response(u)
     if details isa AbstractDict
         cached_tokens = get(() -> 0, details, "cached_tokens")
     end
-    return Usage(; input = input_tokens - cached_tokens, output = output_tokens, cacheRead = cached_tokens, cacheWrite = 0, total = total_tokens)
+    return Usage(; input = max(0, input_tokens - cached_tokens), output = output_tokens, cacheRead = cached_tokens, cacheWrite = 0, total = total_tokens)
 end
 
 function codex_stop_reason(status::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
@@ -713,7 +713,7 @@ end
 
 function truncate_text(text::String, limit::Int)
     length(text) <= limit && return text
-    return string(text[1:limit], "...[truncated $(length(text) - limit)]")
+    return string(first(text, limit), "...[truncated $(length(text) - limit)]")
 end
 
 function format_codex_failure(raw_event::AbstractDict{String, Any})
@@ -853,7 +853,9 @@ function codex_retryable_exception(err::Exception)
         inner = err.error
         inner isa Exception && return codex_retryable_exception(inner)
         return codex_retryable_message(string(inner))
-    elseif err isa EOFError || err isa Base.IOError || err isa InterruptException
+    elseif err isa InterruptException
+        return false
+    elseif err isa EOFError || err isa Base.IOError
         return true
     end
     return codex_retryable_message(sprint(showerror, err))

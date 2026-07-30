@@ -10,12 +10,13 @@ const AnthropicMessages = LLMProviders.AnthropicMessages
 const GoogleGenerativeAI = LLMProviders.GoogleGenerativeAI
 const GoogleGeminiCli = LLMProviders.GoogleGeminiCli
 
-mutable struct DummyUsage
+# Mirrors the field surface of Agentif.Usage (which has no `cost` field);
+# calculateCost must not require or mutate one.
+struct DummyUsage
     input::Int
     output::Int
     cacheRead::Int
     cacheWrite::Int
-    cost::Any
 end
 
 @testset "Future" begin
@@ -191,14 +192,13 @@ end
     @test provider in LLMProviders.getProviders()
     @test any(m -> m.id == "unit-model", LLMProviders.getModels(provider))
 
-    usage = DummyUsage(1000, 2000, 3000, 4000, nothing)
+    usage = DummyUsage(1000, 2000, 3000, 4000)
     cost = LLMProviders.calculateCost(model, usage)
     @test cost["input"] == 0.001
     @test cost["output"] == 0.004
     @test cost["cacheRead"] == 0.0
     @test cost["cacheWrite"] == 0.0
     @test cost["total"] == 0.005
-    @test usage.cost === cost
 end
 
 @testset "discover_models!" begin
