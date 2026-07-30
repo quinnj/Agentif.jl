@@ -69,3 +69,73 @@ end
     @test creds.refresh_token == "refresh-old"
     @test creds.account_id == "acct-xyz"
 end
+
+@testset "Codex credential file atomic save and permissions" begin
+    dir = joinpath(mktempdir(), "agentif")
+    withenv("AGENTIF_DIR" => dir) do
+        creds = LLMOAuth.CodexCredentials(
+            "access-token",
+            "refresh-token",
+            DateTime(2030, 1, 1),
+            "acct-123",
+        )
+        LLMOAuth.codex_save_credentials(creds)
+        path = LLMOAuth.codex_auth_path()
+        @test path == joinpath(dir, "codex_auth.json")
+        @test isfile(path)
+        @test filemode(path) & 0o777 == 0o600
+        @test filemode(dir) & 0o777 == 0o700
+        loaded = LLMOAuth.codex_load_credentials()
+        @test loaded.access_token == creds.access_token
+        @test loaded.refresh_token == creds.refresh_token
+        @test loaded.expires_at == creds.expires_at
+        @test loaded.account_id == creds.account_id
+
+        # Overwriting keeps tight permissions and leaves no temp files behind.
+        creds2 = LLMOAuth.CodexCredentials("access-2", "refresh-2", DateTime(2031, 1, 1), "acct-456")
+        LLMOAuth.codex_save_credentials(creds2)
+        @test filemode(path) & 0o777 == 0o600
+        @test LLMOAuth.codex_load_credentials().refresh_token == "refresh-2"
+        @test readdir(dir) == ["codex_auth.json"]
+    end
+end
+
+@testset "Codex invalid_grant classification" begin
+    @test !LLMOAuth.codex_is_invalid_grant(200, "{\"access_token\": \"ok\"}")
+    @test LLMOAuth.codex_is_invalid_grant(400, "{\"error\": \"invalid_grant\"}")
+    @test LLMOAuth.codex_is_invalid_grant(401, "{\"error\": \"invalid_grant\", \"error_description\": \"revoked\"}")
+    @test !LLMOAuth.codex_is_invalid_grant(401, "{\"error\": \"invalid_token\"}")
+    @test !LLMOAuth.codex_is_invalid_grant(500, "{\"error\": \"invalid_grant\"}")
+    @test !LLMOAuth.codex_is_invalid_grant(400, "{\"error\": \"invalid_request\"}")
+end
+
+@testset "Codex refresh failure clears revoked credentials" begin
+    dir = joinpath(mktempdir(), "agentif")
+    withenv("AGENTIF_DIR" => dir) do
+        creds = LLMOAuth.CodexCredentials("access", "refresh", DateTime(2030, 1, 1), "acct-123")
+        LLMOAuth.codex_save_credentials(creds)
+        path = LLMOAuth.codex_auth_path()
+
+        # A non-invalid_grant failure keeps the stored credentials.
+        err = LLMOAuth.codex_refresh_failure(500, "{\"error\": \"server_error\"}")
+        @test err isa ErrorException
+        @test occursin("status 500", err.msg)
+        @test occursin("server_error", err.msg)
+        @test isfile(path)
+
+        # invalid_grant deletes the stored credentials and points at codex_login().
+        err = LLMOAuth.codex_refresh_failure(400, "{\"error\": \"invalid_grant\"}")
+        @test err isa ErrorException
+        @test occursin("re-run codex_login()", err.msg)
+        @test !isfile(path)
+    end
+end
+
+@testset "Response body snippet" begin
+    @test LLMOAuth.response_body_snippet("short") == "short"
+    @test LLMOAuth.response_body_snippet("   ") == "<empty response body>"
+    snippet = LLMOAuth.response_body_snippet(repeat("x", 500))
+    @test length(snippet) == 203
+    @test startswith(snippet, repeat("x", 200))
+    @test endswith(snippet, "...")
+end
