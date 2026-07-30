@@ -176,6 +176,26 @@ Useful starting points in the repo:
 
 Examples live in `Claw/examples/`.
 
+## Watcher (dual-model supervision)
+
+An assistant can be configured with a second, cheaper "watcher" model that supervises
+every event-handler evaluation: evals are journaled to the `claw_evals` table, stalled
+or overrunning evals are aborted, and on failure the watcher composes a short note that
+is sent to the event's channel (with a hardcoded fallback if the watcher itself fails).
+No configured watcher = today's behavior, unchanged.
+
+```julia
+watcher = Claw.WatcherConfig(;
+    provider = "anthropic",          # encouraged: different from the primary
+    model_id = "claude-haiku-4-5",
+    apikey   = ENV["ANTHROPIC_API_KEY"],
+)
+assistant = Claw.init!(db_path; watcher)
+```
+
+See `Claw/docs/watcher.md` for the full design (timeouts, failure classification,
+journal schema, and the config-gated on-track checks).
+
 ## Tests
 
 From the repo root:
