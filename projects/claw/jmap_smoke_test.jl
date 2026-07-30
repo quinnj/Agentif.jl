@@ -6,10 +6,21 @@ using Claw
 const IDLE_SECONDS = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 45
 const SETTLE_SECONDS = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 4
 
+# The event queue now carries persisted `claw_events` rowids as wakeups; the event
+# object itself lives in the assistant's live-event map until the dispatcher takes it.
+function _take_event!(assistant::Claw.AgentAssistant)
+    id = take!(assistant.event_queue)
+    ev = get(assistant._live_events, id, nothing)
+    ev === nothing && return nothing
+    Claw._forget_live_event!(assistant, id)
+    return ev
+end
+
 function _drain_events!(assistant::Claw.AgentAssistant)
     drained = Claw.Event[]
     while isready(assistant.event_queue)
-        push!(drained, take!(assistant.event_queue))
+        ev = _take_event!(assistant)
+        ev === nothing || push!(drained, ev)
     end
     return drained
 end
@@ -19,7 +30,8 @@ function _collect_events_for!(assistant::Claw.AgentAssistant, source, duration_s
     seen = Vector{Tuple{String, String}}()
     while time() < deadline
         if isready(assistant.event_queue)
-            ev = take!(assistant.event_queue)
+            ev = _take_event!(assistant)
+            ev === nothing && continue
             name = Claw.get_name(ev)
             desc = ev isa source.JMAPNewEmailEvent ? "new_email:$(ev.email_id)" : string(typeof(ev))
             push!(seen, (name, desc))

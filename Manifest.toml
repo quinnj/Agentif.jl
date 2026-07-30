@@ -38,7 +38,7 @@ uuid = "fa961155-64e5-5f13-b03f-caf6b980ea82"
 version = "0.5.0"
 
 [[deps.Claw]]
-deps = ["Agentif", "Dates", "HTTP", "LLMTools", "LocalSearch", "Logging", "LoggingExtras", "Mattermost", "SQLite", "ScopedValues", "Tempus", "TimeZones"]
+deps = ["Agentif", "Dates", "HTTP", "JSON", "LLMTools", "LocalSearch", "Logging", "LoggingExtras", "Mattermost", "SQLite", "ScopedValues", "Tempus", "TimeZones"]
 path = "Claw"
 uuid = "46916a23-5c37-4b23-b62b-45b422578c04"
 version = "0.1.0"

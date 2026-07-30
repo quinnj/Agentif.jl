@@ -28,7 +28,7 @@ sources = Claw.EventSource[
 ]
 
 @info "Starting Claw project runner" assistant_name provider model_id db_path source_count=length(sources)
-Claw.init!(db_path;
+assistant = Claw.init!(db_path;
     event_sources=sources,
     name=assistant_name,
     provider=provider,
@@ -37,5 +37,6 @@ Claw.init!(db_path;
     base_dir=base_dir,
 )
 
-# Claw currently has no blocking run loop, so keep process alive.
-wait(Base.Event())
+# Block until the SIGTERM/SIGINT-installed shutdown handler has drained the
+# pipeline, rather than parking forever on an event that is never notified.
+Claw.wait_for_shutdown(assistant)

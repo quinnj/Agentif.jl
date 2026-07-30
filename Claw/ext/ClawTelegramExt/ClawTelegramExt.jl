@@ -289,6 +289,26 @@ function Claw.get_event_handlers(::TelegramEventSource)
     ]
 end
 
+Claw.event_source_tag(::TelegramMessageEvent) = "telegram"
+Claw.event_source_tag(::TelegramReactionEvent) = "telegram"
+Claw.event_extra(ev::TelegramMessageEvent) = Dict{String, Any}("direct_ping" => ev.direct_ping)
+Claw.event_extra(ev::TelegramReactionEvent) = Dict{String, Any}("emoji" => ev.emoji)
+
+# "telegram:<chat_id>" round-trips, so a replayed event rebuilds its channel from
+# the live client (group chat ids are negative — the sign must be accepted).
+function _register_telegram_rehydrator!(source::TelegramEventSource)
+    Claw.register_rehydrator!("telegram", function (row)
+        row.channel_id === nothing && return Claw.ReplayedEvent(row.name, row.content)
+        client = source.client
+        client === nothing && return nothing
+        m = match(r"^telegram:(-?\d+)$", row.channel_id)
+        m === nothing && return nothing
+        ch = TelegramChannel(parse(Int64, m.captures[1]), nothing, client, IOBuffer(), "", "", "private")
+        return Claw.ReplayedChannelEvent(row.name, row.content, ch)
+    end)
+    return nothing
+end
+
 # ─── Update handling ───
 
 function _handle_message(update, bot_user_id, bot_username, assistant)
@@ -325,7 +345,10 @@ function _handle_message(update, bot_user_id, bot_username, assistant)
     @info "ClawTelegramExt: message" chat_id message_id direct_ping
 
     ch = TelegramChannel(chat_id, message_id, Telegram._get_client(), IOBuffer(), user_id, user_name, chat_type)
-    put!(assistant.event_queue, TelegramMessageEvent(ch, text, direct_ping))
+    # Telegram redelivers an update until it is confirmed; `update_id` is the
+    # delivery id, so a redelivery collides on the UNIQUE dedup_key.
+    Claw.submit_event!(assistant, TelegramMessageEvent(ch, text, direct_ping);
+        dedup_key = "telegram:update:$(update.update_id):message")
 end
 
 function _handle_reaction(update, bot_user_id, assistant)
@@ -363,7 +386,8 @@ function _handle_reaction(update, bot_user_id, assistant)
     @info "ClawTelegramExt: reaction" emoji chat_id message_id user_id
 
     ch = TelegramChannel(chat_id, message_id, Telegram._get_client(), IOBuffer(), user_id, user_name, chat_type)
-    put!(assistant.event_queue, TelegramReactionEvent(ch, emoji, user_name, message_id))
+    Claw.submit_event!(assistant, TelegramReactionEvent(ch, emoji, user_name, message_id);
+        dedup_key = "telegram:update:$(update.update_id):reaction")
 end
 
 function _handle_update(update, bot_user_id::String, bot_username::String, assistant::Claw.AgentAssistant)
@@ -384,6 +408,7 @@ function Claw.start!(source::TelegramEventSource, assistant::Claw.AgentAssistant
 
             # Store client for on-demand channel construction
             source.client = Telegram._get_client()
+            _register_telegram_rehydrator!(source)
 
             # Seed channels from persisted handler/job channel_ids so that
             # non-ChannelEvents (e.g. JMAP email) can route to Telegram

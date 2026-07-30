@@ -216,7 +216,26 @@ function _activity_to_events(activity::AbstractDict, client::MSTeams.BotClient)
     return events
 end
 
+Claw.event_source_tag(::MSTeamsMessageEvent) = "msteams"
+Claw.event_source_tag(::MSTeamsReactionEvent) = "msteams"
+
+# Bot Framework activity ids are unique per delivery.
+function _msteams_dedup_key(activity::AbstractDict, event)
+    id = _string_or_empty(get(() -> "", activity, "id"))
+    isempty(id) && return nothing
+    if event isa MSTeamsReactionEvent
+        return "msteams:$(id):reaction:$(event.action):$(event.reaction)"
+    end
+    return "msteams:$(id):message"
+end
+
 # ─── start! ───
+
+function Claw.validate_source(source::MSTeamsEventSource)
+    isempty(strip(source.app_id)) && error("ClawMSTeamsExt: missing MSTEAMS_APP_ID")
+    isempty(strip(source.app_password)) && error("ClawMSTeamsExt: missing MSTEAMS_APP_PASSWORD")
+    return nothing
+end
 
 function Claw.start!(source::MSTeamsEventSource, assistant::Claw.AgentAssistant)
     app_id = strip(source.app_id)
@@ -226,6 +245,7 @@ function Claw.start!(source::MSTeamsEventSource, assistant::Claw.AgentAssistant)
 
     errormonitor(Threads.@spawn begin
         client = MSTeams.BotClient(; app_id=app_id, app_password=app_password)
+        Claw.register_rehydrator!("msteams", Claw.channel_lookup_rehydrator)
         @info "ClawMSTeamsExt: Starting webhook server" host=source.host port=source.port path=source.path
         MSTeams.run_server(; host=source.host, port=source.port, client=client, path=source.path, health_path=source.health_path) do activity
             for event in _activity_to_events(activity, client)
@@ -236,7 +256,7 @@ function Claw.start!(source::MSTeamsEventSource, assistant::Claw.AgentAssistant)
                     ch = event.channel
                     @info "ClawMSTeamsExt: reaction" conversation_id=ch.conversation_id user_id=ch.user_id reaction=event.reaction action=event.action
                 end
-                put!(assistant.event_queue, event)
+                Claw.submit_event!(assistant, event; dedup_key = _msteams_dedup_key(activity, event))
             end
             return nothing
         end

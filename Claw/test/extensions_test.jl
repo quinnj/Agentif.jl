@@ -8,6 +8,20 @@ using Signal
 using Slack
 using Claw
 
+# Events are now persisted before dispatch, and the in-memory channel carries only
+# rowids as wakeups. Tests still want the event object, which lives in the
+# assistant's live-event map until the dispatcher consumes it.
+function pop_event!(assistant)
+    id = take!(assistant.event_queue)
+    ev = get(assistant._live_events, id, nothing)
+    ev === nothing && error("no live event registered for claw_events id $id")
+    return ev
+end
+
+count_events(assistant, sql, params = ()) =
+    Int(iterate(Claw.SQLite.DBInterface.execute(assistant.db,
+        "SELECT COUNT(*) AS n FROM claw_events " * sql, params))[1].n)
+
 const HAS_GITHUB = try
     @eval using GitHub
     true
@@ -129,7 +143,7 @@ if HAS_JMAP
 
     function drain_events!()
         while isready(assistant.event_queue)
-            take!(assistant.event_queue)
+            pop_event!(assistant)
         end
     end
 
@@ -178,7 +192,7 @@ if HAS_JMAP
         sc_new = JMAP.StateChange("StateChange", Dict("acct-1" => Dict("Email" => "E2")))
         ext._handle_state_change!(source, assistant, sc_new)
         @test isready(assistant.event_queue)
-        ev = take!(assistant.event_queue)
+        ev = pop_event!(assistant)
         @test ev isa ext.JMAPNewEmailEvent
         @test Claw.get_name(ev) == "jmap_new_email"
         @test ev.email_id == "m1"
@@ -274,7 +288,9 @@ end
     msg_event = ext._extract_message_event(msg, web_client, "", "", nothing, nothing, channel_type_cache)
     @test msg_event !== nothing
     @test Claw.get_name(msg_event) == "slack_message"
-    @test Agentif.channel_id(Claw.get_channel(msg_event)) == "slack:C123:1700000000.123"
+    # Top-level messages map to the base channel branch (not a fresh per-message
+    # thread branch) so a conversation stays continuous across messages.
+    @test Agentif.channel_id(Claw.get_channel(msg_event)) == "slack:C123"
     @test !msg_event.direct_ping
     @test Agentif.entry_id(Claw.get_channel(msg_event)) == "1700000000.123"
     @test Claw.event_content(msg_event) == "[U123]: hello"
@@ -449,7 +465,7 @@ end
     )
     ext._handle_request(group_request, web_client, "", "", nothing, nothing, assistant, channel_type_cache)
     @test isready(assistant.event_queue)
-    ev_group = take!(assistant.event_queue)
+    ev_group = pop_event!(assistant)
     @test ev_group isa ext.SlackMessageEvent
     @test !ev_group.direct_ping
 
@@ -491,15 +507,51 @@ end
     )
     ext._handle_request(mention_message_request, web_client, "UBOT", "", nothing, nothing, assistant, channel_type_cache)
     @test isready(assistant.event_queue)
-    ev = take!(assistant.event_queue)
+    ev = pop_event!(assistant)
     @test ev isa ext.SlackMessageEvent
     @test ev.direct_ping
 
-    # Re-delivery is processable without event-id dedupe cache.
+    # Re-delivery of the same Slack event_id is a no-op: the durable inbox has a
+    # UNIQUE dedup_key, so the second delivery inserts nothing and never wakes the
+    # dispatcher. (This assertion previously encoded the redelivery bug as intent.)
     ext._handle_request(mention_message_request, web_client, "UBOT", "", nothing, nothing, assistant, channel_type_cache)
-    @test isready(assistant.event_queue)
-    ev2 = take!(assistant.event_queue)
-    @test ev2 isa ext.SlackMessageEvent
+    @test !isready(assistant.event_queue)
+    @test count_events(assistant, "WHERE dedup_key = ?", ("slack:evt-message-mention-1:message",)) == 1
+
+    # Two sequential top-level messages in the same channel share one branch.
+    function top_level_request(event_id, ts, text)
+        return Slack.SocketModeRequest(
+            type="events_api",
+            envelope_id="env-$(event_id)",
+            payload=Slack.SlackEventsApiPayload(
+                type="event_callback",
+                event_id=event_id,
+                event=Slack.SlackMessageEvent(
+                    type="message", channel="D777", channel_type="im",
+                    user="U777", text=text, ts=ts,
+                ),
+            ),
+        )
+    end
+    dm_cache = Dict("D777" => "im")
+    ext._handle_request(top_level_request("evt-dm-1", "1700000100.111", "my name is Jacob"),
+        web_client, "UBOT", "", nothing, nothing, assistant, dm_cache)
+    first_dm = pop_event!(assistant)
+    ext._handle_request(top_level_request("evt-dm-2", "1700000200.222", "what's my name?"),
+        web_client, "UBOT", "", nothing, nothing, assistant, dm_cache)
+    second_dm = pop_event!(assistant)
+    @test Agentif.branch_id(Claw.get_channel(first_dm)) == Agentif.branch_id(Claw.get_channel(second_dm))
+    @test Agentif.branch_id(Claw.get_channel(first_dm)) == "slack:D777"
+    @test Agentif.parent_branch_id(Claw.get_channel(first_dm)) === nothing
+
+    # A genuine thread reply still gets its own branch.
+    thread_reply = Slack.SlackMessageEvent(
+        type="message", channel="D777", channel_type="im", user="U777",
+        text="in thread", ts="1700000300.333", thread_ts="1700000100.111",
+    )
+    thread_event = ext._extract_message_event(thread_reply, web_client, "", "", nothing, nothing, dm_cache)
+    @test Agentif.channel_id(Claw.get_channel(thread_event)) == "slack:D777:1700000100.111"
+    @test Agentif.parent_branch_id(Claw.get_channel(thread_event)) == "slack:D777"
 
     close(assistant.db)
 end
@@ -535,7 +587,7 @@ end
     )
     function drain_events!()
         while isready(assistant.event_queue)
-            take!(assistant.event_queue)
+            pop_event!(assistant)
         end
     end
 
@@ -654,7 +706,7 @@ end
             ext._handle_posted(posted_event(), "UBOT", "claw", assistant)
         end
         @test isready(assistant.event_queue)
-        ev_post = take!(assistant.event_queue)
+        ev_post = pop_event!(assistant)
         @test ev_post isa ext.MattermostMessageEvent
         @test !ev_post.direct_ping
         @test Agentif.channel_id(Claw.get_channel(ev_post)) == "mattermost:chan-top"
@@ -664,7 +716,7 @@ end
             ext._handle_posted(posted_event(; message="hey @Claw please check", post_id="post-mention", sender_name="@bob"), "UBOT", "claw", assistant)
         end
         @test isready(assistant.event_queue)
-        ev_mention = take!(assistant.event_queue)
+        ev_mention = pop_event!(assistant)
         @test ev_mention isa ext.MattermostMessageEvent
         @test ev_mention.direct_ping
         @test Claw.event_content(ev_mention) == "[bob]: hey @Claw please check"
@@ -674,7 +726,7 @@ end
             ext._handle_posted(posted_event(; channel_type="D", post_id="post-dm"), "UBOT", "claw", assistant)
         end
         @test isready(assistant.event_queue)
-        ev_dm = take!(assistant.event_queue)
+        ev_dm = pop_event!(assistant)
         @test ev_dm isa ext.MattermostMessageEvent
         @test ev_dm.direct_ping
 
@@ -692,7 +744,7 @@ end
         end
         count = 0
         while isready(assistant.event_queue)
-            take!(assistant.event_queue)
+            pop_event!(assistant)
             count += 1
         end
         @test count == 1
@@ -712,7 +764,7 @@ end
             ext._handle_reaction(reaction_event, "UBOT", assistant)
         end
         @test isready(assistant.event_queue)
-        ev_reaction = take!(assistant.event_queue)
+        ev_reaction = pop_event!(assistant)
         @test ev_reaction isa ext.MattermostReactionEvent
         @test Agentif.channel_id(Claw.get_channel(ev_reaction)) == "mattermost:chan-react:root-from-post"
         @test occursin("thumbsup", Claw.event_content(ev_reaction))

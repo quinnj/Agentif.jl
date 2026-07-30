@@ -157,7 +157,14 @@ function _envelope_to_message_event(envelope::Signal.Envelope, client::Signal.Cl
     return SignalMessageEvent(ch, text, direct_ping)
 end
 
+Claw.event_source_tag(::SignalMessageEvent) = "signal"
+
 # ─── start! ───
+
+function Claw.validate_source(source::SignalEventSource)
+    isempty(strip(source.number)) && error("ClawSignalExt: missing SIGNAL_NUMBER")
+    return nothing
+end
 
 function Claw.start!(source::SignalEventSource, assistant::Claw.AgentAssistant)
     number = strip(source.number)
@@ -166,6 +173,7 @@ function Claw.start!(source::SignalEventSource, assistant::Claw.AgentAssistant)
     errormonitor(Threads.@spawn begin
         Signal.with_signal(number; base_url=source.base_url) do
             client = Signal._get_client()
+            Claw.register_rehydrator!("signal", Claw.channel_lookup_rehydrator)
             @info "ClawSignalExt: Starting websocket listener" number=number base_url=source.base_url
 
             Signal.run_websocket(; auto_reconnect=source.auto_reconnect) do envelope
@@ -173,7 +181,8 @@ function Claw.start!(source::SignalEventSource, assistant::Claw.AgentAssistant)
                 event === nothing && return
                 ch = event.channel
                 @info "ClawSignalExt: message" recipient=ch.recipient user_id=ch.user_id is_group=ch.is_group_chat direct_ping=event.direct_ping
-                put!(assistant.event_queue, event)
+                Claw.submit_event!(assistant, event;
+                    dedup_key = "signal:$(ch.recipient):$(something(ch.source_timestamp, ""))")
             end
         end
     end)

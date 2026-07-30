@@ -18,6 +18,79 @@ Agentif.close_channel(::ParentAgentChannel) = nothing
 Agentif.is_group(::ParentAgentChannel) = false
 Agentif.is_private(::ParentAgentChannel) = true
 
+# ─── AsyncSessionChannel ───
+# Async completions used to evaluate into the shared `ParentAgentChannel`, which is
+# a no-op sink on channel "parent": the user was told "you'll be notified" and never
+# was, and every async session shared one branch. This channel captures the
+# originating channel at spawn time and delegates sends to it, while keeping a
+# per-session `channel_id` so each async session gets its own branch.
+
+mutable struct AsyncSessionChannel <: Agentif.AbstractChannel
+    session_name::String
+    origin_channel_id::Union{Nothing, String}
+    io::Union{Nothing, IOBuffer}
+end
+
+AsyncSessionChannel(name::String, origin::Union{Nothing, String}) = AsyncSessionChannel(name, origin, nothing)
+
+async_channel_id(name::AbstractString) = "async:$(name)"
+
+Agentif.channel_id(ch::AsyncSessionChannel) = async_channel_id(ch.session_name)
+Agentif.channel_name(ch::AsyncSessionChannel) = "Async session $(ch.session_name)"
+
+function _async_origin(ch::AsyncSessionChannel)
+    ch.origin_channel_id === nothing && return nothing
+    a = get_current_assistant()
+    a === nothing && return nothing
+    origin = get(a._channels, ch.origin_channel_id, nothing)
+    origin isa AsyncSessionChannel && return nothing   # never chain async channels
+    return origin
+end
+
+# Buffer rather than stream: the origin channel object is shared, and a rehydrated
+# or long-idle channel has lost its streaming context anyway.
+Agentif.start_streaming(ch::AsyncSessionChannel) = (ch.io === nothing && (ch.io = IOBuffer()); nothing)
+function Agentif.append_to_stream(ch::AsyncSessionChannel, delta::AbstractString)
+    ch.io === nothing && (ch.io = IOBuffer())
+    write(ch.io, String(delta))
+    return nothing
+end
+Agentif.finish_streaming(::AsyncSessionChannel) = nothing
+
+function Agentif.send_message(ch::AsyncSessionChannel, msg)
+    origin = _async_origin(ch)
+    if origin === nothing
+        @debug "Claw: async session has no reachable origin channel; dropping message" session = ch.session_name origin = ch.origin_channel_id
+        return nothing
+    end
+    return Agentif.send_message(origin, msg)
+end
+
+function Agentif.close_channel(ch::AsyncSessionChannel)
+    io = ch.io
+    ch.io = nothing
+    io === nothing && return nothing
+    text = String(take!(io))
+    isempty(strip(text)) && return nothing
+    Agentif.send_message(ch, text)
+    return nothing
+end
+
+function Agentif.is_group(ch::AsyncSessionChannel)
+    origin = _async_origin(ch)
+    return origin === nothing ? false : Agentif.is_group(origin)
+end
+
+function Agentif.is_private(ch::AsyncSessionChannel)
+    origin = _async_origin(ch)
+    return origin === nothing ? true : Agentif.is_private(origin)
+end
+
+# Session entries for async completions belong to the async session's own branch,
+# not the originating conversation's.
+Agentif.search_channel_id(ch::AsyncSessionChannel) =
+    ch.origin_channel_id === nothing ? Agentif.channel_id(ch) : ch.origin_channel_id
+
 # ─── Session tracking ───
 
 mutable struct ClawLLMSession
@@ -49,11 +122,20 @@ struct PtyOutputEvent <: Event
     name::String
     output::String
     exit_code::Union{Nothing, Int}
+    exited::Bool
 end
+PtyOutputEvent(event_type, name, output, exit_code) =
+    PtyOutputEvent(event_type, name, output, exit_code, exit_code !== nothing)
 get_name(ev::PtyOutputEvent) = ev.event_type
 function event_content(ev::PtyOutputEvent)
     parts = [ev.output]
-    ev.exit_code !== nothing && push!(parts, "\n[Process exited with code $(ev.exit_code)]")
+    if ev.exited
+        # Report the *real* status: telling the agent a failing build exited 0 is
+        # worse than telling it the status could not be read.
+        push!(parts, ev.exit_code === nothing ?
+            "\n[Process exited (status unavailable)]" :
+            "\n[Process exited with code $(ev.exit_code)]")
+    end
     return join(parts)
 end
 
@@ -64,6 +146,18 @@ struct WorkerOutputEvent <: Event
 end
 get_name(ev::WorkerOutputEvent) = ev.event_type
 event_content(ev::WorkerOutputEvent) = ev.output
+
+# Async completions all share one lane so a chatty process produces a queue, not
+# 1200 concurrent LLM calls (§1.4).
+event_source_tag(::SubagentOutputEvent) = "llmtools"
+event_source_tag(::PtyOutputEvent) = "llmtools"
+event_source_tag(::WorkerOutputEvent) = "llmtools"
+event_lane(::SubagentOutputEvent) = "async"
+event_lane(::PtyOutputEvent) = "async"
+event_lane(::WorkerOutputEvent) = "async"
+event_extra(ev::PtyOutputEvent) = Dict{String, Any}("session" => ev.name, "exit_code" => ev.exit_code, "exited" => ev.exited)
+event_extra(ev::SubagentOutputEvent) = Dict{String, Any}("session" => ev.name)
+event_extra(ev::WorkerOutputEvent) = Dict{String, Any}("session" => ev.name)
 
 # ─── LLMToolsEventSource ───
 
@@ -144,6 +238,13 @@ function _get_session(es::LLMToolsEventSource, name::String, kind::Symbol)
     return session
 end
 
+function _current_channel_id()
+    ch = Agentif.CURRENT_CHANNEL[]
+    ch === nothing && return nothing
+    ch isa AsyncSessionChannel && return ch.origin_channel_id
+    return Agentif.channel_id(ch)
+end
+
 function _register_async_session!(
     es::LLMToolsEventSource,
     name::String,
@@ -153,6 +254,7 @@ function _register_async_session!(
     registry_id::Int = 0,
     agent::Union{Nothing, Agentif.Agent} = nothing,
     state::Union{Nothing, Agentif.AgentState} = nothing,
+    origin_channel_id::Union{Nothing, String} = _current_channel_id(),
 )
     a = get_current_assistant()
     a === nothing && error("No assistant initialized")
@@ -161,14 +263,19 @@ function _register_async_session!(
             "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
             (event_type, "LLMTools $kind: $name"))
     end
-    eh = EventHandler(event_type, [event_type], prompt, "parent")
+    # Capture the originating channel at spawn time so the completion actually
+    # reaches the human who asked for it, on this session's own branch.
+    session_channel = AsyncSessionChannel(name, origin_channel_id)
+    channel_id = Agentif.channel_id(session_channel)
+    a._channels[channel_id] = session_channel
+    eh = EventHandler(event_type, [event_type], prompt, channel_id)
     register_event_handler!(a, eh)
     now = time()
     session = ClawLLMSession(name, kind, registry_id, agent, state, nothing, event_type, prompt, now, now, "running")
     lock(es.lock) do
         es.sessions[name] = session
     end
-    @info "LLMTools async session registered" name kind registry_id event_type
+    @info "LLMTools async session registered" name kind registry_id event_type origin_channel_id
     return session
 end
 
@@ -181,6 +288,7 @@ function _cleanup_session!(es::LLMToolsEventSource, name::String)
     if a !== nothing
         try
             unregister_event_handler!(a, session.event_type)
+            Base.delete!(a._channels, async_channel_id(name))
             _with_busy_retry() do
                 SQLite.DBInterface.execute(a.db, "DELETE FROM claw_event_types WHERE name = ?", (session.event_type,))
             end
@@ -189,6 +297,47 @@ function _cleanup_session!(es::LLMToolsEventSource, name::String)
     end
     @info "LLMTools async session cleaned up" name kind = session.kind status = session.status
     return session
+end
+
+# ─── PTY output coalescing helpers (§1.4) ───
+
+"""
+    _truncate_pty_output(text, max_bytes) -> String
+
+Keep the tail (the part a caller actually needs) and cut on a valid character
+boundary so a truncated multi-byte sequence never reaches the model.
+"""
+function _truncate_pty_output(text::String, max_bytes::Int)
+    max_bytes <= 0 && return text
+    ncodeunits(text) <= max_bytes && return text
+    dropped = ncodeunits(text) - max_bytes
+    idx = thisind(text, min(lastindex(text), dropped + 1))
+    idx < firstindex(text) && (idx = firstindex(text))
+    idx = nextind(text, idx, 0)
+    tail = SubString(text, idx)
+    return string("[... ", ncodeunits(text) - ncodeunits(tail), " bytes of earlier output truncated ...]\n", tail)
+end
+
+function _drain_pty_buffer!(buffer::IOBuffer, max_bytes::Int)
+    text = String(take!(buffer))
+    return _truncate_pty_output(text, max_bytes)
+end
+
+"""
+    _pty_exit_code(session) -> Union{Nothing, Int}
+
+Real exit status of the PTY's process, or `nothing` when it cannot be read. The
+previous code hardcoded `0`, which told the agent a failing build had succeeded.
+"""
+function _pty_exit_code(session)
+    try
+        proc = session.process
+        Base.process_exited(proc) || return nothing
+        return Int(proc.exitcode)
+    catch e
+        @debug "Claw: could not read PTY exit code" exception = (e,)
+        return nothing
+    end
 end
 
 function _build_subagent_tools(config::AgentConfig)
@@ -266,7 +415,7 @@ Examples:
                             s.status = "completed"
                         end
                     end
-                    put!(a.event_queue, SubagentOutputEvent(event_type, name, output))
+                    submit_event!(a, SubagentOutputEvent(event_type, name, output))
                 catch e
                     bt = catch_backtrace()
                     lock(es.lock) do
@@ -284,7 +433,7 @@ Examples:
                         bt,
                         suggested_fix = "Inspect message/error_kind and retry by adjusting the prompt or input_message.",
                     )
-                    put!(a.event_queue, SubagentOutputEvent(event_type, name, payload))
+                    submit_event!(a, SubagentOutputEvent(event_type, name, payload))
                 end
             end
             return "Sub-agent '$name' started asynchronously. You'll be notified when it completes."
@@ -349,7 +498,7 @@ Example:
                             s.status = "completed"
                         end
                     end
-                    put!(a.event_queue, SubagentOutputEvent(event_type, name, output))
+                    submit_event!(a, SubagentOutputEvent(event_type, name, output))
                 catch e
                     bt = catch_backtrace()
                     lock(es.lock) do
@@ -367,7 +516,7 @@ Example:
                         bt,
                         suggested_fix = "Inspect session status and the error payload, then retry with corrected input or create a fresh sub-agent.",
                     )
-                    put!(a.event_queue, SubagentOutputEvent(event_type, name, payload))
+                    submit_event!(a, SubagentOutputEvent(event_type, name, payload))
                 end
             end
             return "Message sent to sub-agent '$name'. You'll be notified when it responds."
@@ -477,31 +626,48 @@ Examples:
             handler_prompt = something(prompt, "")
             session = _register_async_session!(es, name, :pty, event_type, handler_prompt;
                 registry_id = registry_id)
+            notify_interval = a.pipeline.pty_notify_interval_s
+            max_event_bytes = a.pipeline.pty_max_event_bytes
             session.task = Threads.@spawn begin
                 try
+                    # Coalesce output: a 0.5s poll used to trigger a full LLM
+                    # evaluation per chunk. Accumulate instead and emit at most one
+                    # event per `pty_notify_interval`, capped in size.
+                    buffer = IOBuffer()
+                    last_emit = time()
                     while true
                         sleep(0.5)
+                        # Read through the session object we own rather than the
+                        # registry entry: LLMTools' cleanup task can reap an exited
+                        # session, and the old `pty_meta === nothing && break` then
+                        # swallowed the exit notification entirely.
                         pty_meta = LLMTools.get_session(LLMTools.PTY_REGISTRY, registry_id)
-                        pty_meta === nothing && break
-                        is_active = try; LLMTools.PtySessions.isactive(pty_meta.session); catch; false; end
-                        output = try; LLMTools.PtySessions.readavailable(pty_meta.session); catch; ""; end
-                        if !isempty(output)
-                            put!(a.event_queue, PtyOutputEvent(event_type, name, output, nothing))
-                        end
+                        live = pty_meta === nothing ? pty_session : pty_meta.session
+                        is_active = try; LLMTools.PtySessions.isactive(live); catch; false; end
+                        output = try; LLMTools.PtySessions.readavailable(live); catch; ""; end
+                        isempty(output) || write(buffer, output)
                         if !is_active
                             lock(es.lock) do
                                 s = get(es.sessions, name, nothing)
                                 s !== nothing && (s.status = "exited")
                             end
-                            remaining = try; LLMTools.PtySessions.readavailable(pty_meta.session); catch; ""; end
-                            if !isempty(remaining)
-                                put!(a.event_queue, PtyOutputEvent(event_type, name, remaining, 0))
-                            else
-                                put!(a.event_queue, PtyOutputEvent(event_type, name, "", 0))
+                            for _ in 1:20
+                                remaining = try; LLMTools.PtySessions.readavailable(live); catch; ""; end
+                                isempty(remaining) && break
+                                write(buffer, remaining)
                             end
-                            LLMTools.remove_session!(LLMTools.PTY_REGISTRY, registry_id;
+                            exit_code = _pty_exit_code(live)
+                            submit_event!(a, PtyOutputEvent(event_type, name,
+                                _drain_pty_buffer!(buffer, max_event_bytes), exit_code, true))
+                            pty_meta === nothing || LLMTools.remove_session!(LLMTools.PTY_REGISTRY, registry_id;
                                 mark_status = LLMTools.SESSION_STATUS_EXITED, close_session = true)
                             break
+                        end
+                        now = time()
+                        if buffer.size > 0 && now - last_emit >= notify_interval
+                            submit_event!(a, PtyOutputEvent(event_type, name,
+                                _drain_pty_buffer!(buffer, max_event_bytes), nothing, false))
+                            last_emit = now
                         end
                     end
                 catch e
@@ -521,7 +687,7 @@ Examples:
                         bt,
                         suggested_fix = "List PTY sessions, then restart or kill/recreate this PTY session.",
                     )
-                    put!(a.event_queue, PtyOutputEvent(event_type, name, payload, nothing))
+                    submit_event!(a, PtyOutputEvent(event_type, name, payload, nothing, false))
                 end
             end
             return "PTY '$name' started asynchronously (cmd: $cmd). You'll be notified when output is available."
@@ -678,7 +844,7 @@ Examples:
                             s.status = "completed"
                         end
                     end
-                    put!(a.event_queue, WorkerOutputEvent(event_type, name, combined))
+                    submit_event!(a, WorkerOutputEvent(event_type, name, combined))
                 catch e
                     bt = catch_backtrace()
                     lock(es.lock) do
@@ -696,7 +862,7 @@ Examples:
                         bt,
                         suggested_fix = "Inspect worker output/error payload and retry with corrected Julia code.",
                     )
-                    put!(a.event_queue, WorkerOutputEvent(event_type, name, payload))
+                    submit_event!(a, WorkerOutputEvent(event_type, name, payload))
                 end
             end
             return "Worker '$name' started asynchronously. You'll be notified when execution completes."
@@ -754,7 +920,7 @@ Example:
                             s.status = "completed"
                         end
                     end
-                    put!(a.event_queue, WorkerOutputEvent(event_type, name, combined))
+                    submit_event!(a, WorkerOutputEvent(event_type, name, combined))
                 catch e
                     bt = catch_backtrace()
                     lock(es.lock) do
@@ -772,7 +938,7 @@ Example:
                         bt,
                         suggested_fix = "Inspect the error payload and retry with syntactically-valid Julia code that matches the worker's current state.",
                     )
-                    put!(a.event_queue, WorkerOutputEvent(event_type, name, payload))
+                    submit_event!(a, WorkerOutputEvent(event_type, name, payload))
                 end
             end
             return "Code sent to worker '$name'. You'll be notified when execution completes."

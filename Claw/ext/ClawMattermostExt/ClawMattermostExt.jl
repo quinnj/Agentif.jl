@@ -206,6 +206,13 @@ function Claw.event_content(ev::MattermostReactionEvent)
     return join(lines, "\n")
 end
 
+Claw.event_source_tag(::MattermostMessageEvent) = "mattermost"
+Claw.event_source_tag(::MattermostReactionEvent) = "mattermost"
+Claw.event_extra(ev::MattermostMessageEvent) = Dict{String, Any}(
+    "direct_ping" => ev.direct_ping, "user_id" => ev.channel.user_id, "post_id" => ev.channel.source_post_id)
+Claw.event_extra(ev::MattermostReactionEvent) = Dict{String, Any}(
+    "emoji" => ev.emoji, "user_name" => ev.user_name)
+
 # ─── Event Types & Handlers ───
 
 const MESSAGE_EVENT_TYPE = Claw.EventType("mattermost_message", "A new message posted in a Mattermost channel")
@@ -242,6 +249,26 @@ function Claw.get_event_handlers(::MattermostEventSource)
     ]
 end
 
+function _rehydrate_mattermost_channel(source::MattermostEventSource, channel_id::Union{Nothing, String})
+    channel_id === nothing && return nothing
+    client = source.client
+    client === nothing && return nothing
+    m = match(r"^mattermost:([^:]+)(?::(.+))?$", channel_id)
+    m === nothing && return nothing
+    chan = String(m.captures[1])
+    root_id = m.captures[2] === nothing ? "" : String(m.captures[2])
+    return MattermostChannel(chan, root_id, "", "", client, nothing, nothing, "", "", "O", "")
+end
+
+function _register_mattermost_rehydrator!(source::MattermostEventSource)
+    Claw.register_rehydrator!("mattermost", function (row)
+        ch = _rehydrate_mattermost_channel(source, row.channel_id)
+        ch === nothing && return nothing
+        return Claw.ReplayedChannelEvent(row.name, row.content, ch)
+    end)
+    return nothing
+end
+
 # ─── WebSocket event handling ───
 
 function _handle_posted(event, bot_user_id, bot_username, assistant)
@@ -274,7 +301,10 @@ function _handle_posted(event, bot_user_id, bot_username, assistant)
     @info "ClawMattermostExt: message" channel_id post_id direct_ping
 
     ch = MattermostChannel(channel_id, root_id, post_id, post_id, Mattermost._get_client(), nothing, nothing, user_id, user_name, channel_type, "")
-    put!(assistant.event_queue, MattermostMessageEvent(ch, message, direct_ping))
+    # Mattermost post ids are unique per post; a websocket replay after reconnect
+    # therefore dedupes for free.
+    Claw.submit_event!(assistant, MattermostMessageEvent(ch, message, direct_ping);
+        dedup_key = "mattermost:post:$(post_id)")
 end
 
 function _handle_reaction(event, bot_user_id, assistant)
@@ -311,7 +341,8 @@ function _handle_reaction(event, bot_user_id, assistant)
     @info "ClawMattermostExt: reaction" emoji=emoji_name post_id channel_id user_id
 
     ch = MattermostChannel(channel_id, root_id, post_id, "", Mattermost._get_client(), nothing, nothing, user_id, user_name, "", "")
-    put!(assistant.event_queue, MattermostReactionEvent(ch, emoji_name, user_name, reacted_to))
+    Claw.submit_event!(assistant, MattermostReactionEvent(ch, emoji_name, user_name, reacted_to);
+        dedup_key = "mattermost:reaction:$(post_id):$(user_id):$(emoji_name)")
 end
 
 function _handle_post_deleted(event, assistant)
@@ -361,6 +392,7 @@ function Claw.start!(source::MattermostEventSource, assistant::Claw.AgentAssista
             bot_username = me.username !== nothing ? lowercase(string(me.username)) : ""
             source.client = Mattermost._get_client()
             source.bot_user_id = bot_user_id
+            _register_mattermost_rehydrator!(source)
             Claw.register_channels!(assistant, _fetch_channels(source.client, bot_user_id))
             @info "ClawMattermostExt: Bot user: $(me.username) ($(bot_user_id))"
 

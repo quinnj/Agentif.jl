@@ -71,11 +71,12 @@ The easiest REPL entrypoint is the `a"..."` macro:
 a"Say hello and explain what tools you have available."
 ```
 
-If you want the lower-level channel/event form, you can drive the queue directly with `ReplChannel` and `ReplInputEvent`:
+If you want the lower-level channel/event form, submit the event yourself with
+`ReplChannel` and `ReplInputEvent`:
 
 ```julia
 ch = Claw.ReplChannel()
-put!(assistant.event_queue, Claw.ReplInputEvent(
+Claw.submit_event!(assistant, Claw.ReplInputEvent(
     "Summarize the last reply in one sentence.",
     ch,
 ))
@@ -83,6 +84,12 @@ wait(ch.completion)
 ```
 
 That sends input through the assistant's event loop and streams output back to `stdout` via the `ReplChannel`.
+
+`submit_event!` persists the event to the `claw_events` inbox first and only then
+wakes the dispatcher, so events survive a crash. Never `put!` onto
+`assistant.event_queue` directly: it carries persisted rowids as wakeups, not events.
+Pass `dedup_key` when the upstream platform supplies a delivery id — redelivery of a
+key that is already in the table is then a no-op.
 
 ## Slack Event Source
 

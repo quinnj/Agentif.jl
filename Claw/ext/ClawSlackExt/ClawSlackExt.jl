@@ -151,9 +151,16 @@ function Agentif.send_message(ch::SlackChannel, msg)
     return response
 end
 
+# A true thread reply has thread_ts set by Slack AND differing from the message's own
+# ts. Top-level messages set thread_ts = ts (self-referencing) purely so the bot's
+# reply lands in a thread; treating that as a thread gave every top-level DM its own
+# empty branch, so "my name is Jacob" and "what's my name?" landed in different
+# sessions. Mirrors ClawMattermostExt's `_is_thread`.
+_is_thread(ch::SlackChannel) = !isempty(ch.thread_ts) && ch.thread_ts != ch.source_ts
+
 function Agentif.channel_id(ch::SlackChannel)
     base = "slack:$(ch.channel)"
-    return isempty(ch.thread_ts) ? base : "$(base):$(ch.thread_ts)"
+    return _is_thread(ch) ? "$(base):$(ch.thread_ts)" : base
 end
 
 function _record_post_ts!(ch::SlackChannel, response)
@@ -175,8 +182,8 @@ end
 
 Agentif.entry_id(ch::SlackChannel) = isempty(ch.source_ts) ? nothing : ch.source_ts
 Agentif.response_entry_id(ch::SlackChannel) = isempty(ch.post_ts) ? nothing : ch.post_ts
-Agentif.parent_branch_id(ch::SlackChannel) = isempty(ch.thread_ts) ? nothing : "slack:$(ch.channel)"
-Agentif.branch_entry_id(ch::SlackChannel) = isempty(ch.thread_ts) ? nothing : ch.thread_ts
+Agentif.parent_branch_id(ch::SlackChannel) = _is_thread(ch) ? "slack:$(ch.channel)" : nothing
+Agentif.branch_entry_id(ch::SlackChannel) = _is_thread(ch) ? ch.thread_ts : nothing
 Agentif.search_channel_id(ch::SlackChannel) = "slack:$(ch.channel)"
 
 function Agentif.create_channel_tools(ch::SlackChannel)
@@ -229,6 +236,13 @@ function Claw.event_content(ev::SlackReactionEvent)
     !isempty(ev.reacted_to_ts) && push!(lines, "Reacted to message timestamp $(ev.reacted_to_ts)")
     return join(lines, "\n")
 end
+
+Claw.event_source_tag(::SlackMessageEvent) = "slack"
+Claw.event_source_tag(::SlackReactionEvent) = "slack"
+Claw.event_extra(ev::SlackMessageEvent) = Dict{String, Any}(
+    "direct_ping" => ev.direct_ping, "user_id" => ev.channel.user_id, "ts" => ev.channel.source_ts)
+Claw.event_extra(ev::SlackReactionEvent) = Dict{String, Any}(
+    "emoji" => ev.emoji, "user_name" => ev.user_name, "reacted_to_ts" => ev.reacted_to_ts)
 
 # ─── Event Types & Handlers ───
 
@@ -289,6 +303,34 @@ function Claw.get_event_handlers(::SlackEventSource)
         Claw.EventHandler("slack_message_default", ["slack_message"], "", nothing),
         Claw.EventHandler("slack_reaction_default", ["slack_reaction"], REACTION_HANDLER_PROMPT, nothing),
     ]
+end
+
+# Slack channel ids round-trip as "slack:<channel>[:<thread_ts>]", so a replayed
+# event can rebuild its channel from the live web client rather than needing the
+# original object to have survived the restart.
+function _rehydrate_slack_channel(source::SlackEventSource, channel_id::Union{Nothing, String})
+    channel_id === nothing && return nothing
+    wc = source.web_client
+    wc === nothing && return nothing
+    m = match(r"^slack:([^:]+)(?::(.+))?$", channel_id)
+    m === nothing && return nothing
+    chan = String(m.captures[1])
+    thread_ts = m.captures[2] === nothing ? "" : String(m.captures[2])
+    recipient_team_id = let v = strip(source.recipient_team_id); isempty(v) ? nothing : String(v); end
+    recipient_user_id = let v = strip(source.recipient_user_id); isempty(v) ? nothing : String(v); end
+    channel_type = _infer_channel_type(chan)
+    # source_ts left empty so `_is_thread` reflects the persisted channel id.
+    return SlackChannel(chan, thread_ts, "", "", wc, nothing, nothing, "", "", channel_type,
+        recipient_team_id, recipient_user_id, "")
+end
+
+function _register_slack_rehydrator!(source::SlackEventSource)
+    Claw.register_rehydrator!("slack", function (row)
+        ch = _rehydrate_slack_channel(source, row.channel_id)
+        ch === nothing && return nothing
+        return Claw.ReplayedChannelEvent(row.name, row.content, ch)
+    end)
+    return nothing
 end
 
 # ─── Request handling ───
@@ -465,6 +507,15 @@ function _extract_reaction_event(event, web_client::Slack.WebClient, bot_user_id
     return SlackReactionEvent(ch, emoji, user_name, reacted_to_ts)
 end
 
+function _payload_event_id(payload)
+    if payload isa Slack.SlackEventsApiPayload
+        return payload.event_id === nothing ? "" : String(payload.event_id)
+    elseif payload isa AbstractDict
+        return _string_or_empty(get(() -> "", payload, "event_id"))
+    end
+    return ""
+end
+
 function _handle_request(request::Slack.SocketModeRequest, web_client::Slack.WebClient, bot_user_id::String, bot_username::String,
         recipient_team_id::Union{Nothing, String}, recipient_user_id::Union{Nothing, String},
         assistant::Claw.AgentAssistant, channel_type_cache::Dict{String, String}=Dict{String, String}())
@@ -478,25 +529,36 @@ function _handle_request(request::Slack.SocketModeRequest, web_client::Slack.Web
         @info "ClawSlackExt: skipping app_mention event; relying on message events"
         return
     end
+    # Slack redelivers on missed acks; `event_id` is the delivery id that makes the
+    # UNIQUE dedup_key turn a redelivery into a no-op.
+    event_id = _payload_event_id(payload)
 
     message_event = _extract_message_event(event, web_client, bot_user_id, bot_username, recipient_team_id, recipient_user_id, channel_type_cache)
     if message_event !== nothing
         ch = message_event.channel
         @info "ClawSlackExt: message" channel=ch.channel thread_ts=ch.thread_ts user_id=ch.user_id direct_ping=message_event.direct_ping event_type
-        put!(assistant.event_queue, message_event)
+        Claw.submit_event!(assistant, message_event;
+            dedup_key = isempty(event_id) ? nothing : "slack:$(event_id):message")
     end
 
     reaction_event = _extract_reaction_event(event, web_client, bot_user_id, recipient_team_id, recipient_user_id, channel_type_cache)
     if reaction_event !== nothing
         ch = reaction_event.channel
         @info "ClawSlackExt: reaction" channel=ch.channel thread_ts=ch.thread_ts emoji=reaction_event.emoji user_id=ch.user_id
-        put!(assistant.event_queue, reaction_event)
+        Claw.submit_event!(assistant, reaction_event;
+            dedup_key = isempty(event_id) ? nothing : "slack:$(event_id):reaction")
     end
 
     return nothing
 end
 
 # ─── start! ───
+
+function Claw.validate_source(source::SlackEventSource)
+    isempty(strip(source.app_token)) && error("ClawSlackExt: missing SLACK_APP_TOKEN")
+    isempty(strip(source.bot_token)) && error("ClawSlackExt: missing SLACK_BOT_TOKEN")
+    return nothing
+end
 
 function Claw.start!(source::SlackEventSource, assistant::Claw.AgentAssistant)
     app_token = strip(source.app_token)
@@ -507,6 +569,7 @@ function Claw.start!(source::SlackEventSource, assistant::Claw.AgentAssistant)
     errormonitor(Threads.@spawn begin
         web_client = Slack.WebClient(; token=bot_token)
         source.web_client = web_client
+        _register_slack_rehydrator!(source)
         # Register channels now that web_client is available
         # (get_channels returns [] during register_event_source! since web_client is still nothing)
         Claw.register_channels!(assistant, Claw.get_channels(source))
@@ -518,6 +581,9 @@ function Claw.start!(source::SlackEventSource, assistant::Claw.AgentAssistant)
         @info "ClawSlackExt: Starting Socket Mode"
 
         Slack.run!(app_token; web_client=web_client) do socket_client, request
+            # Persist before acknowledging: acking first meant a crash between the
+            # ack and the eval lost the message with no redelivery.
+            _handle_request(request, web_client, bot_user_id, bot_username, recipient_team_id, recipient_user_id, assistant, channel_type_cache)
             if request.envelope_id !== nothing
                 try
                     Slack.ack!(socket_client, request)
@@ -525,7 +591,6 @@ function Claw.start!(source::SlackEventSource, assistant::Claw.AgentAssistant)
                     @warn "ClawSlackExt: failed to ack request" exception=(e, catch_backtrace())
                 end
             end
-            _handle_request(request, web_client, bot_user_id, bot_username, recipient_team_id, recipient_user_id, assistant, channel_type_cache)
         end
     end)
 end

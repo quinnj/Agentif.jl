@@ -411,7 +411,24 @@ function _get_installation_auth(source::GitHubEventSource, payload::AbstractDict
     end
 end
 
+Claw.event_source_tag(::GitHubWebhookEvent) = "github"
+Claw.event_extra(ev::GitHubWebhookEvent) = Dict{String, Any}(
+    "kind" => ev.kind, "action" => ev.action, "repo" => ev.repo_name, "sender" => ev.sender_login)
+
+# GitHub webhook events carry no channel, so replay only needs name + content.
+function _register_github_rehydrator!()
+    Claw.register_rehydrator!("github", row -> Claw.ReplayedEvent(row.name, row.content))
+    return nothing
+end
+
 Claw.get_event_types(::GitHubEventSource) = ALL_EVENT_TYPES
+
+function Claw.validate_source(source::GitHubEventSource)
+    isempty(strip(source.secret)) && error(
+        "GitHubEventSource requires a webhook secret. Set GITHUB_WEBHOOK_SECRET " *
+        "(and configure the same secret on the GitHub webhook) before starting.")
+    return nothing
+end
 
 function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
     secret = strip(source.secret)
@@ -422,6 +439,7 @@ function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
         "GitHubEventSource requires a webhook secret. Set GITHUB_WEBHOOK_SECRET " *
         "(and configure the same secret on the GitHub webhook) before starting.")
     webhook_secret = String(secret)
+    _register_github_rehydrator!()
     repos = source.repos !== nothing ? map(GitHub.Repo, source.repos) : nothing
     host = Sockets.IPv4(source.host)
     port = source.port
@@ -449,7 +467,16 @@ function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
 
             ghev = GitHubWebhookEvent(kind, action, payload, repo_name, sender_login)
             @info "ClawGitHubExt: event" kind action repo=repo_name sender=sender_login name=Claw.get_name(ghev)
-            put!(assistant.event_queue, ghev)
+            # Persist before returning 200, so a crash after the 200 is covered by
+            # GitHub's own redelivery.
+            #
+            # NOTE: no dedup key yet. GitHub's delivery id arrives as the
+            # `X-GitHub-Delivery` *header*, and GitHub.jl's `WebhookEvent` only
+            # carries (kind, payload, repository, sender) — the header never reaches
+            # this callback. Plumbing it through is Stage 2 (§2.1); until then a
+            # GitHub redelivery is processed twice, which is the at-least-once
+            # behavior this stage explicitly accepts.
+            Claw.submit_event!(assistant, ghev)
             return HTTP.Response(200, "OK")
         end
         @info "ClawGitHubExt: listening on $(source.host):$(source.port)"
