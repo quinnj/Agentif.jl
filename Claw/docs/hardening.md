@@ -225,13 +225,23 @@ deserves its own review.
 - **MSTeams**: validate the Bot Framework JWT (issuer, audience = app id, signing keys
   from the OpenID config, expiry) before any event is created; refuse to start bound
   to a non-loopback interface without validation configured.
+  > **Corrected after implementation.** This cannot live inside the `MSTeams.run_server`
+  > callback — that callback receives only the parsed activity, so the `Authorization`
+  > header is unreachable from it. It is *not* blocked upstream though: the extension
+  > serves HTTP itself and delegates routing to `MSTeams.build_server_handler`, so the
+  > check runs strictly before an event exists. No MSTeams.jl change needed. Also note
+  > JWTs.jl is not in this stack's manifest; verification is written on stdlibs
+  > (`SHA.sha256` + GMP `powermod` for the RSA operation, plus an explicit
+  > EMSA-PKCS1-v1_5 padding check), which is fine as it involves no secrets.
 - **GitHub**: secret is already mandatory as of the round-1 fixes. Using
   `X-GitHub-Delivery` as the `dedup_key` is **blocked upstream**: GitHub.jl's
   `WebhookEvent` carries only `(kind, payload, repository, sender)`, so the header
   never reaches the callback. Needs a GitHub.jl change; until then GitHub events are
   deduped only by content, not by delivery id.
 - Default all HTTP-listening sources to `127.0.0.1` unless a host is set explicitly,
-  so the safe deployment (behind a proxy) is the default one.
+  so the safe deployment (behind a proxy) is the default one. That is MSTeams, GitHub
+  **and Telegram** — Telegram's webhook mode is also an HTTP listener binding
+  `0.0.0.0`, which this section originally missed.
 
 ## 2.2 Per-handler tool policy
 
@@ -269,10 +279,20 @@ the model's context.
 ## 2.4 Subprocess environment scrubbing
 
 PTY/worker/codex subprocesses inherit the full parent environment including every API
-key. Pass a minimal allowlisted environment instead, so a prompt-injected `echo
-$ANTHROPIC_API_KEY` returns nothing. (Full container sandboxing — the OpenClaw model —
-is noted as future work; env scrubbing plus the tool policy is the 80% for a
-single-user instance.)
+key. Pass a minimal allowlisted environment instead. (Full container sandboxing — the
+OpenClaw model — is noted as future work; env scrubbing plus the tool policy is the
+80% for a single-user instance.)
+
+> **Corrected after implementation.** "An allowlist makes the key unreadable" is only
+> true for `setenv`-based spawns (PtySessions, codex). `ConcurrentUtilities.Worker`
+> spawns with `addenv`, which **merges onto the parent environment rather than
+> replacing it**, so an allowlist alone was a complete no-op and the worker still
+> returned the key — caught by the test, not by reading the code. Denied names must be
+> explicitly shadowed with `""` (`blank_denied`). A second, residual hole: `bash -l`
+> re-sources the user's profile, which can re-export the very variables scrubbed here;
+> `LLMTOOLS_SUBPROCESS_LOGIN_SHELL=0` drops `-l`, but the default keeps it for PATH
+> behavior, so a login shell is not guaranteed clean. Tests use a sentinel value so
+> they prove inheritance *from this process* was cut regardless of a developer profile.
 
 ---
 
@@ -284,9 +304,14 @@ single-user instance.)
   lanes default to 1-per-channel (a behavior change, but the current concurrency is a
   race, not a feature), retries default on, dedup defaults on where a source provides
   an id.
-- `trust` defaults to `:untrusted` for source-registered handlers, which **will**
-  remove tools from existing automations. This is intentional and is the one change
-  that requires reading release notes; the owner list is how you opt back in.
+- `trust` defaults to `:owner` (see the decision in §2.2), so **no existing automation
+  loses a tool**. This is enforced structurally rather than by convention: for a
+  handler with no explicit tool list at `:owner` trust, `resolve_handler_tools` returns
+  the assistant's tool vector *by object identity*, so there is no code path that can
+  filter it; the schema migration backfills `DEFAULT 'owner'`; and an unrecognized
+  trust value decodes to `:untrusted`, never `:owner`, so corruption can only restrict.
+  The cost of that safety is that the exposure persists until you opt in, which is why
+  §2.2 requires the startup warning naming the handlers still at risk.
 
 ## Testing strategy
 

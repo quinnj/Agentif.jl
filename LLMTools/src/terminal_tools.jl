@@ -122,11 +122,7 @@ Limits: Maximum 20 concurrent sessions. Old exited sessions are auto-cleaned. Ou
             max_lines = max_output_lines === nothing ? DEFAULT_MAX_OUTPUT_LINES : max(10, max_output_lines)
             max_tokens = max_output_tokens === nothing ? DEFAULT_MAX_OUTPUT_TOKENS : max(16, max_output_tokens)
 
-            full_cmd = if Sys.iswindows()
-                Cmd([shell_cmd, "-Command", cmd])
-            else
-                Cmd([shell_cmd, "-l", "-c", cmd])
-            end
+            full_cmd = subprocess_shell_command(shell_cmd, cmd)
 
             session_id = next_session_id!(PTY_REGISTRY)
             events = Dict{String, Any}[
@@ -140,7 +136,9 @@ Limits: Maximum 20 concurrent sessions. Old exited sessions are auto-cleaned. Ou
 
             start_time = time()
             try
-                pty_session = PtySessions.PtySession(full_cmd; dir = work_dir)
+                # Allowlisted environment only (§2.4). Without this the shell the model
+                # chose inherits every credential in the parent process.
+                pty_session = PtySessions.PtySession(full_cmd; dir = work_dir, env = subprocess_env())
                 now = time()
                 register_session!(PTY_REGISTRY, session_id, PtySessionMetadata(
                     pty_session,

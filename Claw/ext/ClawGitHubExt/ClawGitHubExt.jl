@@ -377,7 +377,10 @@ const ALL_EVENT_TYPES = [Claw.EventType("github_$k", "GitHub $k webhook event") 
 
 Base.@kwdef mutable struct GitHubEventSource <: Claw.EventSource
     secret::String = get(ENV, "GITHUB_WEBHOOK_SECRET", "")
-    host::String = get(ENV, "GITHUB_WEBHOOK_HOST", "0.0.0.0")
+    # Loopback by default (§2.1): the safe deployment is behind a proxy, and an
+    # HTTP listener that defaults to every interface is one misconfigured firewall
+    # away from being the internet's event source.
+    host::String = get(ENV, "GITHUB_WEBHOOK_HOST", "127.0.0.1")
     port::Int = parse(Int, get(ENV, "GITHUB_WEBHOOK_PORT", "8080"))
     app_id::Union{Nothing, Int} = let v = get(ENV, "GITHUB_APP_ID", ""); isempty(v) ? nothing : parse(Int, v) end
     private_key_path::Union{Nothing, String} = let v = get(ENV, "GITHUB_PRIVATE_KEY_PATH", ""); isempty(v) ? nothing : v end
@@ -410,6 +413,10 @@ function _get_installation_auth(source::GitHubEventSource, payload::AbstractDict
         return nothing
     end
 end
+
+# Issue bodies, PR descriptions and comments are written by anyone with a GitHub
+# account (§2.2).
+Claw.third_party_content(::GitHubEventSource) = true
 
 Claw.event_source_tag(::GitHubWebhookEvent) = "github"
 Claw.event_extra(ev::GitHubWebhookEvent) = Dict{String, Any}(

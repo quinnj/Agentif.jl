@@ -11,6 +11,12 @@ using ScopedValues: @with
 using SQLite
 using Tempus
 using TimeZones
+# Imported, not `using`d: these only ever appear qualified (`Sockets.IPv4`,
+# `Base64.base64decode`, `SHA.sha256`), and `using Sockets` alongside `using HTTP`
+# would make bare `listen`/`bind` ambiguous for anything added here later.
+import Base64
+import SHA
+import Sockets
 
 export EventSource, Event, ChannelEvent, EventType, EventHandler
 export AgentConfig, AgentAssistant, PipelineConfig
@@ -19,6 +25,7 @@ export get_name, get_channel, event_content
 export register_event_source!, register_channels!, register_event_handler!, unregister_event_handler!
 export evaluate, init!, run, start!, get_current_assistant, scrub_post!
 export submit_event!, shutdown!, wait_for_shutdown
+export is_owner_context, resolve_handler_tools, trust_exposure_report, third_party_content
 export ReplChannel, ReplEventSource, ReplInputEvent
 export @a_str
 
@@ -131,11 +138,52 @@ struct EventType
     description::String
 end
 
+"""
+    EventHandler(id, event_types, prompt, channel_id = nothing; tools = nothing, trust = :owner)
+
+A standing automation: when one of `event_types` fires, `prompt` is prepended to the
+event content and evaluated, with the response sent to `channel_id`.
+
+`trust` selects the tool policy for that evaluation (§2.2):
+
+- `:owner` (**default**) — the full tool set, including `set_system_prompt`,
+  `add_event_handler`/`add_job`, the send-email tools and the shell/coding tools.
+- `:untrusted` — read/search/db tools only. Use this for anything fed by content
+  someone else wrote (inbound email, webhooks, group chat).
+
+The default is deliberately the permissive one so existing automations keep working
+unchanged; restriction is a one-field opt-in. Because that default persists, `init!`
+logs a single startup warning naming every owner-tier handler that is fed by
+third-party content — see [`trust_exposure_report`](@ref).
+
+`tools` optionally narrows the handler to a named subset (`nothing` = the default
+set). Trust filtering applies on top: naming a denied tool does not grant it to an
+`:untrusted` handler.
+"""
 struct EventHandler
     id::String
     event_types::Vector{String}  # event type names
     prompt::String
     channel_id::Union{Nothing, String}
+    tools::Union{Nothing, Vector{String}}
+    trust::Symbol
+end
+
+function EventHandler(id::AbstractString, event_types, prompt::AbstractString,
+        channel_id::Union{Nothing, AbstractString} = nothing;
+        tools::Union{Nothing, AbstractVector} = nothing,
+        trust::Symbol = :owner,
+    )
+    trust in TRUST_TIERS || throw(ArgumentError(
+        "EventHandler trust must be one of $(collect(TRUST_TIERS)), got :$trust"))
+    return EventHandler(
+        String(id),
+        String[String(et) for et in event_types],
+        String(prompt),
+        channel_id === nothing ? nothing : String(channel_id),
+        tools === nothing ? nothing : String[String(t) for t in tools],
+        trust,
+    )
 end
 
 Base.@kwdef struct AgentConfig
@@ -147,6 +195,9 @@ Base.@kwdef struct AgentConfig
     base_dir::String = pwd()
     enable_web::Bool = false
     enable_coding::Bool = false
+    # Owner identity (§2.2). Empty by default; the REPL is always owner regardless.
+    owner_channels::Vector{String} = String[]
+    owner_user_ids::Vector{String} = String[]
 end
 
 # SQLite ownership discipline + pipeline runtime structures (§1.7).
@@ -325,9 +376,35 @@ function register_channels!(assistant::AgentAssistant, channels)
     end
 end
 
+_encode_handler_tools(tools::Nothing) = nothing
+_encode_handler_tools(tools::Vector{String}) = JSON.json(tools)
+
+function _decode_handler_tools(raw)
+    (raw === nothing || raw === missing) && return nothing
+    s = String(raw)
+    isempty(strip(s)) && return nothing
+    parsed = try
+        JSON.parse(s)
+    catch
+        return nothing
+    end
+    parsed isa AbstractVector || return nothing
+    return String[String(x) for x in parsed]
+end
+
+function _decode_handler_trust(raw)
+    (raw === nothing || raw === missing) && return :owner
+    s = strip(lowercase(String(raw)))
+    isempty(s) && return :owner
+    sym = Symbol(s)
+    # An unrecognized tier is treated as the restrictive one: a corrupted or
+    # hand-edited value must not silently upgrade a handler to full trust.
+    return sym === :owner ? :owner : :untrusted
+end
+
 function _upsert_event_handler!(db::SQLite.DB, eh::EventHandler)
-    _exec!(db, "INSERT OR REPLACE INTO claw_event_handlers (id, prompt, channel_id) VALUES (?, ?, ?)",
-        (eh.id, eh.prompt, eh.channel_id))
+    _exec!(db, "INSERT OR REPLACE INTO claw_event_handlers (id, prompt, channel_id, trust, tools) VALUES (?, ?, ?, ?, ?)",
+        (eh.id, eh.prompt, eh.channel_id, String(eh.trust), _encode_handler_tools(eh.tools)))
     # Insert new subscriptions before deleting stale ones so a partial upsert can
     # never leave the handler with zero event types (a dead automation);
     # worst case is a transient union of old+new until the next upsert.
@@ -514,19 +591,17 @@ When to use: To audit what automations are active, debug why events aren't being
 
 Arguments: none.
 
-Returns one entry per handler with: ID, subscribed event types, channel, and a preview of the prompt text.""" function list_event_handlers()
+Each entry shows the handler's trust tier: `owner` handlers get the full tool set, `untrusted` handlers cannot use self-modification, standing-automation, send-email or shell tools.
+
+Returns one entry per handler with: ID, subscribed event types, channel, trust tier, and a preview of the prompt text.""" function list_event_handlers()
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     lines = String[]
-    for row in SQLite.DBInterface.execute(a.db, "SELECT id, prompt, channel_id FROM claw_event_handlers")
-        ch_id = row.channel_id === missing ? "none" : row.channel_id
-        ets = String[]
-        for et_row in SQLite.DBInterface.execute(a.db,
-            "SELECT event_type_name FROM claw_handler_event_types WHERE handler_id = ?", (row.id,))
-            push!(ets, et_row.event_type_name)
-        end
-        prompt_preview = length(row.prompt) > 80 ? string(first(row.prompt, 80), "...") : row.prompt
-        push!(lines, "- $(row.id) [events: $(join(ets, ", "))] [channel: $ch_id]\n  prompt: $prompt_preview")
+    for h in _all_event_handlers(a)
+        ch_id = h.channel_id === nothing ? "none" : h.channel_id
+        prompt_preview = length(h.prompt) > 80 ? string(first(h.prompt, 80), "...") : h.prompt
+        tool_note = h.tools === nothing ? "" : " [tools: $(join(h.tools, ", "))]"
+        push!(lines, "- $(h.id) [events: $(join(h.event_types, ", "))] [channel: $ch_id] [trust: $(h.trust)]$tool_note\n  prompt: $prompt_preview")
     end
     isempty(lines) ? "No event handlers registered" : join(lines, "\n")
 end
@@ -1004,6 +1079,9 @@ const DB_TOOLS = Agentif.AgentTool[DB_STORE_TOOL, DB_SEARCH_TOOL, DB_LIST_KEYS_T
 
 include("llmtools.jl")
 
+# Per-handler tool policy, owner identity, startup exposure report (§2.2).
+include("trust.jl")
+
 # ─── Evaluate ───
 
 function evaluate(
@@ -1011,6 +1089,10 @@ function evaluate(
         input;
         channel::Union{Nothing, Agentif.AbstractChannel} = nothing,
         level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing,
+        # Tool availability is resolved per evaluation from the handler's trust tier
+        # (§2.2). `nothing` keeps the assistant-wide set, which is what every direct
+        # (non-handler) caller gets.
+        tools::Union{Nothing, Vector{Agentif.AgentTool}} = nothing,
         kw...,
     )
     cfg = assistant.config
@@ -1022,7 +1104,7 @@ function evaluate(
         prompt = build_system_prompt(assistant; channel),
         model = model,
         apikey = cfg.apikey,
-        tools = assistant.tools,
+        tools = tools === nothing ? assistant.tools : tools,
     )
     # Prepend date/time context to user input (not system prompt) to preserve
     # LLM provider prefix-based prompt caching across turns.
@@ -1092,7 +1174,7 @@ function _event_handlers_for(assistant::AgentAssistant, event_name::String)
     return _with_busy_retry() do
         handlers = NamedTuple[]
         for row in SQLite.DBInterface.execute(assistant.db, """
-            SELECT eh.id, eh.prompt, eh.channel_id
+            SELECT eh.id, eh.prompt, eh.channel_id, eh.trust, eh.tools
             FROM claw_event_handlers eh
             JOIN claw_handler_event_types het ON eh.id = het.handler_id
             WHERE het.event_type_name = ?
@@ -1101,7 +1183,41 @@ function _event_handlers_for(assistant::AgentAssistant, event_name::String)
             isempty(handler_id) && continue
             prompt = row.prompt === missing ? "" : String(row.prompt)
             channel_id = row.channel_id === missing ? nothing : String(row.channel_id)
-            push!(handlers, (; id=handler_id, prompt, channel_id))
+            trust = _decode_handler_trust(row.trust)
+            tools = _decode_handler_tools(row.tools)
+            push!(handlers, (; id=handler_id, prompt, channel_id, trust, tools))
+        end
+        return handlers
+    end
+end
+
+"""
+    _all_event_handlers(assistant) -> Vector{NamedTuple}
+
+Every registered handler with its subscribed event types and trust tier. Feeds
+[`trust_exposure_report`](@ref) and the `list_event_handlers` tool.
+"""
+function _all_event_handlers(assistant::AgentAssistant)
+    return _with_busy_retry() do
+        handlers = NamedTuple[]
+        rows = NamedTuple[]
+        for row in SQLite.DBInterface.execute(assistant.db,
+                "SELECT id, prompt, channel_id, trust, tools FROM claw_event_handlers")
+            id = row.id === missing ? "" : String(row.id)
+            isempty(id) && continue
+            push!(rows, (; id,
+                prompt = row.prompt === missing ? "" : String(row.prompt),
+                channel_id = row.channel_id === missing ? nothing : String(row.channel_id),
+                trust = _decode_handler_trust(row.trust),
+                tools = _decode_handler_tools(row.tools)))
+        end
+        for r in rows
+            event_types = String[]
+            for et_row in SQLite.DBInterface.execute(assistant.db,
+                    "SELECT event_type_name FROM claw_handler_event_types WHERE handler_id = ?", (r.id,))
+                push!(event_types, String(et_row.event_type_name))
+            end
+            push!(handlers, (; r..., event_types))
         end
         return handlers
     end
@@ -1143,17 +1259,21 @@ function _run_event_handler!(
         handler;
         level::Union{Nothing, LogLevel} = assistant.log_level,
         abort::Union{Nothing, Agentif.Abort} = nothing,
+        kw...,     # forwarded to `evaluate` (tests inject a stub `base_handler`)
     )
     ch = _resolve_event_channel(assistant, ev, handler.channel_id)
     if ch === nothing
         ch = SinkChannel("handler:$(handler.id)")
     end
     input = make_prompt(handler.prompt, ev)
-    @debug "Claw handler evaluate start" handler_id = handler.id event_name = get_name(ev) channel_id = Agentif.channel_id(ch)
+    # §2.2: the tool vector is resolved here, per evaluation, from this handler's
+    # trust tier — not once at init! for the whole assistant.
+    tools = resolve_handler_tools(assistant, handler)
+    @debug "Claw handler evaluate start" handler_id = handler.id event_name = get_name(ev) channel_id = Agentif.channel_id(ch) trust = _handler_trust(handler) n_tools = length(tools)
     if abort === nothing
-        evaluate(assistant, input; channel = ch, level = level)
+        evaluate(assistant, input; channel = ch, level = level, tools = tools, kw...)
     else
-        evaluate(assistant, input; channel = ch, level = level, abort = abort)
+        evaluate(assistant, input; channel = ch, level = level, tools = tools, abort = abort, kw...)
     end
     @debug "Claw handler evaluate end" handler_id = handler.id event_name = get_name(ev)
     return nothing
@@ -1174,6 +1294,8 @@ function AgentAssistant(db_path::String;
     base_dir::String=pwd(),
     enable_web::Bool=false,
     enable_coding::Bool=false,
+    owner_channels::Vector{String}=String[],
+    owner_user_ids::Vector{String}=String[],
     level::Union{Nothing, LogLevel, Int, Symbol, AbstractString}=nothing,
     pipeline::PipelineConfig=PipelineConfig(),
 )
@@ -1184,7 +1306,8 @@ function AgentAssistant(db_path::String;
     session_store = Agentif.SQLiteSessionStore(db, search_store)
     tempus_store = Tempus.SQLiteStore(db)
     scheduler = Tempus.Scheduler(tempus_store)
-    config = AgentConfig(; name, provider, model_id, apikey, timezone, base_dir, enable_web, enable_coding)
+    config = AgentConfig(; name, provider, model_id, apikey, timezone, base_dir, enable_web, enable_coding,
+        owner_channels, owner_user_ids)
     log_level = Agentif.resolve_log_level(level)
     return AgentAssistant(;
         config,
@@ -1234,6 +1357,10 @@ function init!(
     append!(assistant.tools, MANAGEMENT_TOOLS)
     append!(assistant.tools, TEMPUS_TOOLS)
     append!(assistant.tools, DB_TOOLS)
+    # §2.2: the permissive default is the one that persists, so state the exposure
+    # once per boot instead of relying on anyone remembering it. Runs after tools and
+    # handlers are registered and before any event can be dispatched.
+    _log_trust_exposure(assistant, sources)
     Tempus.run!(assistant.scheduler)
     assistant._scheduler_started[] = true
     start_event_loop!(assistant; level = assistant.log_level)

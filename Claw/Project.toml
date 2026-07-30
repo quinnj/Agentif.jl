@@ -5,6 +5,7 @@ authors = ["Jacob Quinn <quinn.jacobd@gmail.com>"]
 
 [deps]
 Agentif = "b1e21dde-9d8e-492f-89d0-ee48af23bfc5"
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
@@ -13,8 +14,10 @@ LocalSearch = "3edf9609-13f2-4288-b0a3-8bd6d521158e"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 LoggingExtras = "e6f89c97-d47a-5376-807f-9c37f3926c36"
 Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
 ScopedValues = "7e506255-f358-4e82-b7e4-beb19740aa63"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 Tempus = "e6262be2-5787-4bdc-bc3f-4b5a3442fa30"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 

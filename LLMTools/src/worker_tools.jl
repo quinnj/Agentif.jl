@@ -46,7 +46,16 @@ const WORKER_REGISTRY = SessionRegistry{WorkerSessionMetadata}(
 # --- Helpers ---
 
 function _worker_env()
-    env = Dict{String, String}(k => v for (k, v) in ENV)
+    # Allowlist, not inheritance (§2.4): a worker used to receive every API key the
+    # parent holds, so `remote_eval(w, :(ENV["ANTHROPIC_API_KEY"]))` — or any code a
+    # prompt injection talked the model into running — read them straight back out.
+    # `WORKER_ENV_ALLOWLIST` adds back only what a Julia process needs to find its
+    # depot and project.
+    # `blank_denied` because `Worker` spawns with `addenv(cmd, env)` — a merge onto
+    # the parent environment, not a replacement — so an allowlist by itself would be
+    # a no-op. Verified by test: without it, `exec_code("ENV[\"ANTHROPIC_API_KEY\"]")`
+    # returns the key.
+    env = subprocess_env(; extra_allow = WORKER_ENV_ALLOWLIST, blank_denied = true)
     # Ensure @stdlib is in the load path (Pkg.test() sandboxes may omit it)
     sep = Sys.iswindows() ? ";" : ":"
     lp = get(env, "JULIA_LOAD_PATH", "")

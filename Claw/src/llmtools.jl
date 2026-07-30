@@ -599,12 +599,15 @@ Examples:
             @info "Starting PTY session" name cmd work_dir sync
 
             shell_cmd = Sys.iswindows() ? "powershell" : "bash"
-            full_cmd = Sys.iswindows() ? Cmd([shell_cmd, "-Command", cmd]) : Cmd([shell_cmd, "-l", "-c", cmd])
+            full_cmd = LLMTools.subprocess_shell_command(shell_cmd, cmd)
 
             LLMTools.ensure_cleanup_task_running!(LLMTools.PTY_REGISTRY)
             LLMTools.cleanup_exited_sessions!(LLMTools.PTY_REGISTRY)
             registry_id = LLMTools.next_session_id!(LLMTools.PTY_REGISTRY)
-            pty_session = LLMTools.PtySessions.PtySession(full_cmd; dir = work_dir)
+            # Allowlisted environment only (§2.4): this PTY is reachable from an
+            # inbound message, so it must not carry the assistant's own API keys.
+            pty_session = LLMTools.PtySessions.PtySession(full_cmd; dir = work_dir,
+                env = LLMTools.subprocess_env())
             now = time()
             meta = LLMTools.PtySessionMetadata(pty_session, now, now, cmd, work_dir, LLMTools.SESSION_STATUS_RUNNING, nothing)
             LLMTools.register_session!(LLMTools.PTY_REGISTRY, registry_id, meta)

@@ -272,7 +272,9 @@ Keep your response concise."""
 Base.@kwdef mutable struct TelegramEventSource <: Claw.EventSource
     use_polling::Bool = true
     timeout::Int = 30
-    host::String = "0.0.0.0"
+    # Loopback by default in webhook mode (§2.1), same rule as the other
+    # HTTP-listening sources: bind wider only behind a proxy you chose.
+    host::String = get(ENV, "TELEGRAM_WEBHOOK_HOST", "127.0.0.1")
     port::Int = 8080
     path::String = "/webhook"
     secret_token::Union{String, Nothing} = nothing
@@ -288,6 +290,11 @@ function Claw.get_event_handlers(::TelegramEventSource)
         Claw.EventHandler("telegram_reaction_default", ["telegram_reaction"], REACTION_HANDLER_PROMPT, nothing),
     ]
 end
+
+# Telegram chats (groups especially) carry content the owner did not write, and
+# their channels are minted per chat at runtime, so the group/public-channel rule
+# can never see them at startup — declare it at the source level (§2.2).
+Claw.third_party_content(::TelegramEventSource) = true
 
 Claw.event_source_tag(::TelegramMessageEvent) = "telegram"
 Claw.event_source_tag(::TelegramReactionEvent) = "telegram"

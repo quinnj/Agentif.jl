@@ -38,7 +38,7 @@ uuid = "fa961155-64e5-5f13-b03f-caf6b980ea82"
 version = "0.5.0"
 
 [[deps.Claw]]
-deps = ["Agentif", "Dates", "HTTP", "JSON", "LLMTools", "LocalSearch", "Logging", "LoggingExtras", "Mattermost", "SQLite", "ScopedValues", "Tempus", "TimeZones"]
+deps = ["Agentif", "Base64", "Dates", "HTTP", "JSON", "LLMTools", "LocalSearch", "Logging", "LoggingExtras", "Mattermost", "SHA", "SQLite", "ScopedValues", "Sockets", "Tempus", "TimeZones"]
 path = "Claw"
 uuid = "46916a23-5c37-4b23-b62b-45b422578c04"
 version = "0.1.0"
@@ -232,7 +232,7 @@ uuid = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
 version = "1.0.0"
 
 [[deps.LLMTools]]
-deps = ["Agentif", "Base64", "ConcurrentUtilities", "Dates", "HTTP", "JSON", "LLMProviders", "Logging", "LoggingExtras", "PtySessions", "UUIDs"]
+deps = ["Agentif", "Base64", "ConcurrentUtilities", "Dates", "HTTP", "JSON", "LLMProviders", "Logging", "LoggingExtras", "PtySessions", "Sockets", "UUIDs"]
 path = "LLMTools"
 uuid = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
 version = "1.0.0"

@@ -5,7 +5,9 @@ using Test, LLMTools
     include("codex_tool_test.jl")
     include("file_tools_test.jl")
     include("session_utils_test.jl")
+    include("subprocess_env_test.jl")
     include("terminal_tools_test.jl")
+    include("egress_test.jl")
     include("web_tools_test.jl")
     include("worker_tools_test.jl")
 end

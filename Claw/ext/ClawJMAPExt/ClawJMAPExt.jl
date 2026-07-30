@@ -88,6 +88,9 @@ Base.@kwdef mutable struct FastmailEventSource <: Claw.EventSource
 end
 
 Claw.get_event_types(::FastmailEventSource) = Claw.EventType[NEW_EMAIL_EVENT_TYPE]
+# Inbound mail is written by anyone who knows the address, and it arrives with the
+# send-email tools loaded — the highest-value target in the whole tool set (§2.2).
+Claw.third_party_content(::FastmailEventSource) = true
 Claw.get_channels(::FastmailEventSource) = Agentif.AbstractChannel[]
 Claw.get_event_handlers(::FastmailEventSource) = Claw.EventHandler[]
 Claw.get_tools(::FastmailEventSource) = JMAP_TOOLS

@@ -7,6 +7,12 @@ function web_funcs()
     return Dict(tool.name => tool.func for tool in LLMTools.web_tools())
 end
 
+# These tests fetch from 127.0.0.1 with non-GET methods, which the §2.3 egress
+# policy refuses by default and on purpose. Opting in explicitly here is exactly the
+# escape hatch a user with a deliberate internal host would use.
+const LOCAL_TEST_POLICY = LLMTools.WebFetchPolicy(;
+    allow_private_hosts = true, allow_non_get = true, deadline_s = 60.0)
+
 @testset "Web tools" begin
     funcs = web_funcs()
     web_fetch = funcs["web_fetch"]
@@ -22,7 +28,9 @@ end
             sock = getsockname(server.listener.server)
             port = sock[2]
             url = "http://127.0.0.1:$port/echo"
-            result = web_fetch(url, "POST", nothing, "hello-post", false, 10, nothing, nothing)
+            result = LLMTools.with_web_fetch_policy(LOCAL_TEST_POLICY) do
+                web_fetch(url, "POST", nothing, "hello-post", false, 10, nothing, nothing)
+            end
             @test occursin("Status: 200", result)
             @test occursin("method=POST;body=hello-post", result)
         finally
@@ -55,7 +63,9 @@ end
             sock = getsockname(server.listener.server)
             port = sock[2]
             url = "http://127.0.0.1:$port/lines"
-            result = web_fetch(url, "GET", nothing, nothing, false, 10, nothing, 50)
+            result = LLMTools.with_web_fetch_policy(LOCAL_TEST_POLICY) do
+                web_fetch(url, "GET", nothing, nothing, false, 10, nothing, 50)
+            end
             @test occursin("--- Content Preview ---", result)
             @test occursin("line 50", result)
             @test !occursin("line 1\nline 2\nline 3", result)

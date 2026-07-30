@@ -291,7 +291,7 @@ end
 # the baseline tables are (idempotently) created, so the ladder below is the only
 # thing that ever has to change a live database.
 
-const CLAW_SCHEMA_VERSION = 2
+const CLAW_SCHEMA_VERSION = 3
 
 function _get_user_version(db::SQLite.DB)
     version = 0
@@ -338,7 +338,34 @@ function _migration_2!(db::SQLite.DB)
     return nothing
 end
 
-const CLAW_MIGRATIONS = Dict{Int, Function}(2 => _migration_2!)
+"""
+    _column_exists(db, table, column) -> Bool
+
+Iterates `PRAGMA table_info` to exhaustion on purpose: an early `return true` would
+leave the cursor mid-step, and an unconsumed cursor holds its statement open — the
+exact failure mode §1.7 documents.
+"""
+function _column_exists(db::SQLite.DB, table::AbstractString, column::AbstractString)
+    found = false
+    for row in SQLite.DBInterface.execute(db, "PRAGMA table_info($(table))")
+        String(row.name) == column && (found = true)
+    end
+    return found
+end
+
+# §2.2: per-handler trust tier and tool subset. `DEFAULT 'owner'` is what backfills
+# existing rows, which is the schema-level half of the no-regression guarantee — a
+# database written by the previous version comes back with every handler still at
+# full trust.
+function _migration_3!(db::SQLite.DB)
+    _column_exists(db, "claw_event_handlers", "trust") ||
+        _exec!(db, "ALTER TABLE claw_event_handlers ADD COLUMN trust TEXT NOT NULL DEFAULT 'owner'")
+    _column_exists(db, "claw_event_handlers", "tools") ||
+        _exec!(db, "ALTER TABLE claw_event_handlers ADD COLUMN tools TEXT")
+    return nothing
+end
+
+const CLAW_MIGRATIONS = Dict{Int, Function}(2 => _migration_2!, 3 => _migration_3!)
 
 """
     _migrate_claw_schema!(db)
