@@ -265,7 +265,18 @@ end
     pending_tool_calls::Vector{PendingToolCall} = PendingToolCall[]
     most_recent_stop_reason::Union{Nothing, Symbol} = nothing
     last_compaction::Union{Nothing, CompactionSummaryMessage} = nothing
-    compaction_kept_count::Int = 0
+    # Input tokens (including cache reads) reported by the most recent API call.
+    # 0 means "unknown" (fresh state restored from a session store), in which
+    # case compaction falls back to estimating from `messages`.
+    context_tokens::Int = 0
+    # Provenance for messages that a session store already persisted:
+    # how many leading messages of `messages` (skipping a leading compaction
+    # summary) are already stored, and the 1-based index of the first of them
+    # in the message list that was originally loaded from the store. `compact!`
+    # keeps both up to date so session persistence never has to reconstruct the
+    # kept boundary with index arithmetic.
+    persisted_prefix_count::Int = 0
+    persisted_prefix_start::Int = 1
 end
 
 function set!(dest::AgentState, source::AgentState)
@@ -275,6 +286,8 @@ function set!(dest::AgentState, source::AgentState)
     dest.pending_tool_calls = source.pending_tool_calls
     dest.most_recent_stop_reason = source.most_recent_stop_reason
     dest.last_compaction = source.last_compaction
-    dest.compaction_kept_count = source.compaction_kept_count
+    dest.context_tokens = source.context_tokens
+    dest.persisted_prefix_count = source.persisted_prefix_count
+    dest.persisted_prefix_start = source.persisted_prefix_start
     return
 end

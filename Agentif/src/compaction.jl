@@ -162,14 +162,17 @@ function format_messages_for_summary(messages::Vector{AgentMessage})
 end
 
 """
-    generate_summary(agent, to_discard, existing_summary, config, model) -> String
+    generate_summary(agent, to_discard, existing_summary, config, model, abort) -> Union{Nothing, String}
 
 Use the agent's model to generate a structured summary of discarded messages.
+Returns `nothing` when the summarization call failed (provider error, abort, or
+an empty response) so callers can skip compaction instead of trading real
+history for an empty summary.
 """
 function generate_summary(
         agent::Agent, to_discard::Vector{AgentMessage},
         existing_summary::Union{Nothing, CompactionSummaryMessage},
-        config::CompactionConfig, model::Model,
+        config::CompactionConfig, model::Model, abort::Abort = Abort(),
     )
     prompt = if existing_summary !== nothing
         replace(COMPACTION_UPDATE_PROMPT, "%s" => existing_summary.summary)
@@ -181,38 +184,55 @@ function generate_summary(
     summary_input = "Summarize this conversation:\n\n$conversation_text"
 
     summary_agent = Agent(; prompt, model, apikey = agent.apikey, tools = AgentTool[])
-    result = stream(identity, summary_agent, AgentState(), summary_input, Abort())
-    return message_text(last_assistant_message(result))
+    result = stream(identity, summary_agent, AgentState(), summary_input, abort)
+    stop_reason = result.most_recent_stop_reason
+    if stop_reason === :error || stop_reason === :aborted
+        @warn "Compaction summary call did not complete, skipping compaction" stop_reason
+        return nothing
+    end
+    msg = last_assistant_message(result)
+    summary_text = msg === nothing ? "" : message_text(msg)
+    if isempty(strip(summary_text))
+        @warn "Compaction summary was empty, skipping compaction" stop_reason
+        return nothing
+    end
+    return summary_text
 end
 
 """
-    compact!(agent, state, config, model)
+    compact!(agent, state, config, model; abort) -> Bool
 
 Perform compaction on the agent state: summarize old messages and replace them
 with a CompactionSummaryMessage. Sets `state.last_compaction` to signal
-session_middleware to write a compaction entry.
+session_middleware to write a compaction entry, and updates the persisted-prefix
+provenance so persistence knows which kept messages the store already holds.
+
+Returns `true` when the state was compacted, `false` when compaction was skipped
+(nothing to compact, or summarization failed) — in which case `state` is
+untouched.
 """
-function compact!(agent::Agent, state::AgentState, config::CompactionConfig, model::Model)
+function compact!(agent::Agent, state::AgentState, config::CompactionConfig, model::Model; abort::Abort = Abort())
     messages = state.messages
 
     cut_idx = find_cut_point(messages, config.keep_recent_tokens)
-    cut_idx <= 1 && return
+    cut_idx <= 1 && return false
 
     # Check for existing compaction summary at the front
     existing_summary = !isempty(messages) && messages[1] isa CompactionSummaryMessage ? messages[1] : nothing
     discard_start = existing_summary !== nothing ? 2 : 1
 
     to_discard = messages[discard_start:cut_idx-1]
-    isempty(to_discard) && return
+    isempty(to_discard) && return false
 
     to_keep = messages[cut_idx:end]
 
     summary_text = try
-        generate_summary(agent, to_discard, existing_summary, config, model)
+        generate_summary(agent, to_discard, existing_summary, config, model, abort)
     catch e
         @warn "Compaction summary generation failed, skipping compaction" exception = (e, catch_backtrace())
-        return
+        nothing
     end
+    summary_text === nothing && return false
 
     tokens_before = sum(estimate_message_tokens(m) for m in to_discard)
     if existing_summary !== nothing
@@ -225,6 +245,14 @@ function compact!(agent::Agent, state::AgentState, config::CompactionConfig, mod
         compacted_at = time(),
     )
 
+    # The already-persisted prefix occupies positions
+    # discard_start .. discard_start + persisted_prefix_count - 1; whatever part
+    # of it survives the cut stays persisted, the rest is now summarized.
+    prefix_end = discard_start + state.persisted_prefix_count - 1
+    surviving_prefix = max(0, prefix_end - max(cut_idx, discard_start) + 1)
+    state.persisted_prefix_start += max(0, min(cut_idx, discard_start + state.persisted_prefix_count) - discard_start)
+    state.persisted_prefix_count = surviving_prefix
+
     # Replace state.messages in-place
     empty!(state.messages)
     push!(state.messages, compaction_msg)
@@ -232,9 +260,8 @@ function compact!(agent::Agent, state::AgentState, config::CompactionConfig, mod
 
     # Signal to session_middleware
     state.last_compaction = compaction_msg
-    state.compaction_kept_count = length(to_keep)
 
-    return
+    return true
 end
 
 function compaction_threshold(context_window::Int, reserve_tokens::Int)
@@ -250,6 +277,78 @@ end
 compaction_threshold(config::CompactionConfig, model::Model) = compaction_threshold(model.contextWindow, config.reserve_tokens)
 
 """
+    estimate_context_tokens(messages) -> Int
+
+Rough token estimate for a whole conversation. Used as the compaction trigger
+when no measured token count is available (e.g. the first call of an evaluation
+whose state was just restored from a session store).
+"""
+function estimate_context_tokens(messages::Vector{AgentMessage})
+    total = 0
+    for msg in messages
+        total += estimate_message_tokens(msg)
+    end
+    return total
+end
+
+"""
+    current_context_tokens(state) -> Int
+
+Best available estimate of how many input tokens the next API call will carry:
+the measured input tokens of the most recent call (`state.context_tokens`), or
+the message estimate when that is larger or unknown. Taking the larger of the
+two catches context that grew after the last measurement (a long tool-call loop)
+and restored sessions that were already over the limit.
+"""
+function current_context_tokens(state::AgentState)
+    return max(state.context_tokens, estimate_context_tokens(state.messages))
+end
+
+const CONTEXT_OVERFLOW_PATTERNS = [
+    "context length",
+    "context_length",
+    "context window",
+    "maximum context",
+    "too many tokens",
+    "prompt is too long",
+    "input is too long",
+    "reduce the length of the messages",
+]
+
+"""
+    is_context_overflow_error(text) -> Bool
+
+Whether a provider error message looks like "the request exceeded the model's
+context window". Matching is textual because providers report overflow as a
+generic 400 with a prose message.
+"""
+function is_context_overflow_error(text::AbstractString)
+    lowered = lowercase(text)
+    return any(pat -> occursin(pat, lowered), CONTEXT_OVERFLOW_PATTERNS)
+end
+
+is_context_overflow_error(e::Exception) = is_context_overflow_error(sprint(showerror, e))
+
+function is_context_overflow_error(e::HTTP.StatusError)
+    400 <= e.status < 500 || return false
+    body = try
+        String(copy(e.response.body))
+    catch
+        ""
+    end
+    return is_context_overflow_error(body) || is_context_overflow_error(sprint(showerror, e))
+end
+
+function _record_context_tokens!(state::AgentState, total_before::Int)
+    # Track full input token count (including cached) for accurate context
+    # window utilization. usage.input has cached tokens subtracted, so we add
+    # cacheRead back.
+    total_after = state.usage.input + state.usage.cacheRead
+    state.context_tokens = max(0, total_after - total_before)
+    return state
+end
+
+"""
     compaction_middleware(agent_handler, config) -> middleware
 
 Middleware that checks if context is approaching the model's context window
@@ -258,12 +357,14 @@ and compacts old messages into a summary before calling the LLM.
 Sits directly above `stream` in the middleware stack so it runs before each
 individual LLM API call (including within tool-call loops).
 
-Uses `state.usage.input` from the previous API call to determine if compaction
-is needed. On the first call (no previous usage data), compaction is skipped.
+The trigger comes from the state itself — the measured input tokens of the most
+recent API call, or an estimate over `state.messages` — so a session restored
+over the limit compacts before its first call rather than failing forever.
+
+If the provider still rejects the request as a context overflow, the middleware
+compacts once and retries the call once.
 """
 function compaction_middleware(agent_handler::AgentHandler, config::CompactionConfig)
-    last_input_tokens = Ref(0)
-
     return function (f, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort;
             model::Union{Nothing, Model} = nothing, kw...)
         if !config.enabled
@@ -278,19 +379,59 @@ function compaction_middleware(agent_handler::AgentHandler, config::CompactionCo
         threshold = compaction_threshold(config, resolved_model)
         threshold <= 0 && return agent_handler(f, agent, state, current_input, abort; model, kw...)
 
-        # Compact if previous call's total input tokens (including cached)
-        # exceeded the context window threshold.
-        if last_input_tokens[] > 0 && last_input_tokens[] > threshold
-            compact!(agent, state, config, resolved_model)
+        if current_context_tokens(state) > threshold
+            compact!(agent, state, config, resolved_model; abort) && (state.context_tokens = 0)
         end
 
-        # Track full input token count (including cached) for accurate
-        # context window utilization. usage.input has cached tokens
-        # subtracted, so we add cacheRead back.
+        # Hold back a context-overflow error: if compaction can rescue the call
+        # we retry instead of surfacing it, otherwise we forward it unchanged.
+        overflow_event = Ref{Union{Nothing, AgentErrorEvent}}(nothing)
+        guarded_f = function (event)
+            if overflow_event[] === nothing && event isa AgentErrorEvent && is_context_overflow_error(event.error)
+                overflow_event[] = event
+                return nothing
+            end
+            return f(event)
+        end
+
+        msg_count_before = length(state.messages)
         total_before = state.usage.input + state.usage.cacheRead
-        result = agent_handler(f, agent, state, current_input, abort; model, kw...)
-        total_after = result.usage.input + result.usage.cacheRead
-        last_input_tokens[] = total_after - total_before
+        overflow_thrown = Ref{Union{Nothing, Exception}}(nothing)
+        result = try
+            agent_handler(guarded_f, agent, state, current_input, abort; model, kw...)
+        catch e
+            (e isa Exception && !isaborted(abort) && is_context_overflow_error(e)) || rethrow()
+            overflow_event[] = AgentErrorEvent(e)
+            overflow_thrown[] = e
+            state
+        end
+        _record_context_tokens!(result, total_before)
+
+        if overflow_event[] !== nothing
+            compacted = false
+            if !isaborted(abort)
+                # Drop the messages the rejected call appended so the retry does
+                # not duplicate the turn, and put them back if compaction fails.
+                failed_tail = AgentMessage[]
+                if length(result.messages) > msg_count_before
+                    append!(failed_tail, result.messages[msg_count_before + 1:end])
+                    Base.resize!(result.messages, msg_count_before)
+                end
+                compacted = compact!(agent, result, config, resolved_model; abort)
+                compacted || append!(result.messages, failed_tail)
+            end
+            if compacted
+                result.context_tokens = 0
+                total_before = result.usage.input + result.usage.cacheRead
+                result = agent_handler(f, agent, result, current_input, abort; model, kw...)
+                _record_context_tokens!(result, total_before)
+            else
+                # Compaction cannot help: leave the failed call exactly as it
+                # was, error and all.
+                overflow_thrown[] === nothing || throw(overflow_thrown[])
+                f(overflow_event[])
+            end
+        end
 
         return result
     end

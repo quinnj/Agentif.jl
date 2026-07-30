@@ -89,6 +89,72 @@ function make_base_handler(; with_tool_call::Bool = false, call_counter = Ref(0)
     end
 end
 
+# ── Compaction/session integration helpers ──
+
+# Minimal openai-completions SSE body carrying a single assistant text.
+function summary_sse_body(text::String)
+    chunks = String[]
+    isempty(text) || push!(chunks, "data: " * JSON.json((; choices = [(; index = 0, delta = (; content = text), finish_reason = nothing)])))
+    push!(chunks, "data: " * JSON.json((; choices = [(; index = 0, delta = (;), finish_reason = "stop")])))
+    push!(chunks, "data: [DONE]")
+    return join(chunks, "\n\n") * "\n\n"
+end
+
+# Mock provider used for compaction's summarization call.
+function start_summary_server(; summary_text::String = "SUMMARY", status::Int = 200,
+        error_message::String = "bad request", hits = Ref(0))
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        hits[] += 1
+        status == 200 || return HTTP.Response(
+            status,
+            ["Content-Type" => "application/json"],
+            JSON.json(Dict("error" => Dict("message" => error_message))),
+        )
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], summary_sse_body(summary_text))
+    end
+    port = HTTP.Sockets.getsockname(server.listener.server)[2]
+    return server, port
+end
+
+function compaction_test_model(port::Integer; contextWindow::Int)
+    return Model(
+        id = "test-model", name = "test-model", api = "openai-completions",
+        provider = "test", baseUrl = "http://127.0.0.1:$port", reasoning = false,
+        input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+        contextWindow = contextWindow, maxTokens = 4096,
+    )
+end
+
+# Base handler with a scripted per-call usage/tool-call program. Records the
+# messages it was handed on every call so tests can assert what the LLM would
+# have seen.
+function scripted_handler(; usage_inputs::Vector{Int} = Int[], tool_turns = Set{Int}(),
+        calls = Ref(0), observed = Vector{Vector{AgentMessage}}())
+    return function (f, agent::Agent, state::AgentState, input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+        calls[] += 1
+        n = calls[]
+        push!(observed, copy(state.messages))
+        msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+        Agentif.append_text!(msg, "reply-$n")
+        args = "{\"text\":\"t\"}"
+        n in tool_turns && push!(msg.tool_calls, AgentToolCall(; call_id = "call-$n", name = "echo_back", arguments = args))
+        tokens = n <= length(usage_inputs) ? usage_inputs[n] : 0
+        Agentif.append_state!(state, input, msg, Usage(; input = tokens, total = tokens))
+        if n in tool_turns
+            state.pending_tool_calls = Agentif.PendingToolCall[Agentif.PendingToolCall(; call_id = "call-$n", name = "echo_back", arguments = args)]
+            state.most_recent_stop_reason = :tool_calls
+        else
+            state.pending_tool_calls = Agentif.PendingToolCall[]
+            state.most_recent_stop_reason = :stop
+        end
+        return state
+    end
+end
+
+message_signatures(messages::Vector{AgentMessage}) = [(typeof(m), message_text(m)) for m in messages]
+message_signatures(state::AgentState) = message_signatures(state.messages)
+
 struct SessionTestChannel <: Agentif.AbstractChannel
     id::String
     user::Union{Nothing, Agentif.ChannelUser}
@@ -758,7 +824,9 @@ end
             push!(state.messages, compaction_msg)
             push!(state.messages, UserMessage("kept"))
             state.last_compaction = compaction_msg
-            state.compaction_kept_count = 1
+            # "kept" was produced during this evaluation, so nothing of the
+            # persisted prefix survived the cut.
+            state.persisted_prefix_count = 0
             # Also add the assistant response
             msg = AssistantMessage(; provider = "test", api = "test", model = "test")
             Agentif.append_text!(msg, "response")
@@ -776,10 +844,13 @@ end
         # Verify last_compaction was cleared
         @test result.last_compaction === nothing
 
-        # Loading branch should produce the compacted state
+        # Loading the branch reproduces the in-memory state exactly — including
+        # the kept message, which used to be dropped from persistence.
         loaded = load_branch(store, "chan:compact")
         @test loaded.messages[1] isa CompactionSummaryMessage
         @test loaded.messages[1].summary == "compacted"
+        @test message_signatures(loaded) == message_signatures(result)
+        @test any(m -> m isa UserMessage && message_text(m) == "kept", loaded.messages)
     end
 
     @testset "compaction_middleware passthrough" begin
@@ -855,6 +926,356 @@ end
         @test config.reserve_tokens == 16384
         @test config.keep_recent_tokens == 20000
     end
+
+    @testset "context overflow detection" begin
+        @test Agentif.is_context_overflow_error("This model's maximum context length is 8192 tokens")
+        @test Agentif.is_context_overflow_error("prompt is too long: 210000 tokens > 200000")
+        @test Agentif.is_context_overflow_error(ErrorException("Requested tokens exceed context window"))
+        @test !Agentif.is_context_overflow_error("rate limit exceeded")
+        @test !Agentif.is_context_overflow_error(ErrorException("invalid api key"))
+    end
+
+    @testset "estimate_context_tokens" begin
+        msgs = AgentMessage[UserMessage("a" ^ 400), UserMessage("b" ^ 400)]
+        @test Agentif.estimate_context_tokens(msgs) == 200
+        @test Agentif.estimate_context_tokens(AgentMessage[]) == 0
+        state = AgentState(; messages = msgs)
+        @test Agentif.current_context_tokens(state) == 200
+        state.context_tokens = 5000
+        @test Agentif.current_context_tokens(state) == 5000
+    end
+end
+
+# ── Compaction × session persistence ──
+#
+# These drive the real middleware stack (evaluate → session_middleware →
+# tool_call_middleware → compaction_middleware → scripted base handler) with a
+# mock provider serving the summarization call.
+
+new_sqlite_store() = Agentif.SQLiteSessionStore(tempname(); embed = nothing)
+
+const SESSION_STORE_FACTORIES = [
+    ("in-memory", () -> InMemorySessionStore()),
+    ("sqlite", new_sqlite_store),
+]
+
+@testset "compaction mid-evaluation round-trips through $label store" for (label, make_store) in SESSION_STORE_FACTORIES
+    hits = Ref(0)
+    server, port = start_summary_server(; summary_text = "SUMMARY-OF-OLD", hits)
+    try
+        store = make_store()
+        model = compaction_test_model(port; contextWindow = 1000)
+        tool = @tool "Echo text." echo_back(text::String) = "echoed"
+        agent = Agent(; id = "a", prompt = "p", model = model, apikey = "k", tools = [tool])
+        # threshold = 1000 - 200 = 800
+        config = CompactionConfig(; enabled = true, reserve_tokens = 200, keep_recent_tokens = 100)
+        calls = Ref(0)
+        observed = Vector{Vector{AgentMessage}}()
+        # call 3 (first call of the third evaluation) reports a context over the
+        # threshold and requests a tool, so compaction fires mid-evaluation.
+        base_handler = scripted_handler(; usage_inputs = [100, 100, 900, 100], tool_turns = Set([3]), calls, observed)
+
+        run_eval(msg_id, input) = Agentif.evaluate(
+            agent, input;
+            session_store = store, channel = SessionTestChannel("chan:mid", nothing, msg_id),
+            base_handler = base_handler, compaction_config = config,
+        )
+
+        run_eval("m1", "A" ^ 400)   # entry 1: [user, assistant]
+        run_eval("m2", "B" ^ 400)   # entry 2: [user, assistant]
+        result = run_eval("m3", "C" ^ 40)
+
+        @test calls[] == 4
+        @test hits[] == 1  # exactly one summarization call
+        @test result.messages[1] isa CompactionSummaryMessage
+        @test result.messages[1].summary == "SUMMARY-OF-OLD"
+
+        loaded = load_branch(store, "chan:mid")
+        # Invariant 1: reload == in-memory, message for message.
+        @test message_signatures(loaded) == message_signatures(result)
+        # The in-evaluation messages survived persistence (H1a).
+        @test any(m -> m isa UserMessage && message_text(m) == "C" ^ 40, loaded.messages)
+        @test count(m -> m isa AssistantMessage && message_text(m) == "reply-3", loaded.messages) == 1
+        # Kept pre-evaluation history appears exactly once, summarized history not at all (H1b).
+        @test count(m -> message_text(m) == "B" ^ 400, loaded.messages) == 1
+        @test !any(m -> message_text(m) == "A" ^ 400, loaded.messages)
+        @test count(m -> m isa CompactionSummaryMessage, loaded.messages) == 1
+        # Nothing lost: user turn, assistant turn, tool result, final assistant.
+        @test message_signatures(loaded) == [
+            (CompactionSummaryMessage, "SUMMARY-OF-OLD"),
+            (UserMessage, "B" ^ 400),
+            (AssistantMessage, "reply-2"),
+            (UserMessage, "C" ^ 40),
+            (AssistantMessage, "reply-3"),
+            (ToolResultMessage, "echoed"),
+            (AssistantMessage, "reply-4"),
+        ]
+
+        # Loading again from the same leaf is stable (no growth/duplication).
+        @test message_signatures(load_branch(store, "chan:mid")) == message_signatures(loaded)
+    finally
+        close(server)
+    end
+end
+
+@testset "restored over-threshold session compacts on the first call ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    hits = Ref(0)
+    server, port = start_summary_server(; summary_text = "RESTORED-SUMMARY", hits)
+    try
+        store = make_store()
+        # threshold = 300 - 100 = 200; the two seeded evaluations estimate ~204
+        model = compaction_test_model(port; contextWindow = 300)
+        agent = Agent(; id = "a", prompt = "p", model = model, apikey = "k")
+        config = CompactionConfig(; enabled = true, reserve_tokens = 100, keep_recent_tokens = 100)
+        calls = Ref(0)
+        observed = Vector{Vector{AgentMessage}}()
+        # Every call reports zero usage: the trigger must come from the restored
+        # messages themselves, not from an in-process token counter.
+        base_handler = scripted_handler(; usage_inputs = Int[], calls, observed)
+
+        run_eval(msg_id, input) = Agentif.evaluate(
+            agent, input;
+            session_store = store, channel = SessionTestChannel("chan:restore", nothing, msg_id),
+            base_handler = base_handler, compaction_config = config,
+        )
+
+        run_eval("m1", "A" ^ 400)
+        run_eval("m2", "B" ^ 400)
+        result = run_eval("m3", "hello again")
+
+        @test hits[] == 1
+        # Invariant 4: the third evaluation compacted BEFORE its first LLM call.
+        @test length(observed) == 3
+        @test observed[3][1] isa CompactionSummaryMessage
+        @test message_signatures(observed[3]) == [
+            (CompactionSummaryMessage, "RESTORED-SUMMARY"),
+            (UserMessage, "B" ^ 400),
+            (AssistantMessage, "reply-2"),
+        ]
+        loaded = load_branch(store, "chan:restore")
+        @test message_signatures(loaded) == message_signatures(result)
+        @test !any(m -> message_text(m) == "A" ^ 400, loaded.messages)
+    finally
+        close(server)
+    end
+end
+
+@testset "failed summary leaves history intact ($mode)" for (mode, server_kw) in [
+        ("provider error", (; status = 400, error_message = "bad request")),
+        ("empty summary", (; summary_text = "")),
+        ("whitespace summary", (; summary_text = "   \n ")),
+    ]
+    hits = Ref(0)
+    server, port = start_summary_server(; hits, server_kw...)
+    try
+        store = InMemorySessionStore()
+        model = compaction_test_model(port; contextWindow = 300)
+        agent = Agent(; id = "a", prompt = "p", model = model, apikey = "k")
+        config = CompactionConfig(; enabled = true, reserve_tokens = 100, keep_recent_tokens = 100)
+        calls = Ref(0)
+        observed = Vector{Vector{AgentMessage}}()
+        base_handler = scripted_handler(; calls, observed)
+
+        run_eval(msg_id, input) = Agentif.evaluate(
+            agent, input;
+            session_store = store, channel = SessionTestChannel("chan:failsum", nothing, msg_id),
+            base_handler = base_handler, compaction_config = config,
+        )
+
+        run_eval("m1", "A" ^ 400)
+        run_eval("m2", "B" ^ 400)
+        result = @test_logs (:warn,) match_mode = :any run_eval("m3", "still here")
+
+        # Invariant 3: summarization was attempted and failed; nothing was lost.
+        @test hits[] >= 1
+        @test !any(m -> m isa CompactionSummaryMessage, result.messages)
+        @test result.most_recent_stop_reason == :stop
+        @test message_signatures(observed[3]) == [
+            (UserMessage, "A" ^ 400),
+            (AssistantMessage, "reply-1"),
+            (UserMessage, "B" ^ 400),
+            (AssistantMessage, "reply-2"),
+        ]
+        loaded = load_branch(store, "chan:failsum")
+        @test message_signatures(loaded) == message_signatures(result)
+        @test message_signatures(loaded) == [
+            (UserMessage, "A" ^ 400),
+            (AssistantMessage, "reply-1"),
+            (UserMessage, "B" ^ 400),
+            (AssistantMessage, "reply-2"),
+            (UserMessage, "still here"),
+            (AssistantMessage, "reply-3"),
+        ]
+    finally
+        close(server)
+    end
+end
+
+@testset "provider context overflow compacts and retries once" begin
+    server, port = start_summary_server(; summary_text = "OVERFLOW-SUMMARY")
+    try
+        # Threshold (100000 - 16384) is far above the estimate, so the only
+        # compaction that can happen is the one the overflow error triggers.
+        model = compaction_test_model(port; contextWindow = 100000)
+        agent = Agent(; id = "a", prompt = "p", model = model, apikey = "k")
+        config = CompactionConfig(; enabled = true, reserve_tokens = 16384, keep_recent_tokens = 4)
+
+        overflow_handler(overflow_calls) = function (f, agent::Agent, state::AgentState, input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+            overflow_calls[] += 1
+            msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+            if overflow_calls[] == 1
+                f(Agentif.AgentErrorEvent(ErrorException("prompt is too long: 210000 tokens > 200000 maximum")))
+                Agentif.append_state!(state, input, msg, Usage())
+                state.pending_tool_calls = Agentif.PendingToolCall[]
+                state.most_recent_stop_reason = :error
+                return state
+            end
+            Agentif.append_text!(msg, "recovered")
+            Agentif.append_state!(state, input, msg, Usage())
+            state.pending_tool_calls = Agentif.PendingToolCall[]
+            state.most_recent_stop_reason = :stop
+            return state
+        end
+
+        seed_messages() = AgentMessage[
+            UserMessage("O" ^ 4000),
+            let m = AssistantMessage(; provider = "t", api = "t", model = "t"); Agentif.append_text!(m, "a1"); m end,
+            UserMessage("recent-keep"),
+            let m = AssistantMessage(; provider = "t", api = "t", model = "t"); Agentif.append_text!(m, "a2"); m end,
+        ]
+
+        calls = Ref(0)
+        events = Agentif.AgentEvent[]
+        handler = compaction_middleware(overflow_handler(calls), config)
+        result = handler(ev -> push!(events, ev), agent, AgentState(; messages = seed_messages()), "hello", Abort())
+
+        @test calls[] == 2  # one failure, one retry — never more
+        @test result.messages[1] isa CompactionSummaryMessage
+        @test result.messages[1].summary == "OVERFLOW-SUMMARY"
+        @test message_text(Agentif.last_assistant_message(result)) == "recovered"
+        @test result.most_recent_stop_reason == :stop
+        # The rejected turn is not duplicated, and the overflow error is not
+        # surfaced because the retry succeeded.
+        @test count(m -> m isa UserMessage && message_text(m) == "hello", result.messages) == 1
+        @test !any(ev -> ev isa Agentif.AgentErrorEvent, events)
+
+        # Nothing to compact → the original error is surfaced and the failed
+        # turn's messages are left in place.
+        calls2 = Ref(0)
+        events2 = Agentif.AgentEvent[]
+        handler2 = compaction_middleware(overflow_handler(calls2), config)
+        result2 = handler2(ev -> push!(events2, ev), agent, AgentState(), "hello", Abort())
+        @test calls2[] == 1
+        @test !any(m -> m isa CompactionSummaryMessage, result2.messages)
+        @test count(ev -> ev isa Agentif.AgentErrorEvent, events2) == 1
+        @test count(m -> m isa UserMessage && message_text(m) == "hello", result2.messages) == 1
+
+        # A thrown overflow that compaction cannot fix keeps propagating.
+        throwing_handler = function (f, agent::Agent, state::AgentState, input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+            throw(ErrorException("This model's maximum context length is 8192 tokens"))
+        end
+        handler3 = compaction_middleware(throwing_handler, config)
+        @test_throws ErrorException handler3(identity, agent, AgentState(), "hello", Abort())
+
+        # …but a thrown overflow with compactable history is retried.
+        calls4 = Ref(0)
+        retry_after_throw = function (f, agent::Agent, state::AgentState, input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+            calls4[] += 1
+            calls4[] == 1 && throw(ErrorException("This model's maximum context length is 8192 tokens"))
+            msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+            Agentif.append_text!(msg, "recovered-after-throw")
+            Agentif.append_state!(state, input, msg, Usage())
+            state.pending_tool_calls = Agentif.PendingToolCall[]
+            state.most_recent_stop_reason = :stop
+            return state
+        end
+        handler4 = compaction_middleware(retry_after_throw, config)
+        result4 = handler4(identity, agent, AgentState(; messages = seed_messages()), "hello", Abort())
+        @test calls4[] == 2
+        @test result4.messages[1] isa CompactionSummaryMessage
+        @test message_text(Agentif.last_assistant_message(result4)) == "recovered-after-throw"
+    finally
+        close(server)
+    end
+end
+
+@testset "compaction entry as branch leaf resumes with summary + kept ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    summary = CompactionSummaryMessage(; summary = "SUM", tokens_before = 10, compacted_at = 1.0)
+    append_entry!(store, SessionEntry(; id = "e1", messages = AgentMessage[UserMessage("discarded-old")]))
+    append_entry!(store, SessionEntry(; id = "e2", parent_id = "e1", messages = AgentMessage[UserMessage("kept-recent")]))
+    append_entry!(store, SessionEntry(;
+        id = "c1", parent_id = "e2", messages = AgentMessage[summary],
+        is_compaction = true, first_kept_entry_id = "e2",
+    ))
+    set_branch_leaf!(store, "branch-leaf", "c1")
+
+    # Invariant 2: leaf IS the compaction entry — summary + kept only.
+    loaded = load_branch(store, "branch-leaf")
+    @test message_signatures(loaded) == [(CompactionSummaryMessage, "SUM"), (UserMessage, "kept-recent")]
+
+    state, boundaries = load_branch_with_boundaries(store, "branch-leaf")
+    @test message_signatures(state) == message_signatures(loaded)
+    @test [b.entry_id for b in boundaries] == ["c1", "e2"]
+
+    # Everything compacted (no kept entries) stops at the compaction entry.
+    append_entry!(store, SessionEntry(;
+        id = "c2", parent_id = "e2", messages = AgentMessage[summary], is_compaction = true,
+    ))
+    set_branch_leaf!(store, "branch-all", "c2")
+    @test message_signatures(load_branch(store, "branch-all")) == [(CompactionSummaryMessage, "SUM")]
+end
+
+@testset "sqlite scrub_post! removes replayable content" begin
+    store = new_sqlite_store()
+    append_entry!(store, SessionEntry(; id = "s1", messages = AgentMessage[UserMessage("keep alpha")], post_id = "post-1"))
+    append_entry!(store, SessionEntry(; id = "s2", parent_id = "s1", messages = AgentMessage[UserMessage("secret bravo")], post_id = "post-2"))
+    append_entry!(store, SessionEntry(; id = "s3", parent_id = "s2", messages = AgentMessage[UserMessage("keep charlie")], post_id = "post-3"))
+    set_branch_leaf!(store, "branch-scrub", "s3")
+    @test length(load_branch(store, "branch-scrub").messages) == 3
+
+    scrub_post!(store, "post-2")
+
+    # Invariant 5: content is gone from the lineage, tree structure intact.
+    loaded = load_branch(store, "branch-scrub")
+    @test message_signatures(loaded) == [(UserMessage, "keep alpha"), (UserMessage, "keep charlie")]
+    @test !any(occursin("bravo", message_text(m)) for m in loaded.messages)
+    scrubbed = get_entry(store, "s2")
+    @test scrubbed !== nothing
+    @test isempty(scrubbed.messages)
+    @test scrubbed.is_deleted
+    @test scrubbed.parent_id == "s1"
+    @test get_entry(store, "s3").parent_id == "s2"
+    # Stored JSON no longer carries the message text at all.
+    row = iterate(SQLite.DBInterface.execute(store.db, "SELECT entry FROM session_entries WHERE entry_id = ?", ("s2",)))
+    @test !occursin("bravo", String(row[1].entry))
+    # Search doc removed.
+    results = LocalSearch.search(store.search_store, "secret bravo"; limit = 10)
+    @test !any(r -> r.id == "session:entry:s2", results)
+end
+
+@testset "queued evaluations persist distinctly and stay scrubbable ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    message_queue = Channel{Agentif.AgentTurnInput}(1)
+    put!(message_queue, "second message")
+    # Same channel object for both evaluations → same platform entry id.
+    ch = SessionTestChannel("chan:queued", nothing, "post-shared")
+    result = Agentif.evaluate(
+        make_agent(), "first message";
+        session_store = store, channel = ch, message_queue = message_queue,
+        base_handler = make_base_handler(), compaction_config = nothing,
+    )
+
+    # Invariant 6: both evaluations persisted (no UNIQUE violation, no clobber).
+    @test length(result.messages) == 4
+    loaded = load_branch(store, "chan:queued")
+    @test message_signatures(loaded) == message_signatures(result)
+    @test count(m -> m isa UserMessage && message_text(m) == "first message", loaded.messages) == 1
+    @test count(m -> m isa UserMessage && message_text(m) == "second message", loaded.messages) == 1
+
+    # …and scrubbing by the shared platform post id still clears both.
+    scrub_post!(store, "post-shared")
+    @test isempty(load_branch(store, "chan:queued").messages)
 end
 
 @testset "skills_middleware" begin
