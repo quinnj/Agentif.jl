@@ -45,12 +45,6 @@ jobs:
               Pkg.PackageSpec(name = "SnoopCompile", version = "3", uuid = "aa65fe97-06da-5843-b5b1-d5d13cad87d2"),
               Pkg.PackageSpec(name = "SnoopCompileCore", uuid = "e2b509da-e806-4183-be48-004708413034"),
           ])
-          # Precompile before measuring, in this same process, so the measurement
-          # below starts from fully-precompiled state. Without this the two
-          # measurements are not comparable: the branch measured first pays for
-          # precompilation while the one measured second runs warm, which showed
-          # up as a spurious ~9-invalidation "increase" on a branch that adds none.
-          Pkg.precompile()
           using SnoopCompileCore: @snoop_invalidations
           using SnoopCompile: filtermod, invalidation_trees, uinvalidated
           invalidations = @snoop_invalidations begin
@@ -83,12 +77,6 @@ jobs:
               Pkg.PackageSpec(name = "SnoopCompile", version = "3", uuid = "aa65fe97-06da-5843-b5b1-d5d13cad87d2"),
               Pkg.PackageSpec(name = "SnoopCompileCore", uuid = "e2b509da-e806-4183-be48-004708413034"),
           ])
-          # Precompile before measuring, in this same process, so the measurement
-          # below starts from fully-precompiled state. Without this the two
-          # measurements are not comparable: the branch measured first pays for
-          # precompilation while the one measured second runs warm, which showed
-          # up as a spurious ~9-invalidation "increase" on a branch that adds none.
-          Pkg.precompile()
           using SnoopCompileCore: @snoop_invalidations
           using SnoopCompile: filtermod, invalidation_trees, uinvalidated
           invalidations = @snoop_invalidations begin
