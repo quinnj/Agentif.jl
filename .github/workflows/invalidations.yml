@@ -51,7 +51,9 @@ jobs:
               import Agentif
           end
           for t in invalidation_trees(invalidations)
-              println("TRIGGER|", t.method.module, "|", t.method.name, "|", t.method.file, ":", t.method.line)
+              m = try; t.method; catch; nothing; end
+              m === nothing && (println("TRIGGER|<nomethod>|", typeof(t)); continue)
+              println("TRIGGER|", m.module, "|", m.name, "|", basename(String(m.file)), ":", m.line)
           end
           inv_owned = length(filtermod(Agentif, invalidation_trees(invalidations)))
           inv_total = length(uinvalidated(invalidations))
@@ -86,7 +88,9 @@ jobs:
               import Agentif
           end
           for t in invalidation_trees(invalidations)
-              println("TRIGGER|", t.method.module, "|", t.method.name, "|", t.method.file, ":", t.method.line)
+              m = try; t.method; catch; nothing; end
+              m === nothing && (println("TRIGGER|<nomethod>|", typeof(t)); continue)
+              println("TRIGGER|", m.module, "|", m.name, "|", basename(String(m.file)), ":", m.line)
           end
           inv_owned = length(filtermod(Agentif, invalidation_trees(invalidations)))
           inv_total = length(uinvalidated(invalidations))
