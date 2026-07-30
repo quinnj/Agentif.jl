@@ -70,6 +70,60 @@ function _init_custom_models!()
     )
     merge!(get!(() -> Dict{String, Model}(), _model_registry, "google-gemini-cli"), google_gemini_cli_models)
 
+    # Frontier Anthropic models that the upstream generated registry does not carry
+    # yet (it tops out at the 4.6 generation). Prices, context windows and max
+    # output are from Anthropic's model overview docs, retrieved 2026-07-30:
+    # https://platform.claude.com/docs/en/docs/about-claude/models/overview
+    # Cache prices follow Anthropic's published multipliers (read 0.1x input,
+    # write 1.25x input), which the upstream 4.6 entries also use.
+    # NOTE: these models do NOT support extended thinking
+    # (`thinking.type = "enabled"`); they use adaptive thinking with an `effort`
+    # parameter. `reasoning = true` here means "reasons", not "accepts a
+    # thinking budget".
+    function anthropic_model(
+            model_id::String,
+            name::String,
+            input_cost::Float64,
+            output_cost::Float64;
+            context_window::Int = 1000000,
+            max_tokens::Int = 128000,
+        )
+        return Model(
+            id = model_id,
+            name = name,
+            api = "anthropic-messages",
+            provider = "anthropic",
+            baseUrl = "https://api.anthropic.com",
+            reasoning = true,
+            input = ["text", "image"],
+            cost = Dict(
+                "input" => input_cost,
+                "output" => output_cost,
+                # round: 3.0 * 0.1 is 0.30000000000000004 in binary floating point,
+                # and these are our own derived values, not upstream's verbatim ones
+                "cacheRead" => round(input_cost * 0.1; digits = 6),
+                "cacheWrite" => round(input_cost * 1.25; digits = 6),
+            ),
+            contextWindow = context_window,
+            maxTokens = max_tokens,
+            headers = nothing,
+        )
+    end
+
+    anthropic_models = Dict{String, Model}(
+        "claude-fable-5" => anthropic_model("claude-fable-5", "Claude Fable 5", 10.0, 50.0),
+        "claude-opus-5" => anthropic_model("claude-opus-5", "Claude Opus 5", 5.0, 25.0),
+        # Standard pricing; an introductory $2/$10 rate applies through 2026-08-31.
+        "claude-sonnet-5" => anthropic_model("claude-sonnet-5", "Claude Sonnet 5", 3.0, 15.0),
+        "claude-opus-4-8" => anthropic_model("claude-opus-4-8", "Claude Opus 4.8", 5.0, 25.0),
+        "claude-opus-4-7" => anthropic_model("claude-opus-4-7", "Claude Opus 4.7", 5.0, 25.0),
+    )
+    # Generated entries win where they already exist; only fill the gaps.
+    anthropic_registry = get!(() -> Dict{String, Model}(), _model_registry, "anthropic")
+    for (k, v) in anthropic_models
+        haskey(anthropic_registry, k) || (anthropic_registry[k] = v)
+    end
+
     # OpenAI Codex models (via ChatGPT OAuth)
     function codex_model(
             model_id::String,

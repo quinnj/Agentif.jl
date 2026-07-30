@@ -314,3 +314,141 @@ end
     @test v54 !== nothing
     @test v54.id == "gpt-5.4"
 end
+
+@testset "Generated model registry" begin
+    # Roster shipped by models_generated.jl + models_custom.jl. Pinned explicitly so
+    # the structural sweep below ignores providers other testsets register ad hoc,
+    # and so an upstream provider appearing/disappearing is a deliberate test update.
+    registry_providers = [
+        "amazon-bedrock", "anthropic", "azure-openai-responses", "cerebras",
+        "github-copilot", "google", "google-antigravity", "google-gemini-cli",
+        "google-vertex", "groq", "huggingface", "kimi-coding", "minimax",
+        "minimax-cn", "mistral", "openai", "openai-codex", "opencode",
+        "opencode-go", "openrouter", "vercel-ai-gateway", "xai", "zai",
+    ]
+    @test issubset(registry_providers, LLMProviders.getProviders())
+    all_models = [m for p in registry_providers for m in LLMProviders.getModels(p)]
+    # Lower bound, not an exact count: models_custom.jl layers additional entries on
+    # top, so an exact assertion fails every time a custom model is added.
+    @test length(all_models) >= 784
+
+    # (a) Current frontier models are present with the prices upstream publishes.
+    # Values are verbatim from pi-mono packages/ai/src/models.generated.ts.
+    for (provider, id, input, output) in [
+            ("anthropic", "claude-sonnet-4-6", 3.0, 15.0),
+            ("anthropic", "claude-opus-4-6", 5.0, 25.0),
+            ("anthropic", "claude-haiku-4-5", 1.0, 5.0),
+            ("openai", "gpt-5.4", 2.5, 15.0),
+            ("google", "gemini-3.1-pro-preview", 2.0, 12.0),
+            ("zai", "glm-5", 1.0, 3.2),
+        ]
+        model = LLMProviders.getModel(provider, id)
+        @test model !== nothing
+        if model !== nothing
+            @test model.id == id
+            @test model.provider == provider
+            @test model.cost["input"] == input
+            @test model.cost["output"] == output
+            @test model.contextWindow > 0
+            @test model.maxTokens > 0
+        end
+    end
+
+    # Providers that only exist after the 2026-07 registry refresh.
+    for provider in ["azure-openai-responses", "huggingface", "kimi-coding", "opencode-go"]
+        @test !isempty(LLMProviders.getModels(provider))
+    end
+
+    # (b) Structural sanity across every registered model.
+    # `openrouter/auto` carries a -1_000_000 sentinel upstream (dynamic pricing
+    # resolved per request), so it is the one documented exception.
+    negative_cost_sentinels = Set([("openrouter", "openrouter/auto")])
+    for model in all_models
+        key = (model.provider, model.id)
+        if key in negative_cost_sentinels
+            @test model.cost["input"] == -1.0e6
+        else
+            @test all(>=(0.0), values(model.cost))
+        end
+        @test model.contextWindow > 0
+        @test model.maxTokens > 0
+        @test !isempty(model.id)
+        @test !isempty(model.api)
+        @test !isempty(model.input)
+    end
+
+    # Every model must expose the four cost keys `calculateCost` reads.
+    @test all(m -> issetequal(keys(m.cost), ["input", "output", "cacheRead", "cacheWrite"]), all_models)
+
+    # (c) Costs are carried through verbatim from upstream, including the
+    # binary-float dust in the source data. Fidelity beats cosmetics: rounding
+    # here would silently diverge from pi-mono's published numbers.
+    olmo = LLMProviders.getModel("openrouter", "allenai/olmo-3.1-32b-instruct")
+    @test olmo !== nothing
+    @test olmo !== nothing && olmo.cost["input"] === 0.19999999999999998
+    @test olmo !== nothing && olmo.cost["input"] !== 0.2
+
+    # models_custom.jl is layered on top of the generated file and must keep winning.
+    spark = LLMProviders.getModel("openai-codex", "gpt-5.3-codex-spark")
+    @test spark !== nothing && spark.maxTokens == 32000          # custom value, not upstream's
+    for id in ["gpt-5.1", "gpt-5.2", "gpt-5.3-codex", "gpt-5.4"]
+        m = LLMProviders.getModel("openai-codex", id)
+        @test m !== nothing
+        # ChatGPT-OAuth transport is subscription-billed; custom zeroes upstream's API prices.
+        @test m !== nothing && all(==(0.0), values(m.cost))
+    end
+    @test LLMProviders.getModel("openai-codex", "gpt-codex-5.3") !== nothing  # custom-only alias
+
+    # Upstream now ships a real `minimax` provider; the custom overlay adds its
+    # OpenAI-compatible entry alongside (keyed by the OpenRouter id, `id` field
+    # holds the MiniMax API name -- a pre-existing quirk, asserted so it is not
+    # broken silently by a refresh).
+    @test LLMProviders.getModel("minimax", "MiniMax-M2.5") !== nothing
+    m21 = LLMProviders.getModel("minimax", "minimax/minimax-m2.1")
+    @test m21 !== nothing
+    @test m21 !== nothing && m21.baseUrl == "https://api.minimax.io/v1"
+    @test m21 !== nothing && m21.id == "MiniMax-M2.1"
+
+    # google-gemini-cli entries stay on the Cloud Code Assist endpoint at $0.
+    for model in LLMProviders.getModels("google-gemini-cli")
+        @test model.api == "google-gemini-cli"
+        @test model.baseUrl == "https://cloudcode-pa.googleapis.com"
+        @test all(==(0.0), values(model.cost))
+    end
+end
+
+@testset "Custom frontier Anthropic models" begin
+    # Upstream's generated registry tops out at the 4.6 generation; models_custom.jl
+    # fills in the current frontier. Prices from Anthropic's model overview docs
+    # (retrieved 2026-07-30).
+    expected = Dict(
+        "claude-fable-5"  => (10.0, 50.0),
+        "claude-opus-5"   => (5.0, 25.0),
+        "claude-sonnet-5" => (3.0, 15.0),   # standard rate; intro $2/$10 ends 2026-08-31
+        "claude-opus-4-8" => (5.0, 25.0),
+        "claude-opus-4-7" => (5.0, 25.0),
+    )
+    for (id, (input_cost, output_cost)) in expected
+        model = LLMProviders.getModel("anthropic", id)
+        @test model !== nothing
+        model === nothing && continue
+        @test model.api == "anthropic-messages"
+        @test model.provider == "anthropic"
+        @test model.cost["input"] == input_cost
+        @test model.cost["output"] == output_cost
+        # Anthropic's published cache multipliers: read 0.1x, write 1.25x input.
+        @test model.cost["cacheRead"] == round(input_cost * 0.1; digits = 6)
+        @test model.cost["cacheWrite"] == round(input_cost * 1.25; digits = 6)
+        # derived values must not carry binary-float dust of our own making
+        @test model.cost["cacheRead"] != 0.30000000000000004
+        @test model.contextWindow == 1000000
+        @test model.maxTokens == 128000
+        @test model.reasoning
+    end
+
+    # Custom entries must only fill gaps, never shadow a generated model.
+    haiku = LLMProviders.getModel("anthropic", "claude-haiku-4-5")
+    @test haiku !== nothing
+    @test haiku.cost["input"] == 1
+    @test haiku.contextWindow == 200000
+end
