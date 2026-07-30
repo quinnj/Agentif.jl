@@ -112,12 +112,192 @@ function anthropic_internal_tool_name(tool_name_reverse_map::Dict{String, String
     return get(() -> name, tool_name_reverse_map, name)
 end
 
-function anthropic_oauth_system_blocks(prompt::String)
+# Prompt caching, mirroring pi-mono's anthropic provider (getCacheControl,
+# packages/ai/src/providers/anthropic.ts): a breakpoint on the system prompt and one
+# on the last user message, so the whole conversation prefix is served from cache
+# instead of being re-billed at uncached rates every turn.
+# `resolve_openai_cache_retention` is the shared none/short/long resolver.
+function anthropic_cache_control(base_url::AbstractString, cache_retention)
+    retention = resolve_openai_cache_retention(cache_retention)
+    retention == "none" && return nothing
+    # The 1h beta TTL only exists on Anthropic's own endpoint; proxies reject it.
+    ttl = (retention == "long" && occursin("api.anthropic.com", lowercase(String(base_url)))) ? "1h" : nothing
+    return AnthropicMessages.CacheControl(; type = "ephemeral", ttl)
+end
+
+function anthropic_system_blocks(prompt::String, cache_control::Union{Nothing, AnthropicMessages.CacheControl})
+    isempty(strip(prompt)) && return nothing
+    return AnthropicMessages.TextBlock[AnthropicMessages.TextBlock(; text = prompt, cache_control)]
+end
+
+function anthropic_oauth_system_blocks(prompt::String, cache_control::Union{Nothing, AnthropicMessages.CacheControl} = AnthropicMessages.CacheControl(; type = "ephemeral"))
     blocks = AnthropicMessages.TextBlock[]
-    cache_control = AnthropicMessages.CacheControl(; type = "ephemeral")
     push!(blocks, AnthropicMessages.TextBlock(; text = "You are Claude Code, Anthropic's official CLI for Claude.", cache_control))
     isempty(prompt) || push!(blocks, AnthropicMessages.TextBlock(; text = prompt, cache_control))
     return blocks
+end
+
+# Breakpoint on the last block of the trailing user message. Anthropic allows at most
+# four; the OAuth spoof path already spends two on its system blocks, so this one is
+# additive rather than a second pass over the system prompt.
+function anthropic_apply_cache_control!(messages::Vector{AnthropicMessages.Message}, cache_control::Union{Nothing, AnthropicMessages.CacheControl})
+    (cache_control === nothing || isempty(messages)) && return messages
+    last_message = messages[end]
+    last_message.role == "user" || return messages
+    content = last_message.content
+    if content isa AbstractString
+        block = AnthropicMessages.TextBlock(; text = content, cache_control)
+        messages[end] = AnthropicMessages.Message(; role = "user", content = AnthropicMessages.ContentBlock[block])
+    elseif content isa AbstractVector && !isempty(content)
+        block = content[end]
+        if block isa AnthropicMessages.TextBlock || block isa AnthropicMessages.ImageBlock || block isa AnthropicMessages.ToolResultBlock
+            block.cache_control = cache_control
+        end
+    end
+    return messages
+end
+
+# --- Per-model thinking/effort capabilities -----------------------------------------
+# Source: Anthropic docs fetched 2026-07-30 —
+#   /docs/en/build-with-claude/thinking  and  /docs/en/build-with-claude/effort.
+# There are two distinct thinking mechanisms and the newest models only support the
+# newer one, so selection is capability-driven rather than a single global mapping.
+
+anthropic_model_matches(model_id::AbstractString, patterns) =
+    any(p -> occursin(p, lowercase(String(model_id))), patterns)
+
+# Adaptive-only: extended thinking (`budget_tokens`) returns a 400 here. These are also
+# the models that reject non-default temperature/top_p/top_k on *every* request.
+const ANTHROPIC_ADAPTIVE_ONLY_MODELS = (
+    "opus-4-7", "opus-4.7", "opus-4-8", "opus-4.8",
+    "opus-5", "sonnet-5", "fable-5", "mythos-5", "mythos-preview",
+)
+
+# The 4.6 family supports both mechanisms (extended thinking deprecated there).
+const ANTHROPIC_ADAPTIVE_THINKING_MODELS = (
+    ANTHROPIC_ADAPTIVE_ONLY_MODELS..., "opus-4-6", "opus-4.6", "sonnet-4-6", "sonnet-4.6",
+)
+
+# Thinking cannot be turned off at all on these; `{type: "disabled"}` is rejected.
+const ANTHROPIC_ALWAYS_THINKING_MODELS = ("fable-5", "mythos-5", "mythos-preview")
+
+# `effort` also works on Opus 4.5, the one extended-thinking-only model that supports it
+# (there it composes with `budget_tokens`).
+const ANTHROPIC_EFFORT_MODELS = (ANTHROPIC_ADAPTIVE_THINKING_MODELS..., "opus-4-5", "opus-4.5")
+
+# `max` is available on the 4.6 family and newer; `xhigh` arrived with Opus 4.7 and is
+# not available on Mythos Preview or the 4.6 family.
+const ANTHROPIC_MAX_EFFORT_MODELS = ANTHROPIC_ADAPTIVE_THINKING_MODELS
+const ANTHROPIC_XHIGH_EFFORT_MODELS = (
+    "opus-4-7", "opus-4.7", "opus-4-8", "opus-4.8", "opus-5", "sonnet-5", "fable-5", "mythos-5",
+)
+
+anthropic_supports_adaptive_thinking(model_id::AbstractString) = anthropic_model_matches(model_id, ANTHROPIC_ADAPTIVE_THINKING_MODELS)
+anthropic_supports_extended_thinking(model_id::AbstractString) = !anthropic_model_matches(model_id, ANTHROPIC_ADAPTIVE_ONLY_MODELS)
+anthropic_thinking_always_on(model_id::AbstractString) = anthropic_model_matches(model_id, ANTHROPIC_ALWAYS_THINKING_MODELS)
+anthropic_supports_effort(model_id::AbstractString) = anthropic_model_matches(model_id, ANTHROPIC_EFFORT_MODELS)
+anthropic_supports_max_effort(model_id::AbstractString) = anthropic_model_matches(model_id, ANTHROPIC_MAX_EFFORT_MODELS)
+anthropic_supports_xhigh_effort(model_id::AbstractString) = anthropic_model_matches(model_id, ANTHROPIC_XHIGH_EFFORT_MODELS)
+# Non-default temperature/top_p/top_k are rejected outright on the adaptive-only models;
+# on older models they only conflict while thinking is on.
+anthropic_rejects_sampling_params(model_id::AbstractString) = anthropic_model_matches(model_id, ANTHROPIC_ADAPTIVE_ONLY_MODELS)
+# Interleaved thinking is automatic under adaptive thinking (no header); under extended
+# thinking it needs a beta header, and Claude Haiku 4.5 does not support it at all.
+anthropic_needs_interleaved_thinking_beta(model_id::AbstractString) =
+    !anthropic_supports_adaptive_thinking(model_id) && !anthropic_model_matches(model_id, ("haiku-4-5", "haiku-4.5"))
+
+# pi-mono's mapThinkingLevelToEffort, made capability-driven: a level the model does not
+# support steps down to the highest rung it does support.
+function anthropic_effort_for_level(level::AbstractString, model_id::AbstractString)
+    lvl = lowercase(strip(String(level)))
+    lvl == "minimal" && (lvl = "low")
+    lvl in ("low", "medium", "high") && return lvl
+    if lvl in ("xhigh", "max")
+        lvl == "xhigh" && anthropic_supports_xhigh_effort(model_id) && return "xhigh"
+        anthropic_supports_max_effort(model_id) && return "max"
+        return "high"
+    end
+    return "high"
+end
+
+const ANTHROPIC_DEFAULT_THINKING_BUDGETS = Dict("minimal" => 1024, "low" => 2048, "medium" => 8192, "high" => 16384)
+const ANTHROPIC_MIN_OUTPUT_TOKENS = 1024
+
+# pi-mono's adjustMaxTokensForThinking: grow max_tokens to make room for the thinking
+# budget, clamp to the model ceiling, and keep budget_tokens strictly below max_tokens
+# (the API rejects budget_tokens >= max_tokens).
+function anthropic_adjust_max_tokens_for_thinking(base_max_tokens::Int, model_max_tokens::Int, level::AbstractString)
+    lvl = lowercase(strip(String(level)))
+    # Budget-based models have no rung above "high".
+    lvl in ("xhigh", "max") && (lvl = "high")
+    budget = get(() -> ANTHROPIC_DEFAULT_THINKING_BUDGETS["high"], ANTHROPIC_DEFAULT_THINKING_BUDGETS, lvl)
+    max_tokens = min(base_max_tokens + budget, model_max_tokens)
+    if max_tokens <= budget
+        budget = max(0, max_tokens - ANTHROPIC_MIN_OUTPUT_TOKENS)
+    end
+    return (; max_tokens, thinking_budget = budget)
+end
+
+# Maps a reasoning-effort level onto the request fields, picking the mechanism the model
+# actually supports: adaptive thinking where available, extended thinking (budget_tokens)
+# otherwise. `output_config.effort` rides along on every model that supports effort,
+# including Opus 4.5 where it composes with a token budget.
+function anthropic_thinking_request(model::Model, level, base_max_tokens::Int)
+    (level === nothing || !model.reasoning) && return (; thinking = nothing, output_config = nothing, max_tokens = base_max_tokens)
+    lvl = string(level)
+    output_config = anthropic_supports_effort(model.id) ?
+        AnthropicMessages.OutputConfig(; effort = anthropic_effort_for_level(lvl, model.id)) : nothing
+    if anthropic_supports_adaptive_thinking(model.id)
+        # `display` defaults to "omitted" on the 5-generation models, which would stream
+        # empty thinking blocks; Agentif surfaces reasoning, so ask for summaries.
+        return (;
+            thinking = AnthropicMessages.ThinkingConfig(; type = "adaptive", display = "summarized"),
+            output_config,
+            max_tokens = base_max_tokens,
+        )
+    end
+    adjusted = anthropic_adjust_max_tokens_for_thinking(base_max_tokens, model.maxTokens, lvl)
+    return (;
+        thinking = AnthropicMessages.ThinkingConfig(; type = "enabled", budget_tokens = adjusted.thinking_budget),
+        output_config,
+        max_tokens = adjusted.max_tokens,
+    )
+end
+
+function anthropic_thinking_type(thinking)
+    thinking isa AnthropicMessages.ThinkingConfig && return thinking.type
+    thinking isa AbstractDict && return get(() -> get(() -> nothing, thinking, :type), thinking, "type")
+    thinking isa NamedTuple && return get(() -> nothing, thinking, :type)
+    return nothing
+end
+
+# Caller-supplied `thinking` kwargs win over the derived config; we still need to know
+# whether thinking ends up on so the sampling guard and beta header stay correct.
+function anthropic_thinking_is_enabled(thinking)
+    thinking === nothing && return false
+    type = anthropic_thinking_type(thinking)
+    type === nothing && return true
+    return String(type) != "disabled"
+end
+
+# Reconcile a caller-supplied thinking config with the model's capabilities so an
+# unsupported shape degrades to the supported mechanism instead of returning a 400.
+function anthropic_normalize_thinking(thinking, model::Model, base_max_tokens::Int)
+    thinking === nothing && return (; thinking = nothing, max_tokens = base_max_tokens)
+    type = anthropic_thinking_type(thinking)
+    type = type === nothing ? nothing : String(type)
+    if type == "disabled" && anthropic_thinking_always_on(model.id)
+        @warn "Thinking cannot be disabled on this model; ignoring thinking=disabled" model = model.id
+        return (; thinking = nothing, max_tokens = base_max_tokens)
+    elseif type == "enabled" && !anthropic_supports_extended_thinking(model.id)
+        @warn "Extended thinking (budget_tokens) is not supported on this model; falling back to adaptive thinking" model = model.id
+        return (; thinking = AnthropicMessages.ThinkingConfig(; type = "adaptive", display = "summarized"), max_tokens = base_max_tokens)
+    elseif type == "adaptive" && !anthropic_supports_adaptive_thinking(model.id)
+        @warn "Adaptive thinking is not supported on this model; falling back to extended thinking" model = model.id
+        adjusted = anthropic_adjust_max_tokens_for_thinking(base_max_tokens, model.maxTokens, "high")
+        return (; thinking = AnthropicMessages.ThinkingConfig(; type = "enabled", budget_tokens = adjusted.thinking_budget), max_tokens = adjusted.max_tokens)
+    end
+    return (; thinking, max_tokens = base_max_tokens)
 end
 
 function anthropic_message_from_agent(msg::AgentMessage, tool_name_map::Dict{String, String}, model::Model)
@@ -247,6 +427,20 @@ function anthropic_merge_usage(base::Union{Nothing, AnthropicMessages.Usage}, de
     )
 end
 
+# Anthropic pauses long-running turns with stop_reason "pause_turn". The documented
+# continuation is to re-send the same request with the paused assistant content
+# appended verbatim and *no* extra user turn; the server resumes where it left off.
+# https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+const ANTHROPIC_MAX_PAUSE_TURN_RESUBMITS = 3
+
+function anthropic_should_resubmit_paused(reason::Union{Nothing, String}, attempt::Int, assistant_message::AssistantMessage)
+    reason == "pause_turn" || return false
+    attempt <= ANTHROPIC_MAX_PAUSE_TURN_RESUBMITS || return false
+    # A pending client tool call outranks the pause: the caller owes us a tool result
+    # before the turn can continue.
+    return isempty(assistant_message.tool_calls)
+end
+
 function anthropic_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
     if !isempty(tool_calls)
         return :tool_calls
@@ -262,7 +456,8 @@ function anthropic_stop_reason(reason::Union{Nothing, String}, tool_calls::Vecto
     elseif reason == "refusal"
         return :error
     elseif reason == "pause_turn"
-        # The server paused a long-running turn; auto-resubmitting to continue is future work.
+        # The stream driver resubmits paused turns (bounded); reaching here means the
+        # resubmit budget ran out, so the turn is reported as a normal stop.
         return :stop
     elseif reason == "error"
         # Synthesized by the stream driver on HTTP errors.
@@ -395,7 +590,9 @@ function anthropic_event_callback(
                 sr isa AbstractString && !isempty(sr) && (stop_reason[] = sr)
             end
         elseif parsed isa AnthropicMessages.StreamMessageStopEvent
-            if started[] && !ended[]
+            # A paused turn is resumed by the driver into this same assistant message,
+            # so hold the end event back until the continuation finishes.
+            if started[] && !ended[] && stop_reason[] != "pause_turn"
                 ended[] = true
                 f(MessageEndEvent(:assistant, assistant_message))
             end

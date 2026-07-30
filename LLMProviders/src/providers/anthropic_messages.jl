@@ -13,6 +13,8 @@ schema(::Type{T}) where {T} = JSONSchema.schema(
 
 @omit_null @kwarg struct CacheControl
     type::String
+    # "1h" opts into the extended-TTL cache; omitted means the default 5m ephemeral cache.
+    ttl::Union{Nothing, String} = nothing
 end
 
 @omit_null @kwarg mutable struct TextBlock
@@ -38,9 +40,10 @@ end
     data::String
 end
 
-@omit_null @kwarg struct ImageBlock
+@omit_null @kwarg mutable struct ImageBlock
     type::String = "image"
     source::ImageSource
+    cache_control::Union{Nothing, CacheControl} = nothing
 end
 
 @omit_null @kwarg mutable struct ToolUseBlock
@@ -52,11 +55,12 @@ end
 
 const ToolResultContentBlock = Union{TextBlock, ImageBlock}
 
-@omit_null @kwarg struct ToolResultBlock
+@omit_null @kwarg mutable struct ToolResultBlock
     type::String = "tool_result"
     tool_use_id::String
     content::Union{String, Vector{ToolResultContentBlock}}
     is_error::Union{Nothing, Bool} = nothing
+    cache_control::Union{Nothing, CacheControl} = nothing
 end
 
 # Catch-all so unrecognized content block types (e.g. server_tool_use) parse
@@ -243,6 +247,22 @@ JSON.@choosetype StreamEvent x -> begin
     end
 end
 
+# Two distinct mechanisms:
+#   adaptive thinking  -> {"type": "adaptive"} (+ optional "display")
+#   extended thinking  -> {"type": "enabled", "budget_tokens": N}
+#   off                -> {"type": "disabled"} (rejected on always-thinking models)
+# `display` is "omitted" | "summarized"; it is invalid with type "disabled".
+@omit_null @kwarg struct ThinkingConfig
+    type::String = "adaptive"
+    budget_tokens::Union{Nothing, Int} = nothing
+    display::Union{Nothing, String} = nothing
+end
+
+# Carries the effort level: low | medium | high | xhigh | max (model dependent).
+@omit_null @kwarg struct OutputConfig
+    effort::Union{Nothing, String} = nothing
+end
+
 @omit_null @kwarg struct Request
     model::String
     messages::Vector{Message}
@@ -254,6 +274,11 @@ end
     temperature::Union{Nothing, Float64} = nothing
     top_p::Union{Nothing, Float64} = nothing
     stop_sequences::Union{Nothing, Vector{String}} = nothing
+    # `Any` (like tool_choice) so callers can pass a raw Dict/NamedTuple through
+    # `model.kw`/stream kwargs while the adapter builds the typed structs above.
+    thinking::Union{Nothing, Any} = nothing
+    output_config::Union{Nothing, Any} = nothing
+    metadata::Union{Nothing, Any} = nothing
 end
 
 end # module AnthropicMessages

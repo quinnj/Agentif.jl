@@ -171,6 +171,73 @@ end
     @test response.content[2].data == "opaque"
     @test response.content[3] isa AnthropicMessages.TextBlock
     @test response.content[3].text == "done"
+
+    # adaptive thinking + effort serialize to the documented wire shapes
+    adaptive = AnthropicMessages.Request(
+        ; model = "claude-opus-5",
+        messages = AnthropicMessages.Message[AnthropicMessages.Message(; role = "user", content = "hi")],
+        max_tokens = 4096,
+        thinking = AnthropicMessages.ThinkingConfig(; type = "adaptive", display = "summarized"),
+        output_config = AnthropicMessages.OutputConfig(; effort = "xhigh"),
+        metadata = Dict("user_id" => "u-1"),
+    )
+    adaptive_body = JSON.parse(JSON.json(adaptive))
+    @test adaptive_body["thinking"]["type"] == "adaptive"
+    @test adaptive_body["thinking"]["display"] == "summarized"
+    @test !haskey(adaptive_body["thinking"], "budget_tokens")
+    @test adaptive_body["output_config"]["effort"] == "xhigh"
+    @test adaptive_body["metadata"]["user_id"] == "u-1"
+    @test !haskey(adaptive_body, "temperature")
+
+    # budget-based thinking keeps budget_tokens strictly below max_tokens
+    budgeted = AnthropicMessages.Request(
+        ; model = "claude-haiku-4-5",
+        messages = AnthropicMessages.Message[],
+        max_tokens = 12288,
+        thinking = AnthropicMessages.ThinkingConfig(; type = "enabled", budget_tokens = 8192),
+    )
+    budget_body = JSON.parse(JSON.json(budgeted))
+    @test budget_body["thinking"]["type"] == "enabled"
+    @test !haskey(budget_body["thinking"], "display")
+    @test budget_body["thinking"]["budget_tokens"] == 8192
+    @test budget_body["thinking"]["budget_tokens"] < budget_body["max_tokens"]
+    @test !haskey(budget_body, "output_config")
+
+    # cache_control breakpoints ride on system blocks and on user content blocks
+    cached = AnthropicMessages.Request(
+        ; model = "claude-opus-5",
+        messages = AnthropicMessages.Message[
+            AnthropicMessages.Message(
+                ; role = "user",
+                content = AnthropicMessages.ContentBlock[
+                    AnthropicMessages.ToolResultBlock(
+                        ; tool_use_id = "t1",
+                        content = "ok",
+                        cache_control = AnthropicMessages.CacheControl(; type = "ephemeral"),
+                    ),
+                ],
+            ),
+        ],
+        max_tokens = 1024,
+        system = AnthropicMessages.TextBlock[
+            AnthropicMessages.TextBlock(
+                ; text = "sys",
+                cache_control = AnthropicMessages.CacheControl(; type = "ephemeral", ttl = "1h"),
+            ),
+        ],
+    )
+    cached_body = JSON.parse(JSON.json(cached))
+    @test cached_body["system"][1]["cache_control"]["type"] == "ephemeral"
+    @test cached_body["system"][1]["cache_control"]["ttl"] == "1h"
+    tool_result_body = cached_body["messages"][1]["content"][1]
+    @test tool_result_body["cache_control"]["type"] == "ephemeral"
+    # the default 5m ephemeral cache omits the ttl field entirely
+    @test !haskey(tool_result_body["cache_control"], "ttl")
+
+    image_block = AnthropicMessages.ImageBlock(; source = AnthropicMessages.ImageSource(; media_type = "image/png", data = "AAA"))
+    @test JSON.parse(JSON.json(image_block)) |> b -> !haskey(b, "cache_control")
+    image_block.cache_control = AnthropicMessages.CacheControl(; type = "ephemeral")
+    @test JSON.parse(JSON.json(image_block))["cache_control"]["type"] == "ephemeral"
 end
 
 @testset "GoogleGenerativeAI" begin
