@@ -71,11 +71,39 @@ function _zdt_to_unix(zdt::ZonedDateTime)
     return datetime2unix(DateTime(astimezone(zdt, tz"UTC")))
 end
 
+"""
+    _fetch_one(db, sql, params) -> row or nothing
+
+Fetch the first row of a query and **close the cursor**.
+
+`SQLite.DBInterface.execute` returns a lazy cursor; taking only its first row with
+`iterate` leaves the statement mid-step, which under WAL pins that connection to the
+read snapshot it started with. The connection then stops seeing other connections'
+commits — verified directly: a partially-consumed SELECT made a second connection's
+committed INSERT permanently invisible to the first. (The same lazy-cursor mechanic in
+a row-returning `PRAGMA` is what left `journal_mode=WAL` holding its lock and made
+every second connection fail with "database is locked".)
+"""
+function _fetch_one(db::SQLite.DB, sql::String, params = ())
+    cursor = SQLite.DBInterface.execute(db, sql, params)
+    state = iterate(cursor)
+    # A row is a lazy view over the live statement, so its columns must be copied
+    # out before the cursor closes — reading them afterwards yields `missing`.
+    result = if state === nothing
+        nothing
+    else
+        row = state[1]
+        names = Tuple(propertynames(row))
+        NamedTuple{names}(map(n -> getproperty(row, n), names))
+    end
+    SQLite.DBInterface.close!(cursor)
+    return result
+end
+
 function _get_agent_metadata(db::SQLite.DB, key::String)
-    row = iterate(SQLite.DBInterface.execute(db,
-        "SELECT value FROM claw_agent_metadata WHERE key = ?", (key,)))
+    row = _fetch_one(db, "SELECT value FROM claw_agent_metadata WHERE key = ?", (key,))
     row === nothing && return nothing
-    return String(row[1].value)
+    return String(row.value)
 end
 
 function _set_agent_metadata!(db::SQLite.DB, key::String, value::String)
@@ -566,8 +594,7 @@ Gotchas:
     end
     names = strip.(split(event_type_names, ","))
     for n in names
-        result = iterate(SQLite.DBInterface.execute(a.db,
-            "SELECT 1 FROM claw_event_types WHERE name = ?", (n,)))
+        result = _fetch_one(a.db, "SELECT 1 FROM claw_event_types WHERE name = ?", (n,))
         result === nothing && return "Unknown event type: $n"
     end
     if cid !== nothing
@@ -770,9 +797,8 @@ Gotchas:
     lock(AGENT_DATA_WRITE_LOCK) do
         _with_busy_retry() do
             # Preserve original created_at on update
-            existing = iterate(SQLite.DBInterface.execute(a.db,
-                "SELECT created_at FROM claw_agent_data WHERE key = ?", (key,)))
-            created = existing !== nothing ? existing[1].created_at : now
+            existing = _fetch_one(a.db, "SELECT created_at FROM claw_agent_data WHERE key = ?", (key,))
+            created = existing !== nothing ? existing.created_at : now
             SQLite.DBInterface.execute(a.db,
                 "INSERT OR REPLACE INTO claw_agent_data (key, value, created_at, updated_at, channel_id, channel_flags, user_id, post_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (key, value, created, now, ch_id, ch_flags, user_id, post_id))
@@ -843,10 +869,9 @@ Gotchas:
             all(t -> t in row_tags, filter_tags) || continue
         end
         # Time filter
-        meta = iterate(SQLite.DBInterface.execute(a.db,
-            "SELECT created_at, updated_at FROM claw_agent_data WHERE key = ?", (k,)))
+        meta = _fetch_one(a.db, "SELECT created_at, updated_at FROM claw_agent_data WHERE key = ?", (k,))
         if meta !== nothing
-            row = meta[1]
+            row = meta
             after_ts !== nothing && row.created_at < after_ts && continue
             before_ts !== nothing && row.created_at > before_ts && continue
         end
@@ -961,8 +986,7 @@ Returns confirmation or "Key not found" if the key doesn't exist.""" function db
     a === nothing && return "No assistant initialized"
     removed = lock(AGENT_DATA_WRITE_LOCK) do
         _with_busy_retry() do
-            existing = iterate(SQLite.DBInterface.execute(a.db,
-                "SELECT 1 FROM claw_agent_data WHERE key = ?", (key,)))
+            existing = _fetch_one(a.db, "SELECT 1 FROM claw_agent_data WHERE key = ?", (key,))
             existing === nothing && return false
             SQLite.DBInterface.execute(a.db, "DELETE FROM claw_agent_data WHERE key = ?", (key,))
             search_store = _get_search_store(a)

@@ -878,4 +878,36 @@ end
     @test Claw._decode_payload("not json")[2] == ""
 end
 
+
+# ── SQLite cursor hygiene ────────────────────────────────────────────────────
+# Two bugs, same root cause: SQLite.DBInterface.execute returns a lazy cursor, and a
+# statement left mid-step holds its lock / pins its read snapshot until GC finalizes
+# it (which is why both were intermittent).
+
+@testset "row-returning PRAGMA does not lock out other connections" begin
+    path = joinpath(mktempdir(), "pragma.sqlite")
+    db = SQLite.DB(path)
+    Claw._init_claw_schema!(db)          # runs PRAGMA journal_mode=WAL, which returns a row
+    second = SQLite.DB(path)
+    # Before the fix this threw SQLiteException("database is locked"), and no
+    # busy_timeout could rescue it: nothing ever released the parked statement.
+    @test (SQLite.execute(second, "CREATE TABLE IF NOT EXISTS probe (v TEXT)"); true)
+    @test (SQLite.execute(second, "INSERT INTO probe VALUES ('ok')"); true)
+end
+
+@testset "_fetch_one releases the read snapshot" begin
+    path = joinpath(mktempdir(), "snapshot.sqlite")
+    db = SQLite.DB(path)
+    Claw._init_claw_schema!(db)
+    Claw._set_agent_metadata!(db, "probe-key", "first")
+    # Take a first row through the helper; it must not pin this connection's snapshot.
+    @test Claw._get_agent_metadata(db, "probe-key") == "first"
+
+    writer = SQLite.DB(path)
+    SQLite.execute(writer, "INSERT OR REPLACE INTO claw_agent_metadata (key, value, updated_at) VALUES ('probe-key2', 'second', 0.0)")
+
+    # With a parked cursor this connection would still see only the pre-write snapshot.
+    @test Claw._get_agent_metadata(db, "probe-key2") == "second"
+end
+
 end # module PipelineTests
