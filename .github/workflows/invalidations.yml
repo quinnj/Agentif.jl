@@ -36,8 +36,11 @@ jobs:
       run: |
         julia -e '
           using Pkg
-          Pkg.activate(temp=true)
-          Pkg.develop([Pkg.PackageSpec(path = "Agentif")])
+          # Use the repo-root environment rather than a fresh temp one: several
+          # runtime deps (JSONSchema, HTTP, ConcurrentUtilities, ...) are only
+          # available through the root Project.toml [sources] git URLs, and a temp
+          # env cannot resolve them from the registry.
+          Pkg.activate(".")
           Pkg.add([
               Pkg.PackageSpec(name = "SnoopCompile", version = "3", uuid = "aa65fe97-06da-5843-b5b1-d5d13cad87d2"),
               Pkg.PackageSpec(name = "SnoopCompileCore", uuid = "e2b509da-e806-4183-be48-004708413034"),
@@ -65,8 +68,11 @@ jobs:
       run: |
         julia -e '
           using Pkg
-          Pkg.activate(temp=true)
-          Pkg.develop([Pkg.PackageSpec(path = "Agentif")])
+          # Use the repo-root environment rather than a fresh temp one: several
+          # runtime deps (JSONSchema, HTTP, ConcurrentUtilities, ...) are only
+          # available through the root Project.toml [sources] git URLs, and a temp
+          # env cannot resolve them from the registry.
+          Pkg.activate(".")
           Pkg.add([
               Pkg.PackageSpec(name = "SnoopCompile", version = "3", uuid = "aa65fe97-06da-5843-b5b1-d5d13cad87d2"),
               Pkg.PackageSpec(name = "SnoopCompileCore", uuid = "e2b509da-e806-4183-be48-004708413034"),
