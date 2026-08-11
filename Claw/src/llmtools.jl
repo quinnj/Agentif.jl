@@ -80,6 +80,7 @@ mutable struct ClawLLMSession
     registry_id::Int        # LLMTools registry ID (PTY/worker); 0 for subagent
     agent::Union{Nothing, Agentif.Agent}       # subagent only
     state::Union{Nothing, Agentif.AgentState}  # subagent only
+    abort::Union{Nothing, Agentif.Abort}       # subagent only
     task::Union{Nothing, Task}                 # async background task
     event_type::String      # "subagent:<name>", "pty:<name>", "worker:<name>"
     handler_prompt::String
@@ -208,19 +209,14 @@ function stop!(es::LLMToolsEventSource)
     end
     for session in sessions
         session.status = "killed"
-        if session.kind === :pty && session.registry_id > 0
+        if session.kind === :subagent && session.abort !== nothing
+            Agentif.abort!(session.abort)
+        elseif session.kind === :pty && session.registry_id > 0
             LLMTools.remove_session!(LLMTools.PTY_REGISTRY, session.registry_id;
                 mark_status = LLMTools.SESSION_STATUS_KILLED, close_session = true)
         elseif session.kind === :worker && session.registry_id > 0
             LLMTools.remove_session!(LLMTools.WORKER_REGISTRY, session.registry_id;
                 mark_status = LLMTools.SESSION_STATUS_KILLED, close_session = true)
-        end
-        task = session.task
-        if task !== nothing && !istaskdone(task)
-            try
-                schedule(task, InterruptException(); error = true)
-            catch
-            end
         end
     end
     tasks = Task[s.task for s in sessions if s.task !== nothing]
@@ -327,7 +323,9 @@ function _register_async_session!(
     eh = EventHandler(event_type, [event_type], prompt, channel_id)
     register_event_handler!(a, eh)
     now = time()
-    session = ClawLLMSession(name, kind, registry_id, agent, state, nothing, event_type, prompt, now, now, "running")
+    abort = kind === :subagent ? Agentif.Abort() : nothing
+    session = ClawLLMSession(name, kind, registry_id, agent, state, abort, nothing,
+        event_type, prompt, now, now, "running")
     lock(es.lock) do
         es.sessions[name] = session
     end
@@ -522,9 +520,10 @@ Examples:
             handler_prompt = something(prompt, "")
             session = _register_async_session!(es, name, :subagent, event_type, handler_prompt;
                 agent = child, state = Agentif.AgentState())
+            abort = session.abort::Agentif.Abort
             session.task = Threads.@spawn begin
                 try
-                    result_state = Agentif.evaluate(child, input_message; level)
+                    result_state = Agentif.evaluate(child, input_message; level, abort)
                     msg = Agentif.last_assistant_message(result_state)
                     output = msg === nothing ? "" : string(Agentif.message_text(msg))
                     lock(es.lock) do
@@ -603,13 +602,16 @@ Example:
                 return LLMTools.truncate_tool_output(output; label = "Subagent output")
             end
             event_type = session.event_type
+            abort = Agentif.Abort()
             lock(es.lock) do
                 session.status = "running"
                 session.last_used = time()
+                session.abort = abort
             end
             session.task = Threads.@spawn begin
                 try
-                    result_state = Agentif.evaluate(session.agent, input_message; state = session.state, level)
+                    result_state = Agentif.evaluate(session.agent, input_message;
+                        state = session.state, level, abort)
                     msg = Agentif.last_assistant_message(result_state)
                     output = msg === nothing ? "" : string(Agentif.message_text(msg))
                     lock(es.lock) do
@@ -666,18 +668,17 @@ Returns each sub-agent's name, status (running/completed/error/killed), age sinc
     )
 
     kill_tool = @tool(
-        """Terminate and remove a sub-agent session, freeing its name for reuse.
+        """Cancel and remove a sub-agent session, freeing its name for reuse.
 
-Interrupts the sub-agent if still running and unregisters its event handler. Use this to clean up finished sub-agents you no longer need, or to force-stop a stuck/runaway sub-agent.
+Signals a running sub-agent to abort and unregisters its event handler. Use this to clean up finished sub-agents or cancel active work.
 
 Arguments:
 - name (String, required): The name of the sub-agent session to kill.""",
         kill_subagent(name::String) = begin
             session = _cleanup_session!(es, name)
             session === nothing && return "No sub-agent named '$name'"
-            if session.task !== nothing && !istaskdone(session.task)
-                try; schedule(session.task, InterruptException(); error = true); catch; end
-            end
+            session.status = "killed"
+            session.abort === nothing || Agentif.abort!(session.abort)
             return "Sub-agent '$name' killed and removed."
         end,
     )
@@ -804,6 +805,11 @@ Examples:
                     last_emit = time()
                     last_output = ""
                     while true
+                        if _async_session_cancelled(es, a, name)
+                            LLMTools.remove_session!(LLMTools.PTY_REGISTRY, registry_id;
+                                mark_status = LLMTools.SESSION_STATUS_KILLED, close_session = true)
+                            return nothing
+                        end
                         # A dedicated reader starts before handler registration and
                         # owns PTY reads. This loop only drains its capture buffer
                         # and coalesces model-facing events.
@@ -946,9 +952,7 @@ Arguments:
         kill_pty(name::String) = begin
             session = _cleanup_session!(es, name)
             session === nothing && return "No PTY session named '$name'"
-            if session.task !== nothing && !istaskdone(session.task)
-                try; schedule(session.task, InterruptException(); error = true); catch; end
-            end
+            session.status = "killed"
             if session.registry_id > 0
                 LLMTools.remove_session!(LLMTools.PTY_REGISTRY, session.registry_id;
                     mark_status = LLMTools.SESSION_STATUS_KILLED, close_session = true)
@@ -1186,9 +1190,7 @@ Arguments:
         kill_worker(name::String) = begin
             session = _cleanup_session!(es, name)
             session === nothing && return "No worker session named '$name'"
-            if session.task !== nothing && !istaskdone(session.task)
-                try; schedule(session.task, InterruptException(); error = true); catch; end
-            end
+            session.status = "killed"
             if session.registry_id > 0
                 LLMTools.remove_session!(LLMTools.WORKER_REGISTRY, session.registry_id;
                     mark_status = LLMTools.SESSION_STATUS_KILLED, close_session = true)

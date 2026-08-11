@@ -920,6 +920,38 @@ end
     Claw.shutdown!(a; timeout_s = 5)
 end
 
+@testset "LLMTools source cancels subagents cooperatively" begin
+    a = make_assistant(":memory:"; FAST...)
+    es = Claw.LLMToolsEventSource(a.config)
+    abort = Agentif.Abort()
+    entered = Threads.Atomic{Bool}(false)
+    cleaned = Threads.Atomic{Bool}(false)
+    task = Threads.@spawn begin
+        entered[] = true
+        while !Agentif.isaborted(abort)
+            sleep(0.01)
+        end
+        cleaned[] = true
+    end
+    now = time()
+    session = Claw.ClawLLMSession("cooperative", :subagent, 0, nothing, nothing,
+        abort, task, "subagent:cooperative", "", now, now, "running")
+    lock(es.lock) do
+        es.sessions[session.name] = session
+    end
+    try
+        @test timedwait(() -> entered[], 5.0) == :ok
+        Claw.stop!(es)
+        @test timedwait(() -> cleaned[], 5.0) == :ok
+        @test istaskdone(task)
+        @test isempty(es.sessions)
+    finally
+        Agentif.abort!(abort)
+        timedwait(() -> istaskdone(task), 5.0)
+        Claw.shutdown!(a; timeout_s = 5)
+    end
+end
+
 # ─── §1.8 Async completions reach humans ───
 
 @testset "async sessions notify the originating channel on their own branch" begin
