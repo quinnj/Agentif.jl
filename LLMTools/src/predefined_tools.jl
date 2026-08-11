@@ -107,14 +107,29 @@ end
 
 function ensure_relative_path(path::String)
     isempty(path) && throw(ArgumentError("path is required"))
-    isabspath(path) && throw(ArgumentError("absolute paths are not allowed: $path"))
     startswith(path, "~") && throw(ArgumentError("home paths are not allowed: $path"))
     return nothing
 end
 
+# Canonicalize for containment checks: realpath the deepest existing ancestor
+# (resolving symlinks like macOS /var -> /private/var) and keep the
+# not-yet-existing tail lexically. Works for paths being created.
+function canonical_path(p::AbstractString)
+    tail = String[]
+    q = normpath(abspath(p))
+    while !ispath(q)
+        d = dirname(q)
+        d == q && break
+        pushfirst!(tail, basename(q))
+        q = d
+    end
+    root = ispath(q) ? realpath(q) : q
+    return isempty(tail) ? root : joinpath(root, tail...)
+end
+
 function is_within_base(path::AbstractString, base::AbstractString)
-    base_norm = normpath(base)
-    path_norm = normpath(path)
+    base_norm = canonical_path(base)
+    path_norm = canonical_path(path)
     if path_norm == base_norm
         return true
     end
@@ -122,11 +137,14 @@ function is_within_base(path::AbstractString, base::AbstractString)
     return startswith(path_norm, base_norm * string(sep))
 end
 
+# Resolve a tool-supplied path against the base directory. Relative paths are
+# joined to base; absolute paths are accepted as long as they stay within base
+# (models routinely pass absolute paths — rejecting them just costs a retry).
 function resolve_relative_path(base_dir::AbstractString, path::String)
     ensure_relative_path(path)
     base = abspath(base_dir)
-    resolved = abspath(joinpath(base, path))
-    is_within_base(resolved, base) || throw(ArgumentError("path resolves outside base directory: $path"))
+    resolved = isabspath(path) ? abspath(path) : abspath(joinpath(base, path))
+    is_within_base(resolved, base) || throw(ArgumentError("path resolves outside the working directory: $path"))
     return resolved
 end
 
@@ -189,7 +207,7 @@ function create_read_tool(base_dir::AbstractString)
 Use `read` when you know the file path and want to see its contents. For searching across many files, use `grep` instead. For listing directory contents, use `ls`.
 
 Arguments:
-- path (String, required): File path relative to the working directory.
+- path (String, required): File path: relative to the working directory, or absolute within it.
 - offset (Int, optional): 1-based line number to start reading from. Errors if beyond end of file.
 - limit (Int, optional): Maximum number of lines to return starting from offset.
 
@@ -243,7 +261,7 @@ function create_write_tool(base_dir::AbstractString)
 WARNING: This completely overwrites the file. To change specific parts of an existing file, use `edit` instead — it is safer and more precise.
 
 Arguments:
-- path (String, required): File path relative to the working directory. Parent directories are created automatically.
+- path (String, required): File path: relative to the working directory, or absolute within it. Parent directories are created automatically.
 - content (String, required): The full file content to write.
 
 Examples:
@@ -269,7 +287,7 @@ function create_edit_tool(base_dir::AbstractString)
 The match is whitespace-sensitive and must be unique — if `oldText` appears more than once in the file, the call fails. Include enough surrounding context (nearby lines) to make the match unique.
 
 Arguments:
-- path (String, required): File path relative to the working directory.
+- path (String, required): File path: relative to the working directory, or absolute within it.
 - oldText (String, required): The exact text to find. Must match exactly one location in the file, including whitespace and indentation.
 - newText (String, required): The replacement text. Must differ from oldText.
 

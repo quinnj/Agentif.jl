@@ -101,7 +101,7 @@ To EDIT: `oldText` must match exactly one location in the file (whitespace-sensi
 To CREATE a new file: pass an empty `oldText` (""). The file must not already exist; parent directories are created automatically.
 
 Arguments:
-- path (String, required): File path relative to the working directory.
+- path (String, required): File path: relative to the working directory, or absolute within it.
 - oldText (String, required): Exact text to find, or "" to create a new file.
 - newText (String, required): Replacement text, or the full content of the new file.
 

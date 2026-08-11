@@ -88,6 +88,23 @@ end
     end
 end
 
+@testset "absolute paths within the working directory" begin
+    mktempdir() do dir
+        edit = Juco.create_edit_tool(dir)
+        # absolute path inside base is accepted (including through macOS /var symlink)
+        abs_inside = joinpath(realpath(dir), "abs.txt")
+        @test occursin("Created", edit.func(abs_inside, "", "content\n"))
+        @test isfile(joinpath(dir, "abs.txt"))
+        # the unresolved (symlinked) form works too
+        alt = joinpath(dir, "abs2.txt")
+        @test occursin("Created", edit.func(alt, "", "content\n"))
+        # absolute path outside base is rejected
+        @test_throws ArgumentError edit.func("/etc/hosts", "a", "b")
+        # relative escape is rejected
+        @test_throws ArgumentError edit.func("../escape.txt", "", "x")
+    end
+end
+
 @testset "toolset presets" begin
     mktempdir() do dir
         jdb = Juco.opendb(joinpath(dir, "test.sqlite"))
