@@ -113,6 +113,22 @@ end
     end
 end
 
+@testset "budget notice wrapping" begin
+    mktempdir() do dir
+        bash = Juco.create_bash_tool(dir)
+        counter = Threads.Atomic{Int}(0)
+        wrapped = Juco.with_budget_notice(bash, counter, 10)
+        @test wrapped.name == "bash"
+        @test Agentif.parameters(wrapped) == Agentif.parameters(bash)
+        counter[] = 2   # plenty of budget: no notice
+        @test !occursin("wrap up", wrapped.func("echo hi", nothing))
+        counter[] = 6   # within the warning margin
+        result = wrapped.func("echo hi", nothing)
+        @test occursin("only 4 tool calls remain", result)
+        @test occursin("hi", result)
+    end
+end
+
 @testset "toolset presets" begin
     mktempdir() do dir
         jdb = Juco.opendb(joinpath(dir, "test.sqlite"))

@@ -60,6 +60,24 @@ function build_agent(;
     )
 end
 
+# Warn the model inside tool results when the tool-call budget runs low, so it
+# wraps up instead of being cut off mid-flight (SWE-agent's cost-limit pattern).
+const BUDGET_WARN_MARGIN = 5
+
+function with_budget_notice(tool::Agentif.AgentTool{F, T}, counter::Threads.Atomic{Int}, max_turns::Int) where {F, T}
+    wrapped = function (args...)
+        result = tool.func(args...)
+        used = counter[]
+        if result isa String && used >= max_turns - BUDGET_WARN_MARGIN
+            remaining = max(0, max_turns - used)
+            result *= "\n\n[harness: only $(remaining) tool calls remain — wrap up now: make your final change and verify]"
+        end
+        return result
+    end
+    return Agentif.AgentTool{typeof(wrapped), T}(;
+        name = tool.name, description = tool.description, strict = tool.strict, func = wrapped)
+end
+
 # ─── One-shot evaluation (used by the REPL per turn, and by the eval harness) ───
 
 """
@@ -89,6 +107,8 @@ function evaluate(input::AbstractString;
     abort = Agentif.Abort()
     # tool executions run on concurrent tasks, so the counter must be atomic
     tool_calls = Threads.Atomic{Int}(0)
+    agent = Agentif.with_tools(agent,
+        Agentif.AgentTool[with_budget_notice(t, tool_calls, max_turns) for t in agent.tools])
     handler = function (event)
         if event isa Agentif.ToolExecutionStartEvent
             n = Threads.atomic_add!(tool_calls, 1) + 1
