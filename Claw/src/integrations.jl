@@ -277,6 +277,12 @@ function enable_integration!(assistant::AgentAssistant, name::AbstractString;
         factory === nothing && error(
             "Integration '$key' is in the catalog but package $(spec.package) is not loaded in this process. " *
             "Add `using $(spec.package)` to the deployment; the Claw extension registers the factory when the package loads.")
+        valid_keys = Set(first.(spec.config_keys))
+        unknown_keys = sort!(String[String(k) for k in keys(config) if !(String(k) in valid_keys)])
+        if !isempty(unknown_keys)
+            valid = isempty(valid_keys) ? "none" : join(sort!(collect(valid_keys)), ", ")
+            error("Unknown config key(s) for integration '$key': $(join(unknown_keys, ", ")). Valid config keys: $valid.")
+        end
         kwargs = Dict{Symbol, Any}(Symbol(String(k)) => v for (k, v) in config)
         es = try
             factory(; kwargs...)

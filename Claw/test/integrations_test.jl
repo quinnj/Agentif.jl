@@ -118,6 +118,18 @@ const START_RACE_SPEC = Claw.IntegrationSpec(
     "start-race", "StartRacePkg", "source with a controlled start/stop race", [])
 Claw.register_integration!(START_RACE_SPEC, StartRaceSource)
 
+struct PermissiveEventSource <: Claw.EventSource
+    label::String
+    internal_state::Any
+end
+PermissiveEventSource(; label::String = "", internal_state = nothing) =
+    PermissiveEventSource(label, internal_state)
+
+const PERMISSIVE_SPEC = Claw.IntegrationSpec(
+    "permissive", "PermissivePkg", "source with internal constructor state",
+    ["label" => "public label"])
+Claw.register_integration!(PERMISSIVE_SPEC, PermissiveEventSource)
+
 mutable struct BlockingEventSource <: Claw.EventSource
     stop_entered::Base.Event
     stop_release::Base.Event
@@ -220,6 +232,18 @@ end
             e
         end
         @test err !== nothing && occursin("Valid config keys", sprint(showerror, err))
+
+        # The catalog remains an allowlist when a constructor accepts internal
+        # keywords that must not be exposed through the agent tool.
+        err = try
+            Claw.enable_integration!(a, "permissive";
+                config = Dict{String, Any}("internal_state" => "injected"))
+            nothing
+        catch e
+            e
+        end
+        @test err !== nothing && occursin("Unknown config key", sprint(showerror, err))
+        @test lock(() -> !haskey(a._integrations, "permissive"), a._integrations_lock)
 
         # bring it back for the disable assertions
         st = Claw.enable_integration!(a, "toy")
