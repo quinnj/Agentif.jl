@@ -1081,15 +1081,18 @@ function _supervise_source!(assistant::AgentAssistant, ss::SupervisedSource)
 end
 
 function _request_source_restart!(assistant::AgentAssistant, ss::SupervisedSource)
-    inner = lock(ss.lock) do
+    inner, stopped_ok = lock(ss.lock) do
         ss.restart_requested[] = true
         try
             stop!(ss.source)
         catch e
             @warn "Claw: source stop! failed" source = ss.tag exception = (e,)
+            ss.restart_requested[] = false
+            return (ss.inner, false)
         end
-        ss.inner
+        return (ss.inner, true)
     end
+    stopped_ok || return nothing
     if inner !== nothing && !istaskdone(inner)
         result = timedwait(() -> istaskdone(inner),
             assistant.pipeline.source_stop_timeout_s; pollint = 0.05)

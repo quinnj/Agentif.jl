@@ -853,6 +853,15 @@ function Claw.start!(s::FlakySource, ::Claw.AgentAssistant)
     return Threads.@spawn (sleep(0.01); error("source blew up"))
 end
 
+mutable struct StopFailSource <: Claw.EventSource
+    starts::Threads.Atomic{Int}
+end
+StopFailSource() = StopFailSource(Threads.Atomic{Int}(0))
+Claw.is_healthy(::StopFailSource) = false
+Claw.start!(s::StopFailSource, ::Claw.AgentAssistant) =
+    (Threads.atomic_add!(s.starts, 1); nothing)
+Claw.stop!(::StopFailSource) = error("source refused to stop")
+
 struct InvalidSource <: Claw.EventSource end
 Claw.get_channels(::InvalidSource) = Agentif.AbstractChannel[]
 Claw.get_event_types(::InvalidSource) = Claw.EventType[]
@@ -917,6 +926,21 @@ end
     @test src.starts[] == 2
     @test src.stops[] == 2
 
+    Claw.shutdown!(a; timeout_s = 5)
+end
+
+@testset "failed source stop never starts a duplicate" begin
+    a = make_assistant(":memory:";
+        source_restart_cap = 2, source_restart_backoff_s = 0.02,
+        source_health_interval_s = 0.05, FAST...)
+    Claw.CURRENT_ASSISTANT[] = a
+    src = StopFailSource()
+    Claw.start_event_loop!(a)
+    Claw.start_sources!(a, Claw.EventSource[src])
+    @test timedwait(() -> src.starts[] == 1, 5.0) == :ok
+    @test timedwait(() -> journal_count(a, "stopfailsource", "restart_cap_exceeded") == 1,
+        15.0) == :ok
+    @test src.starts[] == 1
     Claw.shutdown!(a; timeout_s = 5)
 end
 
