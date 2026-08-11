@@ -23,7 +23,7 @@ function _async_origin(ch::AsyncSessionChannel)
     ch.origin_channel_id === nothing && return nothing
     a = get_current_assistant()
     a === nothing && return nothing
-    origin = get(a._channels, ch.origin_channel_id, nothing)
+    origin = _channel_get(a, ch.origin_channel_id)
     origin isa AsyncSessionChannel && return nothing   # never chain async channels
     return origin
 end
@@ -147,7 +147,7 @@ function _async_event_extra(name::String)
     extra = Dict{String, Any}("session" => name)
     assistant = get_current_assistant()
     assistant === nothing && return extra
-    ch = get(assistant._channels, async_channel_id(name), nothing)
+    ch = _channel_get(assistant, async_channel_id(name))
     if ch isa AsyncSessionChannel && ch.origin_channel_id !== nothing
         extra["origin_channel_id"] = ch.origin_channel_id
     end
@@ -168,7 +168,7 @@ function _rehydrate_llmtools_event(row)
     origin = get(() -> nothing, row.extra, "origin_channel_id")
     if name isa AbstractString && !isempty(name) && origin isa AbstractString
         ch = AsyncSessionChannel(String(name), String(origin))
-        row.assistant._channels[Agentif.channel_id(ch)] = ch
+        _channel_set!(row.assistant, Agentif.channel_id(ch), ch)
     end
     return ReplayedEvent(row.name, row.content)
 end
@@ -323,7 +323,7 @@ function _register_async_session!(
     # reaches the human who asked for it, on this session's own branch.
     session_channel = AsyncSessionChannel(name, origin_channel_id)
     channel_id = Agentif.channel_id(session_channel)
-    a._channels[channel_id] = session_channel
+    _channel_set!(a, channel_id, session_channel)
     eh = EventHandler(event_type, [event_type], prompt, channel_id)
     register_event_handler!(a, eh)
     now = time()
@@ -344,7 +344,7 @@ function _cleanup_session!(es::LLMToolsEventSource, name::String)
     if a !== nothing
         try
             unregister_event_handler!(a, session.event_type)
-            Base.delete!(a._channels, async_channel_id(name))
+            _channel_delete!(a, async_channel_id(name))
             _with_busy_retry() do
                 _exec!(a.db, "DELETE FROM claw_event_types WHERE name = ?", (session.event_type,))
             end

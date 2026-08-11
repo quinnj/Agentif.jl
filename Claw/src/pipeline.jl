@@ -117,7 +117,7 @@ client should register something better.
 function channel_lookup_rehydrator(row::EventRow)
     cid = row.channel_id
     cid === nothing && return ReplayedEvent(row.name, row.content)
-    ch = get(row.assistant._channels, cid, nothing)
+    ch = _channel_get(row.assistant, cid)
     ch === nothing && return nothing
     return ReplayedChannelEvent(row.name, row.content, ch)
 end
@@ -615,7 +615,7 @@ function _dead_letter_channel(assistant::AgentAssistant, ev::Event, handlers)
     ev isa ChannelEvent && return get_channel(ev)
     for h in handlers
         h.channel_id === nothing && continue
-        ch = get(assistant._channels, h.channel_id, nothing)
+        ch = _channel_get(assistant, h.channel_id)
         ch === nothing && continue
         return ch
     end

@@ -331,6 +331,22 @@ function _new_agent_assistant(;
     )
 end
 
+# Runtime integration transitions can add and remove channels and tools while
+# event tasks are active. The integrations lock owns both registries.
+_channel_get(assistant::AgentAssistant, id::AbstractString, default = nothing) =
+    lock(() -> get(assistant._channels, String(id), default), assistant._integrations_lock)
+
+function _channel_set!(assistant::AgentAssistant, id::AbstractString, channel)
+    return lock(assistant._integrations_lock) do
+        assistant._channels[String(id)] = channel
+    end
+end
+
+_channel_delete!(assistant::AgentAssistant, id::AbstractString) =
+    lock(() -> Base.delete!(assistant._channels, String(id)), assistant._integrations_lock)
+_tool_snapshot(assistant::AgentAssistant) =
+    lock(() -> copy(assistant.tools), assistant._integrations_lock)
+
 # ─── SQLite schema ───
 
 function _init_claw_schema!(db::SQLite.DB)
@@ -760,15 +776,19 @@ Example output:
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     # Refresh channels from all event sources
-    lock(EVENT_SOURCES_LOCK) do
-        for es in EVENT_SOURCES
-            for ch in get_channels(es)
-                a._channels[Agentif.channel_id(ch)] = ch
-            end
+    sources = lock(() -> collect(EVENT_SOURCES), EVENT_SOURCES_LOCK)
+    channels = Agentif.AbstractChannel[]
+    for es in sources
+        append!(channels, get_channels(es))
+    end
+    pairs = lock(a._integrations_lock) do
+        for ch in channels
+            a._channels[Agentif.channel_id(ch)] = ch
         end
+        collect(a._channels)
     end
     lines = String[]
-    for (id, ch) in sort!(collect(a._channels); by=first)
+    for (id, ch) in sort!(pairs; by=first)
         name = Agentif.channel_name(ch)
         group = Agentif.is_group(ch) ? "group" : "direct"
         privacy = Agentif.is_private(ch) ? "private" : "public"
@@ -905,7 +925,8 @@ Gotchas:
         result === nothing && return "Unknown event type: $n"
     end
     if cid !== nothing
-        haskey(a._channels, cid) || return "Unknown channel: $cid. Use list_channels to see available channels."
+        _channel_get(a, cid) === nothing &&
+            return "Unknown channel: $cid. Use list_channels to see available channels."
     end
     ft = filter_type === nothing ? nothing : strip(filter_type)
     (ft !== nothing && isempty(ft)) && (ft = nothing)
@@ -985,7 +1006,7 @@ Gotchas:
 - Jobs persist across restarts (stored in SQLite).""" function add_job(name::String, schedule::String, prompt::String, channel_id::String, timezone::Union{Nothing, String} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
-    haskey(a._channels, channel_id) || return "Unknown channel: $channel_id"
+    _channel_get(a, channel_id) === nothing && return "Unknown channel: $channel_id"
     et_name = "tempus_job:$name"
     _exec!(a.db,
         "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
@@ -1383,7 +1404,7 @@ function evaluate(
         prompt = build_system_prompt(assistant; channel),
         model = model,
         apikey = cfg.apikey,
-        tools = tools === nothing ? assistant.tools : tools,
+        tools = tools === nothing ? _tool_snapshot(assistant) : tools,
     )
     # Prepend date/time context to user input (not system prompt) to preserve
     # LLM provider prefix-based prompt caching across turns.
@@ -1526,11 +1547,11 @@ function _resolve_event_channel(assistant::AgentAssistant, ev::Event, handler_ch
         # Register dynamically-created channels so non-ChannelEvent handlers
         # (e.g. JMAP email → telegram) can look them up by channel_id.
         id = Agentif.channel_id(ch)
-        assistant._channels[id] = ch
+        _channel_set!(assistant, id, ch)
         return ch
     end
     handler_channel_id === nothing && return nothing
-    return get(assistant._channels, handler_channel_id, nothing)
+    return _channel_get(assistant, handler_channel_id)
 end
 
 function _run_event_handler!(

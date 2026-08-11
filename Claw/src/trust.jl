@@ -61,15 +61,15 @@ end
 
 The tool vector for one handler evaluation.
 
-- `tools = nothing` and `trust = :owner` (the defaults) returns `assistant.tools`
-  itself — byte-for-byte what the handler saw before this file existed. That
-  identity is the no-regression guarantee, and it is asserted in the test suite.
+- `tools = nothing` and `trust = :owner` (the defaults) returns a snapshot of the
+  full assistant tool set. A snapshot keeps runtime integration changes from
+  mutating the tool vector of an evaluation that is already starting.
 - A non-`nothing` `tools` narrows to that named subset.
 - `trust = :untrusted` then keeps only names in
   [`UNTRUSTED_ALLOWED_TOOLS`](@ref). Unknown and custom tools fail closed.
 """
 function resolve_handler_tools(assistant::AgentAssistant, handler)
-    tools = assistant.tools
+    tools = _tool_snapshot(assistant)
     names = _handler_tool_names(handler)
     if names !== nothing
         allowed = Set{String}(names)
@@ -185,7 +185,7 @@ function trust_exposure_report(assistant::AgentAssistant, sources)
             r === nothing || push!(reasons, "$et via $r")
         end
         if h.channel_id !== nothing
-            ch = get(assistant._channels, h.channel_id, nothing)
+            ch = _channel_get(assistant, h.channel_id)
             ch !== nothing && _channel_is_shared(ch) &&
                 push!(reasons, "replies into group/public channel $(h.channel_id)")
         end

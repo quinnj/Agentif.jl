@@ -2,7 +2,7 @@
 #
 # Negative tests are the point here. The positive assertions that matter are the
 # no-regression ones: an existing handler, constructed the way every existing call
-# site constructs it, must still see the *identical* tool set.
+# site constructs it, must still see the full tool set.
 
 module TrustTests
 
@@ -60,6 +60,9 @@ end
 const UNKNOWN_CUSTOM_TOOL = Agentif.@tool "A deployment-specific mutation." function custom_mutation(value::String)
     return value
 end
+const LATE_TOOL = Agentif.@tool "A tool registered after resolution." function late_tool()
+    return "late"
+end
 
 # A registered stub model so `evaluate` can build an Agent without reaching a
 # provider; the stub `base_handler` below returns before any request is made.
@@ -111,9 +114,13 @@ Claw.get_channels(::GroupSource) = Agentif.AbstractChannel[TrustChannel("group-1
         legacy = Claw.EventHandler("legacy", ["trust_test_event"], "", nothing)
         @test legacy.trust === :owner
         @test legacy.tools === nothing
-        # Identity, not merely equality: the tool vector handed to the evaluation is
-        # the assistant's own, untouched.
-        @test Claw.resolve_handler_tools(a, legacy) === a.tools
+        resolved = Claw.resolve_handler_tools(a, legacy)
+        @test resolved !== a.tools
+        @test tool_names(resolved) == tool_names(a.tools)
+        lock(a._integrations_lock) do
+            push!(a.tools, LATE_TOOL)
+        end
+        @test !("late_tool" in tool_names(resolved))
 
         # Same through the database round-trip a real dispatch takes.
         Claw.execute_write(a._writer,
@@ -124,7 +131,6 @@ Claw.get_channels(::GroupSource) = Agentif.AbstractChannel[TrustChannel("group-1
         @test length(rows) == 1
         @test rows[1].trust === :owner
         @test rows[1].tools === nothing
-        @test Claw.resolve_handler_tools(a, rows[1]) === a.tools
         @test tool_names(Claw.resolve_handler_tools(a, rows[1])) == tool_names(a.tools)
     finally
         Claw.shutdown!(a; timeout_s = 5)
@@ -152,7 +158,8 @@ end
             ("ancient", "trust_test_event"))
         row = only(Claw._event_handlers_for(a, "trust_test_event"))
         @test row.trust === :owner
-        @test Claw.resolve_handler_tools(a, row) === a.tools
+        @test Claw.resolve_handler_tools(a, row) !== a.tools
+        @test tool_names(Claw.resolve_handler_tools(a, row)) == tool_names(a.tools)
         # Re-running migrations is a no-op.
         @test Claw._migrate_claw_schema!(a.db) == Claw.CLAW_SCHEMA_VERSION
     finally
