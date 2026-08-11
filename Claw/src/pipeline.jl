@@ -1064,18 +1064,21 @@ end
 Validate one source and start it in its own supervised task. A validation failure
 marks it stopped but never throws — one bad source must not take down the rest.
 """
-function _start_supervised_source!(assistant::AgentAssistant, es::EventSource)
+function _start_supervised_source!(assistant::AgentAssistant, es::EventSource;
+        validated::Bool = false)
     tag = _source_tag(es)
     ss = SupervisedSource(es, tag)
     lock(() -> push!(assistant._sources, ss), assistant._sources_lock)
-    try
-        validate_source(es)
-    catch e
-        ss.stopped[] = true
-        _journal_source!(assistant, tag, "invalid_config", sprint(showerror, _unwrap_error(e)))
-        @error "Claw: source configuration invalid; not started" source = tag exception = (e, catch_backtrace())
-        _ensure_health_loop!(assistant)
-        return ss
+    if !validated
+        try
+            validate_source(es)
+        catch e
+            ss.stopped[] = true
+            _journal_source!(assistant, tag, "invalid_config", sprint(showerror, _unwrap_error(e)))
+            @error "Claw: source configuration invalid; not started" source = tag exception = (e, catch_backtrace())
+            _ensure_health_loop!(assistant)
+            return ss
+        end
     end
     ss.task = errormonitor(Threads.@spawn _supervise_source!(assistant, ss))
     _ensure_health_loop!(assistant)
@@ -1164,10 +1167,15 @@ stragglers through their `Abort` handles, return unfinished claims to `pending`,
 and close the database. Idempotent; safe to call from an `atexit` hook.
 """
 function shutdown!(assistant::AgentAssistant; timeout_s::Real = assistant.pipeline.shutdown_timeout_s)
-    first_caller = lock(assistant._shutdown_lock) do
-        assistant._state[] in (:stopping, :stopped) && return false
-        assistant._state[] = :stopping
-        return true
+    # Serialize the state transition with runtime integration changes. An enable
+    # that won the lock first finishes adding its supervised source before shutdown
+    # snapshots sources; one that arrives later sees :stopping and fails closed.
+    first_caller = lock(assistant._integrations_lock) do
+        lock(assistant._shutdown_lock) do
+            assistant._state[] in (:stopping, :stopped) && return false
+            assistant._state[] = :stopping
+            return true
+        end
     end
     if !first_caller
         timedwait(() -> assistant._state[] === :stopped, Float64(timeout_s); pollint = 0.05)

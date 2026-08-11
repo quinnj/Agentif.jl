@@ -46,6 +46,41 @@ const TOY_SPEC = Claw.IntegrationSpec("toy", "ToyPkg", "toy integration for test
     ["token" => "the toy token"])
 Claw.register_integration!(TOY_SPEC, ToyEventSource)
 
+mutable struct BlockingEventSource <: Claw.EventSource
+    stop_entered::Base.Event
+    stop_release::Base.Event
+    block_stop::Threads.Atomic{Bool}
+end
+
+const BLOCKING_STOP_ENTERED = Ref{Base.Event}(Base.Event())
+const BLOCKING_STOP_RELEASE = Ref{Base.Event}(Base.Event())
+const BLOCKING_STOP_STARTED = Threads.Atomic{Bool}(false)
+BlockingEventSource() = BlockingEventSource(
+    BLOCKING_STOP_ENTERED[], BLOCKING_STOP_RELEASE[], Threads.Atomic{Bool}(true))
+
+Claw.get_channels(::BlockingEventSource) = Agentif.AbstractChannel[ToyChannel("blocking-chan")]
+Claw.get_event_types(::BlockingEventSource) = Claw.EventType[Claw.EventType("blocking_event", "blocking event")]
+Claw.get_tools(::BlockingEventSource) = Agentif.AgentTool[TOY_TOOL]
+Claw.start!(::BlockingEventSource, ::Claw.AgentAssistant) = nothing
+function Claw.stop!(es::BlockingEventSource)
+    es.block_stop[] || return nothing
+    BLOCKING_STOP_STARTED[] = true
+    notify(es.stop_entered)
+    wait(es.stop_release)
+    return nothing
+end
+
+const BLOCKING_SPEC = Claw.IntegrationSpec(
+    "blocking", "BlockingPkg", "blocking integration for race tests", [])
+Claw.register_integration!(BLOCKING_SPEC, BlockingEventSource)
+
+struct InvalidEventSource <: Claw.EventSource end
+Claw.validate_source(::InvalidEventSource) = error("invalid test configuration")
+
+const INVALID_SPEC = Claw.IntegrationSpec(
+    "invalid", "InvalidPkg", "invalid integration for validation tests", [])
+Claw.register_integration!(INVALID_SPEC, InvalidEventSource)
+
 # A catalog entry with no factory, i.e. an integration whose package is not loaded.
 # (Registered directly so the assertion cannot go stale when another test file
 # loads the real Telegram/Slack packages into this process.)
@@ -122,6 +157,56 @@ end
         @test all(ss -> ss.source !== src, a._sources)
         err = try; Claw.disable_integration!(a, "toy"); nothing; catch e; e; end
         @test err !== nothing && occursin("not enabled", sprint(showerror, err))
+    finally
+        Claw.shutdown!(a; timeout_s = 5)
+    end
+end
+
+@testset "integration transitions stay serialized" begin
+    a = make_assistant()
+    a._state[] = :running
+    BLOCKING_STOP_ENTERED[] = Base.Event()
+    BLOCKING_STOP_RELEASE[] = Base.Event()
+    BLOCKING_STOP_STARTED[] = false
+    first = Claw.enable_integration!(a, "blocking")
+    disable_task = Threads.@spawn Claw.disable_integration!(a, "blocking")
+    try
+        @test timedwait(() -> BLOCKING_STOP_STARTED[], 5.0) == :ok
+        enable_task = Threads.@spawn Claw.enable_integration!(a, "blocking")
+        # A new enable must wait until the old source has stopped and all of its
+        # registrations have been removed. Otherwise the old cleanup removes the
+        # new source's channels, event types, and tools.
+        @test timedwait(() -> istaskdone(enable_task), 0.2) == :timed_out
+        notify(BLOCKING_STOP_RELEASE[])
+        wait(disable_task)
+        second = fetch(enable_task)
+        @test second.source !== first.source
+        @test haskey(a._channels, "blocking-chan")
+        @test has_tool(a, "toy_integration_tool")
+        @test event_type_registered(a, "blocking_event")
+        @test integration_row(a, "blocking").enabled == 1
+        second.source.block_stop[] = false
+    finally
+        notify(BLOCKING_STOP_RELEASE[])
+        first.source.block_stop[] = false
+        try
+            wait(disable_task)
+        catch
+        end
+        st = lock(() -> get(a._integrations, "blocking", nothing), a._integrations_lock)
+        st === nothing || (st.source.block_stop[] = false)
+        Claw.shutdown!(a; timeout_s = 5)
+    end
+end
+
+@testset "invalid integrations do not become enabled" begin
+    a = make_assistant()
+    a._state[] = :running
+    try
+        @test_throws ErrorException Claw.enable_integration!(a, "invalid")
+        @test lock(() -> !haskey(a._integrations, "invalid"), a._integrations_lock)
+        @test all(ss -> !(ss.source isa InvalidEventSource), a._sources)
+        @test integration_row(a, "invalid") === nothing
     finally
         Claw.shutdown!(a; timeout_s = 5)
     end

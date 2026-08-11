@@ -165,29 +165,36 @@ end
 # `register_event_source!` plus a record of exactly what it added, so disable can
 # undo precisely that.
 function _register_event_source_tracked!(assistant::AgentAssistant, es::EventSource)
-    register_event_source!(es)
-    db = assistant.db
-    channel_ids = String[]
-    for ch in get_channels(es)
-        id = Agentif.channel_id(ch)
-        assistant._channels[id] = ch
-        push!(channel_ids, id)
+    return lock(assistant._integrations_lock) do
+        channels = collect(get_channels(es))
+        event_types = collect(get_event_types(es))
+        handlers = collect(get_event_handlers(es))
+        tools = collect(get_tools(es))
+        channel_ids = String[Agentif.channel_id(ch) for ch in channels]
+        event_type_names = String[et.name for et in event_types]
+        tool_names = String[Agentif.tool_name(tool) for tool in tools]
+
+        # Runtime enablement can run from a tool task while the pipeline writer is
+        # active. Keep registration writes on that writer instead of racing the
+        # main SQLite handle.
+        _writer_txn(assistant) do db
+            for et in event_types
+                _exec!(db, "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
+                    (et.name, et.description))
+            end
+            for eh in handlers
+                _upsert_event_handler!(db, eh)
+            end
+            return nothing
+        end
+
+        register_event_source!(es)
+        for (id, ch) in zip(channel_ids, channels)
+            assistant._channels[id] = ch
+        end
+        append!(assistant.tools, tools)
+        return (; channel_ids, event_type_names, tool_names)
     end
-    event_type_names = String[]
-    for et in get_event_types(es)
-        _exec!(db, "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
-            (et.name, et.description))
-        push!(event_type_names, et.name)
-    end
-    for eh in get_event_handlers(es)
-        _upsert_event_handler!(db, eh)
-    end
-    tool_names = String[]
-    for tool in get_tools(es)
-        push!(assistant.tools, tool)
-        push!(tool_names, Agentif.tool_name(tool))
-    end
-    return (; channel_ids, event_type_names, tool_names)
 end
 
 # ─── Enable / disable ───
@@ -205,14 +212,20 @@ already enabled, or its package is not loaded.
 function enable_integration!(assistant::AgentAssistant, name::AbstractString;
         config::AbstractDict = Dict{String, Any}(), persist::Bool = true)
     key = lowercase(strip(String(name)))
-    spec = get(INTEGRATION_SPECS, key, nothing)
-    spec === nothing && error("Unknown integration '$key'. Known integrations: $(join(sort!(collect(keys(INTEGRATION_SPECS))), ", ")).")
     # The whole enable runs under the integrations lock so two concurrent enables
     # of the same name cannot both pass the already-enabled check and construct
-    # duplicate sources. (Lock order: _integrations_lock, then _sources_lock.)
+    # duplicate sources. Persistence stays inside the same critical section so a
+    # concurrent disable cannot leave the database disagreeing with runtime state.
+    # Lock order: _integrations_lock, then _sources_lock.
     state = lock(assistant._integrations_lock) do
+        assistant._state[] === :running || error(
+            "Cannot enable integration '$key' while the pipeline is $(assistant._state[]).")
         haskey(assistant._integrations, key) && error("Integration '$key' is already enabled.")
-        factory = _integration_factory(key)
+        spec, factory, known = lock(INTEGRATIONS_LOCK) do
+            (get(INTEGRATION_SPECS, key, nothing), get(INTEGRATION_FACTORIES, key, nothing),
+                sort!(collect(keys(INTEGRATION_SPECS))))
+        end
+        spec === nothing && error("Unknown integration '$key'. Known integrations: $(join(known, ", ")).")
         factory === nothing && error(
             "Integration '$key' is in the catalog but package $(spec.package) is not loaded in this process. " *
             "Add `using $(spec.package)` to the deployment; the Claw extension registers the factory when the package loads.")
@@ -223,17 +236,20 @@ function enable_integration!(assistant::AgentAssistant, name::AbstractString;
             valid = isempty(spec.config_keys) ? "none" : join(first.(spec.config_keys), ", ")
             error("Failed to construct integration '$key': $(sprint(showerror, e)). Valid config keys: $valid.")
         end
+        try
+            validate_source(es)
+        catch e
+            error("Integration '$key' configuration is invalid: $(sprint(showerror, e))")
+        end
         reg = _register_event_source_tracked!(assistant, es)
         st = IntegrationState(key, es, nothing, reg.channel_ids, reg.event_type_names, reg.tool_names)
         assistant._integrations[key] = st
-        if assistant._state[] === :running
-            st.supervised = _start_supervised_source!(assistant, es)
+        st.supervised = _start_supervised_source!(assistant, es; validated = true)
+        if persist
+            _persist_integration!(assistant, key, true, config)
+            _set_integration_status!(assistant, key, "")
         end
         st
-    end
-    if persist
-        _persist_integration!(assistant, key, true, config)
-        _set_integration_status!(assistant, key, "")
     end
     _journal_source!(assistant, _source_tag(state.source), "enabled")
     # An integration enabled at runtime was not covered by the boot report; state
@@ -254,10 +270,21 @@ it stays off across restarts (its stored config is kept).
 """
 function disable_integration!(assistant::AgentAssistant, name::AbstractString; persist::Bool = true)
     key = lowercase(strip(String(name)))
-    state = lock(assistant._integrations_lock) do
-        pop!(assistant._integrations, key, nothing)
+    lock(assistant._integrations_lock) do
+        assistant._state[] === :running || error(
+            "Cannot disable integration '$key' while the pipeline is $(assistant._state[]).")
+        state = pop!(assistant._integrations, key, nothing)
+        state === nothing && error("Integration '$key' is not enabled.")
+        _disable_integration_locked!(assistant, key, state; persist)
     end
-    state === nothing && error("Integration '$key' is not enabled.")
+    return nothing
+end
+
+# Caller holds `_integrations_lock` for the full transition. In particular, do not
+# let a re-enable register a replacement source until this old source has stopped
+# and all registrations attributed to it have been removed.
+function _disable_integration_locked!(assistant::AgentAssistant, key::String,
+        state::IntegrationState; persist::Bool)
     ss = state.supervised
     if ss === nothing
         ss = lock(assistant._sources_lock) do
@@ -283,8 +310,15 @@ function disable_integration!(assistant::AgentAssistant, name::AbstractString; p
         remove = Set(state.tool_names)
         filter!(t -> !(Agentif.tool_name(t) in remove), assistant.tools)
     end
-    for et in state.event_type_names
-        _exec!(assistant.db, "DELETE FROM claw_event_types WHERE name = ?", (et,))
+    if !isempty(state.event_type_names)
+        execute_write(assistant._writer) do db
+            _with_busy_retry() do
+                for et in state.event_type_names
+                    _exec!(db, "DELETE FROM claw_event_types WHERE name = ?", (et,))
+                end
+                return nothing
+            end
+        end
     end
     lock(EVENT_SOURCES_LOCK) do
         Base.delete!(EVENT_SOURCES, state.source)

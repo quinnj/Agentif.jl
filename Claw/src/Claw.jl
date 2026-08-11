@@ -471,11 +471,14 @@ function register_event_source!(assistant::AgentAssistant, es::EventSource)
 end
 
 function register_channels!(assistant::AgentAssistant, channels)
-    added = false
-    for ch in channels
-        id = Agentif.channel_id(ch)
-        assistant._channels[id] = ch
-        added = true
+    added = lock(assistant._integrations_lock) do
+        found = false
+        for ch in channels
+            id = Agentif.channel_id(ch)
+            assistant._channels[id] = ch
+            found = true
+        end
+        found
     end
     added && assistant._state[] === :running && _rehydration_ready!(assistant)
     return nothing
