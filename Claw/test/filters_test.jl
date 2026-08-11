@@ -205,6 +205,37 @@ end
     end
 end
 
+@testset "handler mutations use the pipeline writer" begin
+    path = tempname() * ".sqlite"
+    a = Claw.AgentAssistant(path;
+        provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "k", level = :error)
+    try
+        Claw.execute_write(a._writer,
+            "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
+            ("writer_event", "writer ownership"))
+        close(a.db)
+        handler = Claw.EventHandler("writer-handler", ["writer_event"], "";
+            filter = Claw.EventFilter(:regex, "owned"))
+        Claw.register_event_handler!(a, handler)
+        found = Claw.with_read(a._readers) do db
+            Claw._fetch_one(db,
+                "SELECT filter_expr FROM claw_event_handlers WHERE id = ?",
+                (handler.id,))
+        end
+        @test found !== nothing && found.filter_expr == "owned"
+        Claw.unregister_event_handler!(a, handler.id)
+        found = Claw.with_read(a._readers) do db
+            Claw._fetch_one(db, "SELECT 1 FROM claw_event_handlers WHERE id = ?", (handler.id,))
+        end
+        @test found === nothing
+    finally
+        Claw.shutdown!(a; timeout_s = 5)
+        rm(path; force = true)
+        rm(path * "-wal"; force = true)
+        rm(path * "-shm"; force = true)
+    end
+end
+
 @testset "add_event_handler tool filter arguments" begin
     a = Claw.AgentAssistant(":memory:";
         provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "k", level = :error)

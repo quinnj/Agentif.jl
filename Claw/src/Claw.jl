@@ -550,15 +550,20 @@ function _upsert_event_handler!(db::SQLite.DB, eh::EventHandler)
 end
 
 function register_event_handler!(assistant::AgentAssistant, eh::EventHandler)
-    _upsert_event_handler!(assistant.db, eh)
-    return
+    _writer_txn(assistant) do db
+        _upsert_event_handler!(db, eh)
+        return nothing
+    end
+    return nothing
 end
 
 function unregister_event_handler!(assistant::AgentAssistant, handler_id::String)
-    db = assistant.db
-    _exec!(db, "DELETE FROM claw_handler_event_types WHERE handler_id = ?", (handler_id,))
-    _exec!(db, "DELETE FROM claw_event_handlers WHERE id = ?", (handler_id,))
-    return
+    _writer_txn(assistant) do db
+        _exec!(db, "DELETE FROM claw_handler_event_types WHERE handler_id = ?", (handler_id,))
+        _exec!(db, "DELETE FROM claw_event_handlers WHERE id = ?", (handler_id,))
+        return nothing
+    end
+    return nothing
 end
 
 # ─── Untrusted content fencing ───
