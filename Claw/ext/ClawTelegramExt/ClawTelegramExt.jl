@@ -573,7 +573,7 @@ function Claw.start!(source::TelegramEventSource, assistant::Claw.AgentAssistant
                     parse(Int64, m.captures[1]), nothing, source.client, IOBuffer(), "", "", "private"))
             end
             if !isempty(seed_channels)
-                Claw.register_channels!(assistant, seed_channels)
+                Claw.register_channels!(assistant, seed_channels; source)
                 @info "ClawTelegramExt: seeded channels from DB" count=length(seed_channels)
             end
 

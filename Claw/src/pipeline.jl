@@ -1152,6 +1152,11 @@ function _start_supervised_source!(assistant::AgentAssistant, es::EventSource;
     tag = _source_tag(es)
     ss = SupervisedSource(es, tag)
     lock(() -> push!(assistant._sources, ss), assistant._sources_lock)
+    lock(assistant._integrations_lock) do
+        for state in values(assistant._integrations)
+            state.source === es && (state.supervised = ss)
+        end
+    end
     if !validated
         try
             validate_source(es)

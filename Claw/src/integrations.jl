@@ -209,6 +209,46 @@ end
 
 # ─── Registration bookkeeping ───
 
+function _track_integration_channel_locked!(assistant::AgentAssistant,
+        source::EventSource, id::String, channel)
+    state = nothing
+    for candidate in values(assistant._integrations)
+        if candidate.source === source
+            state = candidate
+            break
+        end
+    end
+    state === nothing && return nothing
+    idx = findfirst(==(id), state.channel_ids)
+    if idx === nothing
+        push!(state.channel_ids, id)
+        push!(state.channels, channel)
+    else
+        state.channels[idx] = channel
+    end
+    return nothing
+end
+
+function _track_integration_channel!(assistant::AgentAssistant,
+        source_tag::AbstractString, id::String, channel)
+    lock(assistant._integrations_lock) do
+        assistant._channels[id] = channel
+        tag = lowercase(String(source_tag))
+        state = get(assistant._integrations, tag, nothing)
+        if state === nothing
+            for candidate in values(assistant._integrations)
+                if _source_tag(candidate.source) == tag
+                    state = candidate
+                    break
+                end
+            end
+        end
+        state === nothing && return nothing
+        _track_integration_channel_locked!(assistant, state.source, id, channel)
+    end
+    return nothing
+end
+
 # `register_event_source!` plus a record of exactly what it added, so disable can
 # undo precisely that.
 function _register_event_source_tracked!(assistant::AgentAssistant, es::EventSource)

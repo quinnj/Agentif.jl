@@ -486,12 +486,14 @@ function register_event_source!(assistant::AgentAssistant, es::EventSource)
     return es
 end
 
-function register_channels!(assistant::AgentAssistant, channels)
+function register_channels!(assistant::AgentAssistant, channels;
+        source::Union{Nothing, EventSource} = nothing)
     added = lock(assistant._integrations_lock) do
         found = false
         for ch in channels
             id = Agentif.channel_id(ch)
             assistant._channels[id] = ch
+            source === nothing || _track_integration_channel_locked!(assistant, source, id, ch)
             found = true
         end
         found
@@ -1552,7 +1554,7 @@ function _resolve_event_channel(assistant::AgentAssistant, ev::Event, handler_ch
         # Register dynamically-created channels so non-ChannelEvent handlers
         # (e.g. JMAP email → telegram) can look them up by channel_id.
         id = Agentif.channel_id(ch)
-        _channel_set!(assistant, id, ch)
+        _track_integration_channel!(assistant, event_source_tag(ev), id, ch)
         return ch
     end
     handler_channel_id === nothing && return nothing
@@ -1727,10 +1729,11 @@ function init!(
     start_event_loop!(assistant; level = assistant.log_level)
     # Crash/stuck-worker recovery before sources start producing new work.
     _recover_events!(assistant)
-    start_sources!(assistant, sources)
     # Name runner-passed sources under their catalog integrations, then bring up
-    # whatever the persisted enabled-set adds on top of them.
+    # whatever the persisted enabled-set adds on top of them. Adopt before start
+    # so channels created immediately by a source task are attributed to it.
     _adopt_explicit_integrations!(assistant, regs)
+    start_sources!(assistant, sources)
     _reconcile_integrations!(assistant)
     install_signal_handlers && install_shutdown_handler!(assistant)
     return assistant

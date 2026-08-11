@@ -480,7 +480,7 @@ function Claw.start!(source::MattermostEventSource, assistant::Claw.AgentAssista
             source.client = Mattermost._get_client()
             source.bot_user_id = bot_user_id
             _register_mattermost_rehydrator!(source)
-            Claw.register_channels!(assistant, _fetch_channels(source.client, bot_user_id))
+            Claw.register_channels!(assistant, _fetch_channels(source.client, bot_user_id); source)
             @info "ClawMattermostExt: Bot user: $(me.username) ($(bot_user_id))"
 
             _run_mattermost_websocket(source) do event

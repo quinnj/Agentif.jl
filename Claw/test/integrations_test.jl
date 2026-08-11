@@ -44,6 +44,14 @@ Claw.get_tools(::ToyEventSource) = Agentif.AgentTool[TOY_TOOL]
 Claw.start!(es::ToyEventSource, ::Claw.AgentAssistant) = (es.started[] = true; nothing)
 Claw.stop!(es::ToyEventSource) = (es.stopped[] = true; nothing)
 
+struct ToyChannelEvent <: Claw.ChannelEvent
+    channel::ToyChannel
+end
+Claw.get_name(::ToyChannelEvent) = "toy_event"
+Claw.get_channel(event::ToyChannelEvent) = event.channel
+Claw.event_content(::ToyChannelEvent) = "runtime channel"
+Claw.event_source_tag(::ToyChannelEvent) = "toy"
+
 const TOY_SPEC = Claw.IntegrationSpec("toy", "ToyPkg", "toy integration for tests",
     ["token" => "the toy token", "label" => "a non-sensitive label"])
 Claw.register_integration!(TOY_SPEC, ToyEventSource)
@@ -318,11 +326,19 @@ end
     try
         first = Claw.enable_integration!(a, "toy")
         second = Claw.enable_integration!(a, "overlap")
+        runtime_channel = ToyChannel("runtime-only")
+        Claw.register_channels!(a, Agentif.AbstractChannel[runtime_channel]; source = first.source)
+        event_channel = ToyChannel("event-only")
+        @test Claw._resolve_event_channel(a, ToyChannelEvent(event_channel), nothing) === event_channel
         @test a._channels["toy-chan"] === second.source.channel
+        @test a._channels["runtime-only"] === runtime_channel
+        @test a._channels["event-only"] === event_channel
         @test count(t -> Agentif.tool_name(t) == "toy_integration_tool", a.tools) == 2
 
         Claw.disable_integration!(a, "toy")
         @test a._channels["toy-chan"] === second.source.channel
+        @test !haskey(a._channels, "runtime-only")
+        @test !haskey(a._channels, "event-only")
         @test has_tool(a, "toy_integration_tool")
         @test event_type_registered(a, "toy_event")
 

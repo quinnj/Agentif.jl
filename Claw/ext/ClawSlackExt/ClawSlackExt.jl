@@ -605,7 +605,7 @@ function Claw.start!(source::SlackEventSource, assistant::Claw.AgentAssistant)
         _register_slack_rehydrator!(source)
         # Register channels now that web_client is available
         # (get_channels returns [] during register_event_source! since web_client is still nothing)
-        Claw.register_channels!(assistant, Claw.get_channels(source))
+        Claw.register_channels!(assistant, Claw.get_channels(source); source)
         channel_type_cache = Dict{String, String}()
         bot_user_id = string(strip(source.bot_user_id))
         bot_username = lowercase(strip(source.bot_username))
