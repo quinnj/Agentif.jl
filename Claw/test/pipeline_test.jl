@@ -61,6 +61,15 @@ Claw.get_name(::UnownedEvent) = "pipeline_test_event"
 Claw.event_content(ev::UnownedEvent) = ev.content
 Claw.event_source_tag(::UnownedEvent) = "no-such-source"
 
+struct NamedPipelineEvent <: Claw.ChannelEvent
+    name::String
+    content::String
+    channel::RecordingChannel
+end
+Claw.get_name(ev::NamedPipelineEvent) = ev.name
+Claw.get_channel(ev::NamedPipelineEvent) = ev.channel
+Claw.event_content(ev::NamedPipelineEvent) = ev.content
+
 function make_assistant(db_path::String = ":memory:"; kwargs...)
     return Claw.AgentAssistant(db_path;
         provider = "openai-completions",
@@ -667,6 +676,32 @@ end
     @test Claw.event_content(replayed) == "replayed"
     @test Agentif.channel_id(Claw.get_channel(replayed)) == "replay-ch"
     Claw.shutdown!(a; timeout_s = 5)
+end
+
+@testset "rehydrator failures consume the retry budget" begin
+    a = make_assistant(":memory:"; retry_backoff_s = [0.05],
+        unknown_max_attempts = 2, FAST...)
+    Claw.CURRENT_ASSISTANT[] = a
+    register_test_handler!(a)
+    a._state[] = :running
+    id = Claw.submit_event!(a, UnownedEvent("broken replay"))
+    take!(a.event_queue)
+    Claw._clear_wakeup!(a, id)
+    Claw._forget_live_event!(a, id)
+    Claw.register_rehydrator!("no-such-source", _ -> error("rehydrator broke"))
+    try
+        Claw.start_event_loop!(a)
+        Claw._wake!(a, id)
+        @test timedwait(() -> event_row(a, id).status == "dead", 15.0) == :ok
+        row = event_row(a, id)
+        @test row.attempts == 2
+        @test occursin("rehydrator broke", String(row.last_error))
+    finally
+        lock(Claw.EVENT_REHYDRATORS_LOCK) do
+            Base.delete!(Claw.EVENT_REHYDRATORS, "no-such-source")
+        end
+        Claw.shutdown!(a; timeout_s = 5)
+    end
 end
 
 # ─── §1.5 Graceful shutdown ───
@@ -1348,6 +1383,47 @@ end
     @test isempty(a._pending_wakeups)
     @test isempty(a._live_events)
     @test id isa Int
+end
+
+@testset "stopping returns later claimed groups without evaluating them" begin
+    a = make_assistant(":memory:"; FAST...)
+    a._state[] = :running
+    ch = RecordingChannel("stop-between-groups")
+    for name in ("first_group", "second_group")
+        Claw.execute_write(a._writer,
+            "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
+            (name, "shutdown group test"))
+        Claw.register_event_handler!(a, Claw.EventHandler(name, [name], ""))
+    end
+    first_id = Claw.submit_event!(a, NamedPipelineEvent("first_group", "first", ch))
+    second_id = Claw.submit_event!(a, NamedPipelineEvent("second_group", "second", ch))
+    take!(a.event_queue)
+    take!(a.event_queue)
+
+    runs = Threads.Atomic{Int}(0)
+    started = Threads.Atomic{Bool}(false)
+    gate = Base.Event()
+    runner = function (assistant, ev, handler; kwargs...)
+        Threads.atomic_add!(runs, 1)
+        started[] = true
+        wait(gate)
+        return nothing
+    end
+    with_handler(runner) do
+        task = Threads.@spawn Claw._process_event_batch!(a, [first_id, second_id])
+        @test timedwait(() -> started[], 5.0) == :ok
+        a._state[] = :stopping
+        notify(gate)
+        @test timedwait(() -> istaskdone(task), 5.0) == :ok
+        fetch(task)
+    end
+    @test runs[] == 1
+    @test event_row(a, first_id).status == "done"
+    second = event_row(a, second_id)
+    @test second.status == "pending"
+    @test second.attempts == 0
+    a._state[] = :running
+    Claw.shutdown!(a; timeout_s = 5)
 end
 
 end # module PipelineTests

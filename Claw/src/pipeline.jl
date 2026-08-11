@@ -126,8 +126,8 @@ end
     rehydrate_event(source_tag::String, row::EventRow) -> Union{Nothing, Event}
 
 Reconstruct a persisted event. Unregistered sources return `nothing` and log: the
-row stays `pending` until the owning source is registered, which is the honest
-behavior — silently dropping it would defeat the point of persisting it.
+row stays `pending` until the owning source is registered. A registered rehydrator
+that throws propagates to the pipeline retry ladder.
 """
 function rehydrate_event(source_tag::String, row::EventRow)
     f = lock(EVENT_REHYDRATORS_LOCK) do
@@ -137,12 +137,7 @@ function rehydrate_event(source_tag::String, row::EventRow)
         @warn "Claw: no rehydrator registered for event source; leaving event pending" source = source_tag event_id = row.id event_name = row.name maxlog = 20
         return nothing
     end
-    try
-        return f(row)
-    catch e
-        @error "Claw: rehydrate_event failed; leaving event pending" source = source_tag event_id = row.id exception = (e, catch_backtrace())
-        return nothing
-    end
+    return f(row)
 end
 
 # Built-in sources. Channel-backed replay for the REPL rebuilds a fresh stdout
@@ -684,7 +679,15 @@ function _process_event_batch!(assistant::AgentAssistant, ids::Vector{Int})
             get(assistant._live_events, id, nothing)
         end
         if ev === nothing
-            ev = rehydrate_event(row.source, row)
+            ev = try
+                rehydrate_event(row.source, row)
+            catch e
+                @error "Claw: rehydrate_event failed" source = row.source event_id = row.id exception = (e, catch_backtrace())
+                fallback = ReplayedEvent(row.name, row.content)
+                _handle_event_failure!(assistant, row, fallback, (), e)
+                _clear_wakeup!(assistant, id)
+                continue
+            end
         end
         if ev === nothing
             # The owning source is not registered (or could not rebuild the channel).
@@ -701,6 +704,15 @@ function _process_event_batch!(assistant::AgentAssistant, ids::Vector{Int})
     # them relative to interleaved events of other types on the same lane.
     i = 1
     while i <= length(claimed)
+        if assistant._state[] !== :running
+            remaining = claimed[i:end]
+            for (row, _) in remaining
+                _release_claim!(assistant, row.id)
+                _clear_wakeup!(assistant, row.id)
+            end
+            _release_group_channels!(remaining, nothing)
+            break
+        end
         j = i
         while j < length(claimed) && claimed[j + 1][1].name == claimed[i][1].name
             j += 1
