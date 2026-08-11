@@ -350,7 +350,12 @@ function enable_integration!(assistant::AgentAssistant, name::AbstractString;
         catch e
             error("Integration '$key' configuration is invalid: $(_source_error_detail(es, e))")
         end
-        reg = _register_event_source_tracked!(assistant, es)
+        reg = try
+            _register_event_source_tracked!(assistant, es)
+        catch e
+            detail = _source_error_detail(es, e)
+            error("Failed to register integration '$key': $detail")
+        end
         st = IntegrationState(key, es, nothing, reg.channel_ids, reg.event_type_names,
             reg.tool_names, reg.channels, reg.event_types, reg.tools)
         assistant._integrations[key] = st

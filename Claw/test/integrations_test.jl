@@ -77,6 +77,19 @@ const LEAKY_INVALID_SPEC = Claw.IntegrationSpec(
     "leaky-invalid", "LeakyPkg", "invalid source whose error contains its token", ["token" => "secret token"])
 Claw.register_integration!(LEAKY_INVALID_SPEC, LeakyInvalidSource)
 
+struct LeakyRegistrationSource <: Claw.EventSource
+    token::String
+end
+LeakyRegistrationSource(; token::String = "default-registration-token") =
+    LeakyRegistrationSource(token)
+Claw.get_event_types(es::LeakyRegistrationSource) =
+    error("registration rejected token $(es.token)")
+
+const LEAKY_REGISTRATION_SPEC = Claw.IntegrationSpec(
+    "leaky-registration", "LeakyPkg", "source whose registration error contains its token",
+    ["token" => "secret token"])
+Claw.register_integration!(LEAKY_REGISTRATION_SPEC, LeakyRegistrationSource)
+
 mutable struct SlowExitSource <: Claw.EventSource
     entered::Threads.Atomic{Bool}
     cleaned::Threads.Atomic{Bool}
@@ -629,14 +642,32 @@ end
         @test !occursin("status-secret", sprint(showerror, err))
         @test occursin("[REDACTED]", sprint(showerror, err))
 
+        registration_err = try
+            Claw.enable_integration!(a, "leaky-registration";
+                config = Dict{String, Any}("token" => "registration-secret"))
+            nothing
+        catch e
+            e
+        end
+        @test registration_err !== nothing
+        @test !occursin("registration-secret", sprint(showerror, registration_err))
+        @test occursin("[REDACTED]", sprint(showerror, registration_err))
+
         Claw._exec!(a.db, """
             INSERT INTO claw_integrations (name, enabled, config, updated_at)
             VALUES ('leaky-invalid', 1, NULL, 0)
+        """)
+        Claw._exec!(a.db, """
+            INSERT INTO claw_integrations (name, enabled, config, updated_at)
+            VALUES ('leaky-registration', 1, NULL, 0)
         """)
         Claw._reconcile_integrations!(a)
         status = String(integration_row(a, "leaky-invalid").status)
         @test !occursin("default-token", status)
         @test occursin("[REDACTED]", status)
+        registration_status = String(integration_row(a, "leaky-registration").status)
+        @test !occursin("default-registration-token", registration_status)
+        @test occursin("[REDACTED]", registration_status)
     finally
         Claw.shutdown!(a; timeout_s = 5)
     end
