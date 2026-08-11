@@ -7,6 +7,7 @@ module IntegrationsTests
 using Test
 using Agentif
 using Claw
+using JSON
 using SQLite
 
 # ─── Toy integration ───
@@ -25,11 +26,12 @@ Agentif.close_channel(::ToyChannel) = nothing
 
 mutable struct ToyEventSource <: Claw.EventSource
     token::String
+    label::String
     started::Threads.Atomic{Bool}
     stopped::Threads.Atomic{Bool}
 end
-ToyEventSource(; token::String = "default-token") =
-    ToyEventSource(token, Threads.Atomic{Bool}(false), Threads.Atomic{Bool}(false))
+ToyEventSource(; token::String = "default-token", label::String = "default-label") =
+    ToyEventSource(token, label, Threads.Atomic{Bool}(false), Threads.Atomic{Bool}(false))
 
 toy_tool_impl() = "toy"
 const TOY_TOOL = Agentif.AgentTool{typeof(toy_tool_impl), @NamedTuple{}}(;
@@ -43,8 +45,29 @@ Claw.start!(es::ToyEventSource, ::Claw.AgentAssistant) = (es.started[] = true; n
 Claw.stop!(es::ToyEventSource) = (es.stopped[] = true; nothing)
 
 const TOY_SPEC = Claw.IntegrationSpec("toy", "ToyPkg", "toy integration for tests",
-    ["token" => "the toy token"])
+    ["token" => "the toy token", "label" => "a non-sensitive label"])
 Claw.register_integration!(TOY_SPEC, ToyEventSource)
+
+mutable struct LeakyStartSource <: Claw.EventSource
+    token::String
+end
+LeakyStartSource(; token::String = "default-token") = LeakyStartSource(token)
+Claw.start!(es::LeakyStartSource, ::Claw.AgentAssistant) =
+    Threads.@spawn error("source rejected token $(es.token)")
+
+const LEAKY_START_SPEC = Claw.IntegrationSpec(
+    "leaky-start", "LeakyPkg", "source whose error contains its token", ["token" => "secret token"])
+Claw.register_integration!(LEAKY_START_SPEC, LeakyStartSource)
+
+struct LeakyInvalidSource <: Claw.EventSource
+    token::String
+end
+LeakyInvalidSource(; token::String = "default-token") = LeakyInvalidSource(token)
+Claw.validate_source(es::LeakyInvalidSource) = error("invalid token $(es.token)")
+
+const LEAKY_INVALID_SPEC = Claw.IntegrationSpec(
+    "leaky-invalid", "LeakyPkg", "invalid source whose error contains its token", ["token" => "secret token"])
+Claw.register_integration!(LEAKY_INVALID_SPEC, LeakyInvalidSource)
 
 mutable struct BlockingEventSource <: Claw.EventSource
     stop_entered::Base.Event
@@ -123,7 +146,7 @@ end
         @test event_type_registered(a, "toy_event")
         row = integration_row(a, "toy")
         @test row.enabled == 1
-        @test occursin("abc", String(row.config))
+        @test !occursin("abc", String(row.config))
         @test timedwait(() -> st.source.started[], 5.0) == :ok
         @test st.supervised !== nothing
 
@@ -218,7 +241,8 @@ end
     path = tempname() * ".sqlite"
     a = make_assistant(path)
     a._state[] = :running
-    Claw.enable_integration!(a, "toy"; config = Dict{String, Any}("token" => "persisted-token"))
+    Claw.enable_integration!(a, "toy"; config = Dict{String, Any}(
+        "token" => "ephemeral-secret", "label" => "persisted-label"))
     Claw.shutdown!(a; timeout_s = 5)
 
     # a fresh assistant on the same database re-enables it with the stored config
@@ -229,7 +253,8 @@ end
     try
         st = lock(() -> get(b._integrations, "toy", nothing), b._integrations_lock)
         @test st !== nothing
-        @test st.source.token == "persisted-token"
+        @test st.source.token == "default-token"
+        @test st.source.label == "persisted-label"
         @test timedwait(() -> st.source.started[], 5.0) == :ok
         @test has_tool(b, "toy_integration_tool")
         @test event_type_registered(b, "toy_event")
@@ -259,6 +284,78 @@ end
     rm(path; force = true)
 end
 
+@testset "integration secrets are not persisted" begin
+    path = tempname() * ".sqlite"
+    a = make_assistant(path)
+    try
+        Claw._exec!(a.db, """
+            INSERT INTO claw_integrations (name, enabled, config, status, updated_at)
+            VALUES ('toy', 0, '{"token":"legacy-secret","label":"kept"}', NULL, 0)
+        """)
+        Claw._set_user_version!(a.db, 4)
+    finally
+        Claw.shutdown!(a; timeout_s = 5)
+    end
+
+    b = make_assistant(path)
+    try
+        @test Claw._get_user_version(b.db) == Claw.CLAW_SCHEMA_VERSION
+        row = integration_row(b, "toy")
+        parsed = JSON.parse(String(row.config))
+        @test !haskey(parsed, "token")
+        @test parsed["label"] == "kept"
+        @test !occursin("legacy-secret", String(row.config))
+    finally
+        Claw.shutdown!(b; timeout_s = 5)
+        rm(path; force = true)
+        rm(path * "-wal"; force = true)
+        rm(path * "-shm"; force = true)
+    end
+end
+
+@testset "integration errors redact source secrets" begin
+    a = make_assistant()
+    a._state[] = :running
+    try
+        Claw.enable_integration!(a, "leaky-start";
+            config = Dict{String, Any}("token" => "journal-secret"))
+        @test timedwait(() -> Claw._fetch_one(a.db, """
+            SELECT detail FROM claw_source_journal
+            WHERE source = 'leakystartsource' AND action IN ('start_failed', 'crashed')
+            ORDER BY id DESC LIMIT 1
+        """) !== nothing, 5.0) == :ok
+        journal = Claw._fetch_one(a.db, """
+            SELECT detail FROM claw_source_journal
+            WHERE source = 'leakystartsource' AND action IN ('start_failed', 'crashed')
+            ORDER BY id DESC LIMIT 1
+        """)
+        @test !occursin("journal-secret", String(journal.detail))
+        @test occursin("[REDACTED]", String(journal.detail))
+
+        err = try
+            Claw.enable_integration!(a, "leaky-invalid";
+                config = Dict{String, Any}("token" => "status-secret"))
+            nothing
+        catch e
+            e
+        end
+        @test err !== nothing
+        @test !occursin("status-secret", sprint(showerror, err))
+        @test occursin("[REDACTED]", sprint(showerror, err))
+
+        Claw._exec!(a.db, """
+            INSERT INTO claw_integrations (name, enabled, config, updated_at)
+            VALUES ('leaky-invalid', 1, NULL, 0)
+        """)
+        Claw._reconcile_integrations!(a)
+        status = String(integration_row(a, "leaky-invalid").status)
+        @test !occursin("default-token", status)
+        @test occursin("[REDACTED]", status)
+    finally
+        Claw.shutdown!(a; timeout_s = 5)
+    end
+end
+
 @testset "reconcile failure isolation records status" begin
     path = tempname() * ".sqlite"
     a = make_assistant(path)
@@ -280,6 +377,34 @@ end
         Claw.CURRENT_ASSISTANT[] = nothing
     end
     rm(path; force = true)
+end
+
+@testset "reconcile rejects corrupt stored config" begin
+    path = tempname() * ".sqlite"
+    a = make_assistant(path)
+    Claw._exec!(a.db, """
+        INSERT INTO claw_integrations (name, enabled, config, updated_at)
+        VALUES ('toy', 1, '{broken', 0)
+    """)
+    # Mark this as a current-version row. A migration would correctly discard a
+    # version-4 config before reconciliation gets to validate it.
+    Claw.shutdown!(a; timeout_s = 5)
+
+    b = Claw.init!(path;
+        provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key",
+        timezone = "UTC", level = :error,
+        event_sources = Claw.EventSource[], install_signal_handlers = false)
+    try
+        @test lock(() -> !haskey(b._integrations, "toy"), b._integrations_lock)
+        row = integration_row(b, "toy")
+        @test occursin("not valid JSON", String(row.status))
+    finally
+        Claw.shutdown!(b; timeout_s = 5)
+        Claw.CURRENT_ASSISTANT[] = nothing
+        rm(path; force = true)
+        rm(path * "-wal"; force = true)
+        rm(path * "-shm"; force = true)
+    end
 end
 
 # ─── Adoption of runner-passed sources ───
@@ -331,6 +456,7 @@ end
         @test occursin("- toy [enabled]", Claw.list_integrations())
         st = lock(() -> a._integrations["toy"], a._integrations_lock)
         @test st.source.token == "via-tool"
+        @test !occursin("via-tool", String(integration_row(a, "toy").config))
 
         msg = Claw.disable_integration("toy")
         @test occursin("disabled", msg)

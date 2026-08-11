@@ -312,7 +312,29 @@ end
 # the baseline tables are (idempotently) created, so the ladder below is the only
 # thing that ever has to change a live database.
 
-const CLAW_SCHEMA_VERSION = 4
+const CLAW_SCHEMA_VERSION = 5
+
+function _is_sensitive_integration_key(key)
+    normalized = replace(lowercase(String(key)), r"[^a-z0-9]" => "")
+    normalized in ("key", "auth", "authorization", "cookie", "credentials") && return true
+    occursin("apikey", normalized) && return true
+    occursin("privatekey", normalized) && return true
+    occursin("accesskey", normalized) && return true
+    return any(suffix -> endswith(normalized, suffix),
+        ("token", "secret", "password", "passphrase", "credential"))
+end
+
+function _sanitize_integration_value(value)
+    if value isa AbstractDict
+        return Dict{String, Any}(String(k) => _sanitize_integration_value(v) for (k, v) in value
+            if !_is_sensitive_integration_key(k))
+    elseif value isa AbstractVector
+        return Any[_sanitize_integration_value(v) for v in value]
+    end
+    return value
+end
+
+_sanitize_integration_config(config::AbstractDict) = _sanitize_integration_value(config)
 
 function _get_user_version(db::SQLite.DB)
     version = 0
@@ -408,7 +430,33 @@ function _migration_4!(db::SQLite.DB)
     return nothing
 end
 
-const CLAW_MIGRATIONS = Dict{Int, Function}(2 => _migration_2!, 3 => _migration_3!, 4 => _migration_4!)
+# Version 4 persisted constructor config verbatim. Remove credential-like keys
+# from existing rows and discard old error text, which may quote those values.
+function _migration_5!(db::SQLite.DB)
+    rows = Tuple{String, Union{Nothing, String}}[]
+    for row in SQLite.DBInterface.execute(db, "SELECT name, config FROM claw_integrations")
+        config = (row.config === missing || row.config === nothing) ? nothing : String(row.config)
+        push!(rows, (String(row.name), config))
+    end
+    for (name, raw) in rows
+        sanitized = if raw === nothing || isempty(strip(raw))
+            nothing
+        else
+            parsed = try
+                JSON.parse(raw)
+            catch
+                nothing
+            end
+            parsed isa AbstractDict ? JSON.json(_sanitize_integration_config(parsed)) : nothing
+        end
+        _exec!(db, "UPDATE claw_integrations SET config = ?, status = NULL WHERE name = ?",
+            (sanitized, name))
+    end
+    return nothing
+end
+
+const CLAW_MIGRATIONS = Dict{Int, Function}(
+    2 => _migration_2!, 3 => _migration_3!, 4 => _migration_4!, 5 => _migration_5!)
 
 """
     _migrate_claw_schema!(db)

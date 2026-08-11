@@ -1020,8 +1020,9 @@ function _supervise_source!(assistant::AgentAssistant, ss::SupervisedSource)
             end
         catch e
             unwrapped = _unwrap_error(e)
-            _journal_source!(assistant, ss.tag, started ? "crashed" : "start_failed", sprint(showerror, unwrapped))
-            @error "Claw: event source failed" source = ss.tag exception = (e, catch_backtrace())
+            detail = _source_error_detail(ss.source, unwrapped)
+            _journal_source!(assistant, ss.tag, started ? "crashed" : "start_failed", detail)
+            @error "Claw: event source failed" source = ss.tag error = detail
         end
         (assistant._state[] === :running && !ss.stopped[]) || break
         if ss.restart_requested[]
@@ -1111,8 +1112,9 @@ function _start_supervised_source!(assistant::AgentAssistant, es::EventSource;
             validate_source(es)
         catch e
             ss.stopped[] = true
-            _journal_source!(assistant, tag, "invalid_config", sprint(showerror, _unwrap_error(e)))
-            @error "Claw: source configuration invalid; not started" source = tag exception = (e, catch_backtrace())
+            detail = _source_error_detail(es, e)
+            _journal_source!(assistant, tag, "invalid_config", detail)
+            @error "Claw: source configuration invalid; not started" source = tag error = detail
             _ensure_health_loop!(assistant)
             return ss
         end

@@ -127,7 +127,7 @@ end
 
 function _persist_integration!(assistant::AgentAssistant, name::String, enabled::Bool,
         config::Union{Nothing, AbstractDict})
-    cfg_json = config === nothing ? nothing : JSON.json(config)
+    cfg_json = config === nothing ? nothing : JSON.json(_sanitize_integration_config(config))
     now = time()
     execute_write(assistant._writer) do db
         _with_busy_retry() do
@@ -147,6 +147,51 @@ function _persist_integration!(assistant::AgentAssistant, name::String, enabled:
         end
     end
     return nothing
+end
+
+function _sensitive_integration_values(config::AbstractDict)
+    values = String[]
+    for (key, value) in config
+        if _is_sensitive_integration_key(key)
+            if value !== nothing
+                rendered = value isa AbstractString ? String(value) : string(value)
+                isempty(rendered) || push!(values, rendered)
+            end
+        elseif value isa AbstractDict
+            append!(values, _sensitive_integration_values(value))
+        elseif value isa AbstractVector
+            for item in value
+                item isa AbstractDict && append!(values, _sensitive_integration_values(item))
+            end
+        end
+    end
+    return values
+end
+
+function _redact_sensitive_values(message::AbstractString, values)
+    redacted = String(message)
+    for value in unique(values)
+        isempty(value) || (redacted = replace(redacted, value => "[REDACTED]"))
+    end
+    return redacted
+end
+
+_config_error_detail(error, config::AbstractDict) =
+    _redact_sensitive_values(sprint(showerror, _unwrap_error(error)),
+        _sensitive_integration_values(config))
+
+function _source_error_detail(source::EventSource, error)
+    config = Dict{String, Any}()
+    for field in fieldnames(typeof(source))
+        _is_sensitive_integration_key(field) || continue
+        value = try
+            getfield(source, field)
+        catch
+            nothing
+        end
+        config[String(field)] = value
+    end
+    return _config_error_detail(error, config)
 end
 
 function _set_integration_status!(assistant::AgentAssistant, name::String, status::AbstractString)
@@ -206,8 +251,9 @@ Construct, register and start the cataloged integration `name`. `config` entries
 are passed as keyword arguments to the integration's constructor (environment
 variables supply the defaults). With `persist` (the default), the integration is
 recorded enabled in `claw_integrations` and comes back automatically on the next
-`init!`. Throws with a descriptive message when the integration is unknown,
-already enabled, or its package is not loaded.
+`init!`. Credential-like config values are never persisted; future boots must get
+them from environment variables. Throws with a descriptive message when the
+integration is unknown, already enabled, or its package is not loaded.
 """
 function enable_integration!(assistant::AgentAssistant, name::AbstractString;
         config::AbstractDict = Dict{String, Any}(), persist::Bool = true)
@@ -234,12 +280,13 @@ function enable_integration!(assistant::AgentAssistant, name::AbstractString;
             factory(; kwargs...)
         catch e
             valid = isempty(spec.config_keys) ? "none" : join(first.(spec.config_keys), ", ")
-            error("Failed to construct integration '$key': $(sprint(showerror, e)). Valid config keys: $valid.")
+            detail = _config_error_detail(e, config)
+            error("Failed to construct integration '$key': $detail. Valid config keys: $valid.")
         end
         try
             validate_source(es)
         catch e
-            error("Integration '$key' configuration is invalid: $(sprint(showerror, e))")
+            error("Integration '$key' configuration is invalid: $(_source_error_detail(es, e))")
         end
         reg = _register_event_source_tracked!(assistant, es)
         st = IntegrationState(key, es, nothing, reg.channel_ids, reg.event_type_names, reg.tool_names)
@@ -266,7 +313,7 @@ interrupted) and remove what enabling registered: its channels, its tools, and i
 event types. Handlers subscribed to those event types are kept — they show as
 "(inactive)" in `list_event_handlers` and fire again when the integration is
 re-enabled. With `persist` (the default), the integration is recorded disabled so
-it stays off across restarts (its stored config is kept).
+it stays off across restarts (its stored non-sensitive config is kept).
 """
 function disable_integration!(assistant::AgentAssistant, name::AbstractString; persist::Bool = true)
     key = lowercase(strip(String(name)))
@@ -372,21 +419,19 @@ function _reconcile_integrations!(assistant::AgentAssistant)
             haskey(assistant._integrations, nm)
         end
         already && continue
-        config = Dict{String, Any}()
-        if cfg_raw !== nothing && !isempty(strip(cfg_raw))
-            parsed = try
-                JSON.parse(cfg_raw)
-            catch e
-                @warn "Claw: stored integration config unparseable; enabling with defaults" integration = nm exception = (e,)
-                nothing
-            end
-            if parsed isa AbstractDict
+        try
+            config = Dict{String, Any}()
+            if cfg_raw !== nothing && !isempty(strip(cfg_raw))
+                parsed = try
+                    JSON.parse(cfg_raw)
+                catch
+                    error("Stored integration config is not valid JSON.")
+                end
+                parsed isa AbstractDict || error("Stored integration config is not a JSON object.")
                 for (k, v) in parsed
                     config[String(k)] = v
                 end
             end
-        end
-        try
             enable_integration!(assistant, nm; config, persist = false)
             _set_integration_status!(assistant, nm, "")
         catch e
@@ -456,7 +501,7 @@ Arguments:
 
 Gotchas:
 - Fails if the integration's package is not loaded in this deployment ("unavailable" in list_integrations) — that requires a deployment change, not a tool call.
-- Config values passed here are persisted in the local database; prefer environment variables for secrets.
+- Non-sensitive config values are persisted. Credential-like values are used for this process only; provide them through environment variables for future boots.
 - The integration starts immediately; a misconfigured one will log errors and retry under its restart budget.""" function enable_integration(name::String, config_json::Union{Nothing, String} = nothing)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
@@ -477,12 +522,14 @@ Gotchas:
     catch e
         return sprint(showerror, e)
     end
-    return "Integration '$name' enabled and started. It will start automatically on future boots."
+    secret_note = any(_is_sensitive_integration_key, keys(config)) ?
+        " Sensitive values were not persisted; future boots must get them from the environment." : ""
+    return "Integration '$name' enabled and started. It will start automatically on future boots.$secret_note"
 end
 
 const DISABLE_INTEGRATION_TOOL = @tool """Disable a running integration: stop its event source and persist it as disabled so it stays off across restarts.
 
-Its event handlers are kept (shown "(inactive)" in list_event_handlers) and fire again if the integration is re-enabled. Its stored config is kept too.
+Its event handlers are kept (shown "(inactive)" in list_event_handlers) and fire again if the integration is re-enabled. Its stored non-sensitive config is kept too.
 
 Arguments:
 - name (String, required): Integration name from list_integrations.
