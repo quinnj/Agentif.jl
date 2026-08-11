@@ -207,6 +207,10 @@ integration_row(a, name) =
     # built-in catalog entries exist without their packages loaded
     @test haskey(Claw.INTEGRATION_SPECS, "slack")
     @test haskey(Claw.INTEGRATION_SPECS, "fastmail")
+    github_keys = Set(first.(Claw.INTEGRATION_SPECS["github"].config_keys))
+    @test Set(["app_id", "private_key_path", "app_slug", "mention_aliases"]) <= github_keys
+    @test !haskey(Claw._sanitize_integration_config(
+        Dict("private_key_path" => "/secret/app.pem")), "private_key_path")
     # registering a factory for an uncataloged name requires a spec
     @test_throws ArgumentError Claw.register_integration!("not-in-catalog", ToyEventSource)
     # the toy spec + factory registered above is visible
