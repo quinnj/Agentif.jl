@@ -732,12 +732,59 @@ end
 Claw.third_party_content(::GitHubEventSource) = true
 
 Claw.event_source_tag(::GitHubWebhookEvent) = "github"
-Claw.event_extra(ev::GitHubWebhookEvent) = Dict{String, Any}(
-    "kind" => ev.kind, "action" => ev.action, "repo" => ev.repo_name, "sender" => ev.sender_login)
+function Claw.event_extra(ev::GitHubWebhookEvent)
+    ch = ev.channel
+    installation = get(() -> nothing, ev.payload, "installation")
+    installation_id = installation isa AbstractDict ?
+        _int_or_nothing(get(() -> nothing, installation, "id")) : nothing
+    return Dict{String, Any}(
+        "kind" => ev.kind,
+        "action" => ev.action,
+        "repo" => ev.repo_name,
+        "sender" => ev.sender_login,
+        "issue_number" => ch.issue_number,
+        "pull_request_number" => ch.pull_request_number,
+        "source_id" => ch.source_id,
+        "source_reaction_path" => ch.source_reaction_path,
+        "installation_id" => installation_id,
+    )
+end
 
-# GitHub webhook events carry no channel, so replay only needs name + content.
-function _register_github_rehydrator!()
-    Claw.register_rehydrator!("github", row -> Claw.ReplayedEvent(row.name, row.content))
+_extra_string(extra::AbstractDict, key::String) =
+    (value = get(() -> nothing, extra, key); value === nothing ? "" : string(value))
+
+function _rehydrate_github_event(source::GitHubEventSource, row)
+    extra = row.extra
+    repo_name = _extra_string(extra, "repo")
+    kind = _extra_string(extra, "kind")
+    sender = _extra_string(extra, "sender")
+    issue_number = _int_or_nothing(get(() -> nothing, extra, "issue_number"))
+    pull_request_number = _int_or_nothing(get(() -> nothing, extra, "pull_request_number"))
+    source_id = _int_or_nothing(get(() -> nothing, extra, "source_id"))
+    reaction_value = get(() -> nothing, extra, "source_reaction_path")
+    reaction_path = reaction_value === nothing ? nothing : string(reaction_value)
+    installation_id = _int_or_nothing(get(() -> nothing, extra, "installation_id"))
+    auth = installation_id === nothing ? nothing :
+        _get_installation_auth(source, Dict{String, Any}(
+            "installation" => Dict{String, Any}("id" => installation_id)))
+    channel = GitHubChannel(
+        repo_name,
+        issue_number,
+        pull_request_number,
+        kind,
+        source_id,
+        reaction_path,
+        auth,
+        nothing,
+        nothing,
+        sender,
+        _channel_display_name(repo_name, issue_number, pull_request_number),
+    )
+    return Claw.ReplayedChannelEvent(row.name, row.content, channel)
+end
+
+function _register_github_rehydrator!(source::GitHubEventSource)
+    Claw.register_rehydrator!("github", row -> _rehydrate_github_event(source, row))
     return nothing
 end
 
@@ -793,7 +840,7 @@ function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
         "GitHubEventSource requires a webhook secret. Set GITHUB_WEBHOOK_SECRET " *
         "(and configure the same secret on the GitHub webhook) before starting.")
     webhook_secret = String(secret)
-    _register_github_rehydrator!()
+    _register_github_rehydrator!(source)
     repos = source.repos !== nothing ? map(GitHub.Repo, source.repos) : nothing
     host = Sockets.IPv4(source.host)
     port = source.port

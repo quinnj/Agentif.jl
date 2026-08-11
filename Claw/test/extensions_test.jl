@@ -154,6 +154,31 @@ if HAS_GITHUB
     @test Agentif.channel_id(comment_channel) == "github:owner/repo:pr:7"
     @test Agentif.entry_id(comment_channel) == "17"
 
+    # Durable replay keeps the comment target. Installation credentials are
+    # recreated from source configuration and are never stored in the event row.
+    replay_payload = copy(ev_comment.payload)
+    replay_payload["installation"] = Dict{String, Any}("id" => 1234)
+    replay_event = ext.GitHubWebhookEvent(
+        "github_issue_comment", "issue_comment", "created", replay_payload,
+        "owner/repo", "eve"; auth)
+    replay_extra = Claw.event_extra(replay_event)
+    @test replay_extra["installation_id"] == 1234
+    @test !haskey(replay_extra, "auth")
+    replay_row = Claw.EventRow(
+        1, "github", Claw.get_name(replay_event), nothing,
+        Agentif.channel_id(Claw.get_channel(replay_event)),
+        Claw.event_content(replay_event), replay_extra,
+        Agentif.channel_id(Claw.get_channel(replay_event)), 1, nothing,
+    )
+    replayed = ext._rehydrate_github_event(source, replay_row)
+    @test replayed isa Claw.ReplayedChannelEvent
+    replayed_channel = Claw.get_channel(replayed)
+    @test Agentif.channel_id(replayed_channel) == "github:owner/repo:pr:7"
+    @test Agentif.entry_id(replayed_channel) == "17"
+    @test replayed_channel.source_reaction_path ==
+        "/repos/owner/repo/issues/comments/17/reactions"
+    @test replayed_channel.auth === nothing
+
     # Generic event fallback
     ev_star = ext.GitHubWebhookEvent("github_star", "star", "created", Dict{String,Any}("action" => "created"), "owner/repo", "fan")
     @test Claw.get_name(ev_star) == "github_star"
