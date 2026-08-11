@@ -335,6 +335,7 @@ end
 
 Claw.get_name(ev::GitHubWebhookEvent) = ev.name
 Claw.get_channel(ev::GitHubWebhookEvent) = ev.channel
+Claw.is_trusted_content(::GitHubWebhookEvent) = false
 
 function Claw.event_content(ev::GitHubWebhookEvent)
     p = ev.payload
@@ -753,6 +754,17 @@ end
 _extra_string(extra::AbstractDict, key::String) =
     (value = get(() -> nothing, extra, key); value === nothing ? "" : string(value))
 
+struct ReplayedGitHubWebhookEvent <: Claw.ChannelEvent
+    name::String
+    content::String
+    channel::GitHubChannel
+end
+
+Claw.get_name(ev::ReplayedGitHubWebhookEvent) = ev.name
+Claw.event_content(ev::ReplayedGitHubWebhookEvent) = ev.content
+Claw.get_channel(ev::ReplayedGitHubWebhookEvent) = ev.channel
+Claw.is_trusted_content(::ReplayedGitHubWebhookEvent) = false
+
 function _rehydrate_github_event(source::GitHubEventSource, row)
     extra = row.extra
     repo_name = _extra_string(extra, "repo")
@@ -780,7 +792,7 @@ function _rehydrate_github_event(source::GitHubEventSource, row)
         sender,
         _channel_display_name(repo_name, issue_number, pull_request_number),
     )
-    return Claw.ReplayedChannelEvent(row.name, row.content, channel)
+    return ReplayedGitHubWebhookEvent(row.name, row.content, channel)
 end
 
 function _register_github_rehydrator!(source::GitHubEventSource)

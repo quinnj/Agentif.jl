@@ -149,6 +149,7 @@ if HAS_GITHUB
     @test occursin("LGTM!", content_comment)
     @test occursin("Bug report", content_comment)
     @test occursin("Direct mention: yes", content_comment)
+    @test startswith(Claw.event_prompt_content(ev_comment), Claw.UNTRUSTED_EVENT_OPEN)
     @test ev_comment.direct_ping
     comment_channel = Claw.get_channel(ev_comment)
     @test Agentif.channel_id(comment_channel) == "github:owner/repo:pr:7"
@@ -171,7 +172,8 @@ if HAS_GITHUB
         Agentif.channel_id(Claw.get_channel(replay_event)), 1, nothing,
     )
     replayed = ext._rehydrate_github_event(source, replay_row)
-    @test replayed isa Claw.ReplayedChannelEvent
+    @test replayed isa Claw.ChannelEvent
+    @test startswith(Claw.event_prompt_content(replayed), Claw.UNTRUSTED_EVENT_OPEN)
     replayed_channel = Claw.get_channel(replayed)
     @test Agentif.channel_id(replayed_channel) == "github:owner/repo:pr:7"
     @test Agentif.entry_id(replayed_channel) == "17"
