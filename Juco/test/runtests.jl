@@ -76,9 +76,15 @@ end
         @test occursin("Edited sub/new.txt", result)
         @test occursin("1 | line A", result)
         @test occursin("2 | line b", result)
-        # non-unique match errors
+        # non-unique match errors name the occurrence lines
         write(joinpath(dir, "dup.txt"), "x\nx\n")
-        @test_throws ArgumentError edit.func("dup.txt", "x", "y")
+        err = try edit.func("dup.txt", "x", "y"); nothing catch e; e end
+        @test err isa ArgumentError && occursin("at lines 1, 2", err.msg)
+        # not-found errors include nearest-match candidates
+        write(joinpath(dir, "near.txt"), "alpha\nbeta = 1\ngamma\n")
+        err = try edit.func("near.txt", "beta = 2", "beta = 3"); nothing catch e; e end
+        @test err isa ArgumentError && occursin("Closest candidates", err.msg)
+        @test occursin("beta = 1", err.msg)
         # missing file errors
         @test_throws ArgumentError edit.func("nope.txt", "a", "b")
         # identical replacement errors

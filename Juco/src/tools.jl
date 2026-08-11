@@ -102,6 +102,35 @@ Examples:
     )
 end
 
+# When an exact match fails, point the model at the closest candidates (lines
+# containing the first line of its oldText) so it can re-anchor without a
+# read + guess round trip.
+function nearest_match_hint(content::String, oldText::String; max_hits::Int = 3)
+    anchor = ""
+    for line in eachsplit(oldText, '\n')
+        s = strip(line)
+        isempty(s) || (anchor = String(s); break)
+    end
+    isempty(anchor) && return ""
+    lines = split(content, "\n"; keepempty = true)
+    hits = [i for (i, l) in enumerate(lines) if occursin(anchor, l)]
+    if isempty(hits)
+        # the whole line missed (that's often why the edit failed) — fall back
+        # to its first word to find near-miss regions
+        word = first(eachsplit(anchor, r"\s+"))
+        isempty(word) && return ""
+        hits = [i for (i, l) in enumerate(lines) if occursin(word, l)]
+        isempty(hits) && return ""
+    end
+    sections = String[]
+    for i in first(hits, max_hits)
+        lo, hi = max(1, i - 2), min(length(lines), i + 2)
+        push!(sections, join(("$(lpad(j, 5)) | $(lines[j])" for j in lo:hi), "\n"))
+    end
+    plural = length(hits) > max_hits ? " (showing $(max_hits) of $(length(hits)))" : ""
+    return "\nClosest candidates$(plural) — check exact whitespace/quoting against these:\n" * join(sections, "\n  ...\n")
+end
+
 # Show the edited region (with numbered context lines) so the model can verify
 # the change without a follow-up read.
 function edited_region(new_content::String, replace_start::Int, new_text::String; context::Int = 3)
@@ -145,8 +174,12 @@ Errors if: oldText not found or not unique, file missing when editing, or file a
             isfile(resolved) || throw(ArgumentError("file not found: $(path) (to create it, pass oldText = \"\")"))
             content = Base.read(resolved, String)
             matches = findall(oldText, content)
-            isempty(matches) && throw(ArgumentError("could not find the exact text in $(path)"))
-            length(matches) > 1 && throw(ArgumentError("found $(length(matches)) occurrences in $(path); include more surrounding context to make oldText unique"))
+            isempty(matches) && throw(ArgumentError(
+                "could not find the exact text in $(path)." * nearest_match_hint(content, oldText)))
+            if length(matches) > 1
+                match_lines = [count(==('\n'), content[1:prevind(content, first(m))]) + 1 for m in matches]
+                throw(ArgumentError("found $(length(matches)) occurrences in $(path) (at lines $(join(match_lines, ", "))); include more surrounding context to make oldText unique"))
+            end
             idx = matches[1]
             replace_start = first(idx)
             new_content = content[1:prevind(content, replace_start)] * newText * content[nextind(content, last(idx)):end]
