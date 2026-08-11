@@ -116,6 +116,11 @@ end
     @test Claw.passes_filter(nothing, handler_row(nothing), ev, NO_EXTRA)
     @test Claw.passes_filter(nothing, handler_row(Claw.EventFilter(:regex, "(?i)urgent")), ev, NO_EXTRA)
     @test !Claw.passes_filter(nothing, handler_row(Claw.EventFilter(:regex, "vacation")), ev, NO_EXTRA)
+    # PCRE stops catastrophic backtracking at its match limit. Hostile event text
+    # must become a non-match, not an exception that consumes the retry budget.
+    hostile = PlainEvent("e", repeat("a", 64) * "!")
+    @test !Claw.passes_filter(nothing,
+        handler_row(Claw.EventFilter(:regex, raw"(a+)+$")), hostile, NO_EXTRA)
 end
 
 @testset "passes_filter: jsonpath" begin

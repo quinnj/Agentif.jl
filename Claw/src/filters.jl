@@ -153,6 +153,18 @@ _filter_value_string(v::AbstractString) = String(v)
 _filter_value_string(v::Nothing) = "null"
 _filter_value_string(v) = JSON.json(v)
 
+function _filter_regex_matches(pattern::AbstractString, value::AbstractString)
+    try
+        return occursin(Regex(String(pattern)), value)
+    catch e
+        if e isa ErrorException && startswith(e.msg, "PCRE.exec error:")
+            @warn "Claw: event filter regex exceeded runtime limits; treating as non-match" maxlog = 20
+            return false
+        end
+        rethrow()
+    end
+end
+
 # ─── Prompt filter (LLM classifier) ───
 
 const EVENT_FILTER_PROMPT = """
@@ -222,13 +234,12 @@ function passes_filter(assistant, handler, ev::Event, extra::Dict{String, Any} =
     f === nothing && return true
     f = f::EventFilter
     if f.kind === :regex
-        return occursin(Regex(f.expr), event_content(ev))
+        return _filter_regex_matches(f.expr, event_content(ev))
     elseif f.kind === :jsonpath
         vals = _jsonpath_extract(_filter_document(ev, extra), _parse_jsonpath(f.expr))
         isempty(vals) && return false
         f.pattern === nothing && return true
-        re = Regex(f.pattern)
-        return any(v -> occursin(re, _filter_value_string(v)), vals)
+        return any(v -> _filter_regex_matches(f.pattern, _filter_value_string(v)), vals)
     else
         return PROMPT_FILTER_FN[](assistant, f.expr, event_content(ev))::Bool
     end
