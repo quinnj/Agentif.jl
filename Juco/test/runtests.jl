@@ -65,9 +65,12 @@ end
         @test read(joinpath(dir, "sub", "new.txt"), String) == "line a\nline b\n"
         # creating an existing file errors
         @test_throws ArgumentError edit.func("sub/new.txt", "", "other")
-        # unique replace
-        edit.func("sub/new.txt", "line a", "line A")
+        # unique replace returns the edited region for verification
+        result = edit.func("sub/new.txt", "line a", "line A")
         @test read(joinpath(dir, "sub", "new.txt"), String) == "line A\nline b\n"
+        @test occursin("Edited sub/new.txt", result)
+        @test occursin("1 | line A", result)
+        @test occursin("2 | line b", result)
         # non-unique match errors
         write(joinpath(dir, "dup.txt"), "x\nx\n")
         @test_throws ArgumentError edit.func("dup.txt", "x", "y")

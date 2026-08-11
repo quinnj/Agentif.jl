@@ -91,10 +91,23 @@ Examples:
     )
 end
 
+# Show the edited region (with numbered context lines) so the model can verify
+# the change without a follow-up read.
+function edited_region(new_content::String, replace_start::Int, new_text::String; context::Int = 3)
+    prefix = new_content[1:replace_start-1]
+    first_changed = count(==('\n'), prefix) + 1
+    last_changed = first_changed + count(==('\n'), new_text)
+    lines = split(new_content, "\n"; keepempty = true)
+    lo = max(1, first_changed - context)
+    hi = min(length(lines), last_changed + context)
+    numbered = ["$(lpad(i, 5)) | $(lines[i])" for i in lo:hi]
+    return "lines $(lo)-$(hi) now:\n" * join(numbered, "\n")
+end
+
 function create_edit_tool(base_dir::AbstractString)
     base = LLMTools.ensure_base_dir(base_dir)
     return Agentif.@tool(
-        """Edit a file by replacing an exact text match, or create a new file.
+        """Edit a file by replacing an exact text match, or create a new file. Returns the edited region so you can verify the change without re-reading the file.
 
 To EDIT: `oldText` must match exactly one location in the file (whitespace-sensitive). Include enough surrounding lines to make the match unique, but keep it as small as possible.
 
@@ -124,10 +137,11 @@ Errors if: oldText not found or not unique, file missing when editing, or file a
             isempty(matches) && throw(ArgumentError("could not find the exact text in $(path)"))
             length(matches) > 1 && throw(ArgumentError("found $(length(matches)) occurrences in $(path); include more surrounding context to make oldText unique"))
             idx = matches[1]
-            new_content = content[1:prevind(content, first(idx))] * newText * content[nextind(content, last(idx)):end]
+            replace_start = first(idx)
+            new_content = content[1:prevind(content, replace_start)] * newText * content[nextind(content, last(idx)):end]
             new_content == content && throw(ArgumentError("replacement produced identical content for $(path)"))
             Base.write(resolved, new_content)
-            return "Edited $(path)"
+            return "Edited $(path), " * edited_region(new_content, replace_start, newText)
         end,
     )
 end
