@@ -64,7 +64,7 @@ end
 # wildcards over arrays and objects. No recursive descent, slices, or predicate
 # expressions — event routing does not need a query language, it needs field access.
 
-const _JSONPATH_SEGMENT_RE = r"^(?:\.(\*)|\.([^.\[]+)|\[(\d+)\]|(\[\*\])|\['([^']*)'\]|\[\"([^\"]*)\"\])"
+const _JSONPATH_SEGMENT_RE = r"""^(?:\.(\*)|\.([^.\[\]\s'"]+)|\[(\d+)\]|(\[\*\])|\['([^']*)'\]|\["([^"]*)"\])"""
 
 function _parse_jsonpath(path::AbstractString)
     s = strip(String(path))
@@ -81,7 +81,10 @@ function _parse_jsonpath(path::AbstractString)
         elseif m.captures[2] !== nothing
             push!(tokens, String(m.captures[2]))
         elseif m.captures[3] !== nothing
-            push!(tokens, parse(Int, m.captures[3]))
+            idx = tryparse(Int, m.captures[3])
+            idx === nothing && throw(ArgumentError(
+                "JSONPath array index is too large: $(m.captures[3])"))
+            push!(tokens, idx)
         elseif m.captures[5] !== nothing
             push!(tokens, String(m.captures[5]))
         else
@@ -133,14 +136,14 @@ function _filter_document(ev::Event, extra::Dict{String, Any})
     content = event_content(ev)
     parsed = begin
         stripped = strip(content)
-        if startswith(stripped, "{") || startswith(stripped, "[")
+        if isempty(stripped)
+            content
+        else
             try
                 JSON.parse(content)
             catch
                 content
             end
-        else
-            content
         end
     end
     return Dict{String, Any}("name" => get_name(ev), "content" => parsed, "extra" => extra)
