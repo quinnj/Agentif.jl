@@ -312,10 +312,11 @@ function _sse_loop(source::FastmailEventSource, assistant::Claw.AgentAssistant)
                 "Keep-Alive" => "timeout=$(source.ping * 4)",
             ]
             context = HTTP.RequestContext()
-            lock(source._lock) do
+            should_stop = lock(source._lock) do
                 source._context = context
-                source._stopping[] && HTTP.cancel!(context; message="JMAP source stopping")
+                source._stopping[]
             end
+            should_stop && HTTP.cancel!(context; message="JMAP source stopping")
             HTTP.open("GET", url, headers; context) do stream
                 HTTP._parse_sse_stream!(stream) do event
                     event.event !== nothing && event.event != "state" && return
@@ -413,11 +414,11 @@ function Claw.start!(source::FastmailEventSource, assistant::Claw.AgentAssistant
 end
 
 function Claw.stop!(source::FastmailEventSource)
-    lock(source._lock) do
+    context = lock(source._lock) do
         source._stopping[] = true
-        source._context === nothing ||
-            HTTP.cancel!(source._context; message="JMAP source stopping")
+        source._context
     end
+    context === nothing || HTTP.cancel!(context; message="JMAP source stopping")
     return nothing
 end
 # ═══════════════════════════════════════════════════════════

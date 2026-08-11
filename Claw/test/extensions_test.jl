@@ -26,6 +26,21 @@ count_events(assistant, sql, params = ()) =
         params,
     ).n)
 
+mutable struct LockAwareCloser
+    lock::ReentrantLock
+    closed::Threads.Atomic{Bool}
+end
+
+function Base.close(closer::LockAwareCloser)
+    task = Threads.@spawn lock(closer.lock) do
+        closer.closed[] = true
+    end
+    timedwait(() -> istaskdone(task), 1.0) == :ok ||
+        error("close called while the source lock was held")
+    fetch(task)
+    return nothing
+end
+
 const HAS_GITHUB = try
     @eval using GitHub
     true
@@ -49,6 +64,11 @@ if HAS_GITHUB
     @test which(Claw.stop!, (typeof(source),)).module === ext
     @test Claw.stop!(source) === nothing
     @test source._stopping[]
+    lock_aware = ext.GitHubEventSource(; secret="test-secret", port=19877)
+    closer = LockAwareCloser(lock_aware._lock, Threads.Atomic{Bool}(false))
+    lock_aware._server = closer
+    @test Claw.stop!(lock_aware) === nothing
+    @test closer.closed[]
     event_types = Claw.get_event_types(source)
     et_names = Set(et.name for et in event_types)
 

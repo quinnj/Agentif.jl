@@ -523,10 +523,11 @@ end
 function _run_telegram_webhook(source::TelegramEventSource, handler::Function)
     server = HTTP.serve!(req -> _telegram_webhook_response(source, handler, req),
         source.host, source.port)
-    lock(source._lock) do
+    should_stop = lock(source._lock) do
         source._server = server
-        source._stopping[] && close(server)
+        source._stopping[]
     end
+    should_stop && close(server)
     try
         wait(server)
     finally
@@ -590,10 +591,11 @@ function Claw.start!(source::TelegramEventSource, assistant::Claw.AgentAssistant
 end
 
 function Claw.stop!(source::TelegramEventSource)
-    lock(source._lock) do
+    server = lock(source._lock) do
         source._stopping[] = true
-        source._server === nothing || close(source._server)
+        source._server
     end
+    server === nothing || close(server)
     return nothing
 end
 

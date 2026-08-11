@@ -626,10 +626,11 @@ function Claw.start!(source::SlackEventSource, assistant::Claw.AgentAssistant)
                 end
             end
         end)
-        lock(source._lock) do
+        should_stop = lock(source._lock) do
             source.socket_client = socket_client
-            source._stopping[] && Slack.close!(socket_client)
+            source._stopping[]
         end
+        should_stop && Slack.close!(socket_client)
         try
             Slack.run!(socket_client)
         finally
@@ -642,10 +643,11 @@ function Claw.start!(source::SlackEventSource, assistant::Claw.AgentAssistant)
 end
 
 function Claw.stop!(source::SlackEventSource)
-    lock(source._lock) do
+    socket_client = lock(source._lock) do
         source._stopping[] = true
-        source.socket_client === nothing || Slack.close!(source.socket_client)
+        source.socket_client
     end
+    socket_client === nothing || Slack.close!(socket_client)
     return nothing
 end
 

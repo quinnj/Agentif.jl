@@ -434,10 +434,11 @@ function _run_mattermost_websocket(source::MattermostEventSource, handler::Funct
     while !source._stopping[]
         try
             HTTP.WebSockets.open(ws_url; headers) do ws
-                lock(source._lock) do
+                should_stop = lock(source._lock) do
                     source._ws = ws
-                    source._stopping[] && HTTP.WebSockets.close(ws)
+                    source._stopping[]
                 end
+                should_stop && HTTP.WebSockets.close(ws)
                 consecutive_errors = 0
                 for msg in ws
                     source._stopping[] && break
@@ -490,10 +491,11 @@ function Claw.start!(source::MattermostEventSource, assistant::Claw.AgentAssista
 end
 
 function Claw.stop!(source::MattermostEventSource)
-    lock(source._lock) do
+    ws = lock(source._lock) do
         source._stopping[] = true
-        source._ws === nothing || HTTP.WebSockets.close(source._ws)
+        source._ws
     end
+    ws === nothing || HTTP.WebSockets.close(ws)
     return nothing
 end
 

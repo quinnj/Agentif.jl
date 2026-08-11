@@ -377,10 +377,11 @@ function Claw.start!(source::MSTeamsEventSource, assistant::Claw.AgentAssistant)
         handler = _authenticating_handler(routed, source, keys)
         @info "ClawMSTeamsExt: Starting authenticated webhook server" host=source.host port=source.port path=source.path
         server = HTTP.serve!(handler, source.host, source.port)
-        lock(source._lock) do
+        should_stop = lock(source._lock) do
             source._server = server
-            source._stopping[] && close(server)
+            source._stopping[]
         end
+        should_stop && close(server)
         try
             wait(server)
         finally
@@ -396,10 +397,11 @@ function Claw.start!(source::MSTeamsEventSource, assistant::Claw.AgentAssistant)
 end
 
 function Claw.stop!(source::MSTeamsEventSource)
-    lock(source._lock) do
+    server = lock(source._lock) do
         source._stopping[] = true
-        source._server === nothing || close(source._server)
+        source._server
     end
+    server === nothing || close(server)
     return nothing
 end
 

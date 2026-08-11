@@ -215,10 +215,11 @@ function _run_signal_websocket(source::SignalEventSource, handler::Function)
     while !source._stopping[]
         try
             HTTP.WebSockets.open(url) do ws
-                lock(source._lock) do
+                should_stop = lock(source._lock) do
                     source._ws = ws
-                    source._stopping[] && HTTP.WebSockets.close(ws)
+                    source._stopping[]
                 end
+                should_stop && HTTP.WebSockets.close(ws)
                 for msg in ws
                     source._stopping[] && break
                     raw = msg isa AbstractVector{UInt8} ? String(msg) : String(msg)
@@ -280,10 +281,11 @@ function Claw.start!(source::SignalEventSource, assistant::Claw.AgentAssistant)
 end
 
 function Claw.stop!(source::SignalEventSource)
-    lock(source._lock) do
+    ws = lock(source._lock) do
         source._stopping[] = true
-        source._ws === nothing || HTTP.WebSockets.close(source._ws)
+        source._ws
     end
+    ws === nothing || HTTP.WebSockets.close(ws)
     return nothing
 end
 

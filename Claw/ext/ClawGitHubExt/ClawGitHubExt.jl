@@ -467,10 +467,11 @@ function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
         end
         @info "ClawGitHubExt: listening on $(source.host):$(source.port)"
         server = HTTP.serve!(listener.handle_request, string(host), port)
-        lock(source._lock) do
+        should_stop = lock(source._lock) do
             source._server = server
-            source._stopping[] && close(server)
+            source._stopping[]
         end
+        should_stop && close(server)
         try
             wait(server)
         finally
@@ -486,10 +487,11 @@ function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
 end
 
 function Claw.stop!(source::GitHubEventSource)
-    lock(source._lock) do
+    server = lock(source._lock) do
         source._stopping[] = true
-        source._server === nothing || close(source._server)
+        source._server
     end
+    server === nothing || close(server)
     return nothing
 end
 
