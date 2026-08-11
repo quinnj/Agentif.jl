@@ -182,6 +182,8 @@ _config_error_detail(error, config::AbstractDict) =
     _redact_sensitive_values(sprint(showerror, _unwrap_error(error)),
         _sensitive_integration_values(config))
 
+_integration_secret_values(::EventSource) = String[]
+
 function _source_error_detail(source::EventSource, error)
     config = Dict{String, Any}()
     for field in fieldnames(typeof(source))
@@ -193,7 +195,9 @@ function _source_error_detail(source::EventSource, error)
         end
         config[String(field)] = value
     end
-    return _config_error_detail(error, config)
+    values = _sensitive_integration_values(config)
+    append!(values, _integration_secret_values(source))
+    return _redact_sensitive_values(sprint(showerror, _unwrap_error(error)), values)
 end
 
 function _set_integration_status!(assistant::AgentAssistant, name::String, status::AbstractString)

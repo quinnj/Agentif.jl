@@ -673,6 +673,12 @@ end
 @testset "ClawMattermostExt channel + event mapping" begin
     ext = Base.get_extension(Claw, :ClawMattermostExt)
     @test ext !== nothing
+    withenv("MATTERMOST_TOKEN" => "mattermost-journal-secret") do
+        detail = Claw._source_error_detail(ext.MattermostEventSource(),
+            ErrorException("request used mattermost-journal-secret"))
+        @test !occursin("mattermost-journal-secret", detail)
+        @test occursin("[REDACTED]", detail)
+    end
 
     source = ext.MattermostEventSource()
     @test which(Claw.stop!, (typeof(source),)).module === ext
@@ -1103,6 +1109,13 @@ end
 @testset "ClawTelegramExt durable replay" begin
     ext = Base.get_extension(Claw, :ClawTelegramExt)
     @test ext !== nothing
+    withenv("TELEGRAM_BOT_TOKEN" => "telegram-journal-secret") do
+        source = ext.TelegramEventSource()
+        detail = Claw._source_error_detail(source,
+            ErrorException("GET https://api.telegram.org/bottelegram-journal-secret/getMe"))
+        @test !occursin("telegram-journal-secret", detail)
+        @test occursin("[REDACTED]", detail)
+    end
 
     client = Telegram.Client("test-token", "https://example.invalid/")
     source = ext.TelegramEventSource(; client)

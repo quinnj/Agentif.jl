@@ -290,6 +290,12 @@ Base.@kwdef mutable struct TelegramEventSource <: Claw.EventSource
     _lock::ReentrantLock = ReentrantLock()
 end
 
+function Claw._integration_secret_values(source::TelegramEventSource)
+    values = String[get(ENV, "TELEGRAM_BOT_TOKEN", "")]
+    source.secret_token === nothing || push!(values, source.secret_token)
+    return values
+end
+
 Claw.get_event_types(::TelegramEventSource) = Claw.EventType[MESSAGE_EVENT_TYPE, REACTION_EVENT_TYPE]
 
 function Claw.validate_source(source::TelegramEventSource)

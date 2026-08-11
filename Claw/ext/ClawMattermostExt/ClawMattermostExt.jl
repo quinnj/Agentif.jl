@@ -248,6 +248,9 @@ end
 MattermostEventSource() = MattermostEventSource(
     nothing, nothing, nothing, Threads.Atomic{Bool}(false), ReentrantLock())
 
+Claw._integration_secret_values(::MattermostEventSource) =
+    String[get(ENV, "MATTERMOST_TOKEN", "")]
+
 function Claw.get_channels(source::MattermostEventSource)
     source.client === nothing && return Agentif.AbstractChannel[]
     Mattermost.with_client(source.client) do
