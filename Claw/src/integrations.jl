@@ -92,9 +92,9 @@ not in the built-in catalog.
 """
 function register_integration!(name::AbstractString, factory)
     key = lowercase(strip(String(name)))
-    haskey(INTEGRATION_SPECS, key) || throw(ArgumentError(
-        "unknown integration '$key'; third-party integrations must register an IntegrationSpec: register_integration!(spec, factory)"))
     lock(INTEGRATIONS_LOCK) do
+        haskey(INTEGRATION_SPECS, key) || throw(ArgumentError(
+            "unknown integration '$key'; third-party integrations must register an IntegrationSpec: register_integration!(spec, factory)"))
         INTEGRATION_FACTORIES[key] = factory
     end
     return factory
@@ -102,8 +102,10 @@ end
 
 function register_integration!(spec::IntegrationSpec, factory)
     key = lowercase(strip(spec.name))
+    isempty(key) && throw(ArgumentError("integration name cannot be empty"))
+    canonical = IntegrationSpec(key, spec.package, spec.description, spec.config_keys)
     lock(INTEGRATIONS_LOCK) do
-        INTEGRATION_SPECS[key] = spec
+        INTEGRATION_SPECS[key] = canonical
         INTEGRATION_FACTORIES[key] = factory
     end
     return factory
@@ -463,6 +465,7 @@ const LIST_INTEGRATIONS_TOOL = @tool """List every integration Claw knows about 
 
 Statuses:
 - "enabled": running now (managed — can be disabled with disable_integration).
+- "enabled (stopped)": configured as enabled, but its supervisor stopped after a permanent failure or exhausted restart budget.
 - "available": package loaded, ready to enable with enable_integration.
 - "unavailable": in the catalog, but its package is not loaded in this deployment, so it cannot be enabled until the deployment adds it.
 
@@ -483,11 +486,12 @@ Returns one block per integration: name, status, description, config keys, and t
     specs = lock(() -> sort!(collect(values(INTEGRATION_SPECS)); by = s -> s.name), INTEGRATIONS_LOCK)
     lines = String[]
     for spec in specs
-        enabled = lock(a._integrations_lock) do
-            haskey(a._integrations, spec.name)
+        state = lock(a._integrations_lock) do
+            get(a._integrations, spec.name, nothing)
         end
-        status = if enabled
-            "enabled"
+        status = if state !== nothing
+            ss = state.supervised
+            ss !== nothing && ss.stopped[] ? "enabled (stopped)" : "enabled"
         elseif _integration_factory(spec.name) !== nothing
             "available"
         else

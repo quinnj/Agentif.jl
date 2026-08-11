@@ -130,6 +130,10 @@ integration_row(a, name) =
     # the toy spec + factory registered above is visible
     @test Claw._integration_factory("toy") === ToyEventSource
     @test Claw._integration_name_for(ToyEventSource()) == "toy"
+    mixed = Claw.IntegrationSpec("MiXeD", "MixedPkg", "mixed-case test", [])
+    Claw.register_integration!(mixed, InvalidEventSource)
+    @test Claw.INTEGRATION_SPECS["mixed"].name == "mixed"
+    @test Claw._integration_factory("mixed") === InvalidEventSource
 end
 
 # ─── Enable / disable ───
@@ -505,6 +509,8 @@ end
         st = lock(() -> a._integrations["toy"], a._integrations_lock)
         @test st.source.token == "via-tool"
         @test !occursin("via-tool", String(integration_row(a, "toy").config))
+        st.supervised.stopped[] = true
+        @test occursin("- toy [enabled (stopped)]", Claw.list_integrations())
 
         msg = Claw.disable_integration("toy")
         @test occursin("disabled", msg)
