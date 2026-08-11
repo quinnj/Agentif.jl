@@ -20,6 +20,7 @@ function iterate_main(args)
         for r in results
             println(io, r.task, " ", r.passed ? "PASS" : "FAIL",
                 " calls=", r.tool_calls, " in=", r.tokens_in, " out=", r.tokens_out,
+                " cached=", get(r, :tokens_cached, 0),
                 " s=", r.seconds, r.aborted ? " ABORTED" : "")
         end
     end

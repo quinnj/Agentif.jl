@@ -5,6 +5,22 @@ default_model() = get(ENV, "JUCO_MODEL", "claude-sonnet-4-5")
 default_reasoning() = let v = get(ENV, "JUCO_REASONING", ""); isempty(v) ? nothing : v end
 const DEFAULT_MAX_TURNS = 50
 
+# OpenRouter routing preferences. Sorting by price keeps routing stable so
+# upstream prompt caches stay warm across a session's turns (round-robin
+# routing defeats them) — but with a quality floor: endpoints must support all
+# request parameters (tools!) and fp4-class quantizations are excluded, since
+# an fp4 endpoint was observed emitting raw tool-call markup as text.
+# JUCO_OPENROUTER_ORDER pins specific endpoint tags, comma-separated.
+function openrouter_provider_prefs()
+    order = get(ENV, "JUCO_OPENROUTER_ORDER", "")
+    isempty(order) || return Dict{String, Any}("order" => strip.(split(order, ",")), "allow_fallbacks" => true)
+    return Dict{String, Any}(
+        "sort" => "price",
+        "require_parameters" => true,
+        "quantizations" => ["fp8", "int8", "fp16", "bf16", "unknown"],
+    )
+end
+
 const PROVIDER_KEY_ENV = Dict(
     "anthropic" => "ANTHROPIC_API_KEY",
     "openai" => "OPENAI_API_KEY",
@@ -126,13 +142,15 @@ function evaluate(input::AbstractString;
     end
     # OpenRouter-style models take {"reasoning": {"effort": ...}}; native OpenAI
     # reasoning models take reasoning_effort. Send the shape the model expects.
+    is_openrouter = get(agent.model.compat, "thinkingFormat", "") == "openrouter"
     eval_kw = if reasoning_effort === nothing
         (;)
-    elseif get(agent.model.compat, "thinkingFormat", "") == "openrouter"
+    elseif is_openrouter
         (; reasoning = Dict("effort" => reasoning_effort))
     else
         (; reasoning_effort)
     end
+    is_openrouter && (eval_kw = merge(eval_kw, (; provider = openrouter_provider_prefs())))
     state = Agentif.evaluate(handler, agent, String(input);
         session_store = jdb.session_store, channel = ch, abort, level, eval_kw...)
     return (; state, session_id = sid, tool_calls = tool_calls[], aborted = Agentif.isaborted(abort))

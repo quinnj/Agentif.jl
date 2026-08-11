@@ -119,6 +119,16 @@ end
     end
 end
 
+@testset "openrouter provider prefs" begin
+    delete!(ENV, "JUCO_OPENROUTER_ORDER")
+    @test Juco.openrouter_provider_prefs() == Dict{String, Any}("sort" => "price")
+    ENV["JUCO_OPENROUTER_ORDER"] = "atlas-cloud/fp4, siliconflow/fp8"
+    prefs = Juco.openrouter_provider_prefs()
+    @test prefs["order"] == ["atlas-cloud/fp4", "siliconflow/fp8"]
+    @test prefs["allow_fallbacks"] === true
+    delete!(ENV, "JUCO_OPENROUTER_ORDER")
+end
+
 @testset "budget notice wrapping" begin
     mktempdir() do dir
         bash = Juco.create_bash_tool(dir)

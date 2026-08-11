@@ -83,6 +83,7 @@ function run_one(task, preset::Symbol; verbose::Bool = false, max_turns::Int = 2
             aborted = result === nothing ? true : result.aborted,
             tokens_in = usage === nothing ? 0 : usage.input + usage.cacheRead + usage.cacheWrite,
             tokens_out = usage === nothing ? 0 : usage.output,
+            tokens_cached = usage === nothing ? 0 : usage.cacheRead,
             seconds = round(elapsed; digits = 1),
         )
     end
