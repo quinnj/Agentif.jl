@@ -154,6 +154,17 @@ end
     bare = Juco.build_prompt(pwd(), :bash)
     @test !occursin("Memories", bare)
     @test occursin("your only tool", bare)
+    # directory snapshot: entries listed, dirs marked, big dirs capped
+    mktempdir() do dir
+        mkdir(joinpath(dir, "src"))
+        write(joinpath(dir, "a.jl"), "")
+        p = Juco.build_prompt(dir, :juco)
+        @test occursin("a.jl", p)
+        @test occursin("src/", p)
+        for i in 1:60; write(joinpath(dir, "f$(lpad(i, 2, '0')).txt"), ""); end
+        p = Juco.build_prompt(dir, :juco)
+        @test occursin("more entries)", p)
+    end
 end
 
 end

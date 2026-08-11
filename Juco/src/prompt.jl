@@ -16,6 +16,21 @@ const PRESET_TOOL_LINES = Dict{Symbol, String}(
 - bash: run shell commands — your only tool. Explore with ls/rg/find/cat, edit files with heredocs, python, or ed/sed""",
 )
 
+# One entry per line, directories marked with '/'. Capped so a huge directory
+# can't blow up the prompt.
+function dir_snapshot(base_dir::AbstractString; limit::Int = 50)
+    entries = try
+        sort(readdir(base_dir))
+    catch
+        return ""
+    end
+    isempty(entries) && return "(empty)"
+    shown = first(entries, limit)
+    lines = [isdir(joinpath(base_dir, e)) ? e * "/" : e for e in shown]
+    length(entries) > limit && push!(lines, "... ($(length(entries) - limit) more entries)")
+    return join(lines, "\n")
+end
+
 function build_prompt(base_dir::AbstractString, preset::Symbol; memories::Vector{String} = String[])
     tool_lines = get(PRESET_TOOL_LINES, preset) do
         throw(ArgumentError("unknown toolset preset: $preset"))
@@ -30,7 +45,9 @@ Guidelines:
 - Keep edits surgical: change only what the task requires.
 - Be concise. When done, summarize what changed in a sentence or two.
 
-Working directory: $(abspath(base_dir))"""
+Working directory: $(abspath(base_dir))
+Top-level contents (snapshot at session start):
+$(dir_snapshot(base_dir))"""
     if !isempty(memories)
         memory_lines = join(("- " * m for m in memories), "\n")
         prompt *= """
