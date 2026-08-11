@@ -2,6 +2,7 @@
 
 default_provider() = get(ENV, "JUCO_MODEL_PROVIDER", "anthropic")
 default_model() = get(ENV, "JUCO_MODEL", "claude-sonnet-4-5")
+default_reasoning() = let v = get(ENV, "JUCO_REASONING", ""); isempty(v) ? nothing : v end
 const DEFAULT_MAX_TURNS = 50
 
 const PROVIDER_KEY_ENV = Dict(
@@ -76,6 +77,8 @@ function evaluate(input::AbstractString;
         io::IO = stdout,
         show_tools::Bool = true,
         max_turns::Int = DEFAULT_MAX_TURNS,
+        reasoning_effort::Union{Nothing, String} = default_reasoning(),
+        on_event::Union{Nothing, Function} = nothing,
         level = nothing,
         kw...,
     )
@@ -98,10 +101,20 @@ function evaluate(input::AbstractString;
         elseif event isa Agentif.AgentErrorEvent && show_tools
             println(io, "\e[31m[error] $(event.error)\e[0m")
         end
+        on_event === nothing || on_event(event)
         return nothing
     end
+    # OpenRouter-style models take {"reasoning": {"effort": ...}}; native OpenAI
+    # reasoning models take reasoning_effort. Send the shape the model expects.
+    eval_kw = if reasoning_effort === nothing
+        (;)
+    elseif get(agent.model.compat, "thinkingFormat", "") == "openrouter"
+        (; reasoning = Dict("effort" => reasoning_effort))
+    else
+        (; reasoning_effort)
+    end
     state = Agentif.evaluate(handler, agent, String(input);
-        session_store = jdb.session_store, channel = ch, abort, level)
+        session_store = jdb.session_store, channel = ch, abort, level, eval_kw...)
     return (; state, session_id = sid, tool_calls = tool_calls[], aborted = Agentif.isaborted(abort))
 end
 
