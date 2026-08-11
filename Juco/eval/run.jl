@@ -17,8 +17,17 @@ include(joinpath(@__DIR__, "tasks.jl"))
 
 # Transcript writer: records assistant reasoning/text/tool calls and tool
 # results to a plain-text file so eval runs can be analyzed closely.
+# Tool events fire from concurrent tasks, so writes are serialized by a lock.
 function transcript_recorder(io::IO)
+    lk = ReentrantLock()
     return function (event)
+        lock(lk) do
+            _record_event(io, event)
+        end
+    end
+end
+
+function _record_event(io::IO, event)
         if event isa Agentif.MessageEndEvent && event.message isa Agentif.AssistantMessage
             for block in event.message.content
                 if block isa Agentif.ThinkingContent && !isempty(block.thinking)
@@ -34,12 +43,11 @@ function transcript_recorder(io::IO)
             length(text) > 3000 && (text = first(text, 3000) * "\n...[transcript-truncated]")
             println(io, "--- tool result", event.result.is_error ? " (ERROR)" : "",
                 " (", event.duration_ms, "ms) ---\n", text)
-        elseif event isa Agentif.AgentErrorEvent
-            println(io, "--- agent error ---\n", event.error)
-        end
-        flush(io)
-        return nothing
+    elseif event isa Agentif.AgentErrorEvent
+        println(io, "--- agent error ---\n", event.error)
     end
+    flush(io)
+    return nothing
 end
 
 function run_one(task, preset::Symbol; verbose::Bool = false, max_turns::Int = 25,

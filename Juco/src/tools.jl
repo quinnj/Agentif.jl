@@ -61,7 +61,9 @@ end
 function create_bash_tool(base_dir::AbstractString)
     base = LLMTools.ensure_base_dir(base_dir)
     return Agentif.@tool(
-        """Execute a bash command in the working directory and return its combined stdout/stderr.
+        """Execute a bash command and return its combined stdout/stderr.
+
+The command already runs in the working directory shown in your system prompt — never prefix commands with `cd`; use relative paths.
 
 This is your tool for everything except reading and editing files: listing directories (ls), searching file contents (rg), finding files (find, rg --files), git, running tests, etc.
 

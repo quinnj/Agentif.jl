@@ -315,8 +315,10 @@ const TASKS = [
     end,
     prompt = "Migrate the request API in src/ from `retries` (count after the first attempt) to `attempts` (total attempt count, default 1), updating the docstring and every call site so behavior is preserved and migration_test.jl passes. The old `retries` keyword must be fully gone.",
     check = function (dir)
-        occursin("retries", read(joinpath(dir, "src", "client.jl"), String)) && return false
-        occursin("retries", read(joinpath(dir, "src", "api.jl"), String)) && return false
+        # the retries KEYWORD must be gone (prose like "no retries" in a docstring is fine)
+        kw = r"retries\s*(=|::)|;\s*retries\b"
+        occursin(kw, read(joinpath(dir, "src", "client.jl"), String)) && return false
+        occursin(kw, read(joinpath(dir, "src", "api.jl"), String)) && return false
         return _run_ok(dir, `julia --startup-file=no migration_test.jl`)
     end,
 ),
