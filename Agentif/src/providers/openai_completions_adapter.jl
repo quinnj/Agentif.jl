@@ -639,6 +639,10 @@ function openai_completions_event_callback(
                 saw_text = true
             end
         end
+        # When a delta carries reasoning_details with text, the details stream is
+        # canonical: providers (e.g. OpenRouter) also mirror the same text into the
+        # plain reasoning field, so processing both would double every token.
+        details_carried_text = false
         if delta.reasoning_details !== nothing
             if !started[]
                 started[] = true
@@ -651,6 +655,7 @@ function openai_completions_event_callback(
                 detail isa AbstractDict || continue
                 text = get(detail, "text", nothing)
                 text isa AbstractString || continue
+                details_carried_text = true
                 text_str = String(text)
                 if startswith(text_str, reasoning_buffer)
                     if isempty(reasoning_buffer)
@@ -680,24 +685,26 @@ function openai_completions_event_callback(
                 assistant_message.content[end].thinkingSignature = JSON.json(details_vec)
             end
         end
-        for field in (:reasoning_content, :reasoning, :reasoning_text)
-            value = getfield(delta, field)
-            if value !== nothing && !isempty(value)
-                if !started[]
-                    started[] = true
-                    f(MessageStartEvent(:assistant, assistant_message))
+        if !details_carried_text
+            for field in (:reasoning_content, :reasoning, :reasoning_text)
+                value = getfield(delta, field)
+                if value !== nothing && !isempty(value)
+                    if !started[]
+                        started[] = true
+                        f(MessageStartEvent(:assistant, assistant_message))
+                    end
+                    # Store field name as thinkingSignature so message building can
+                    # replay thinking to the correct field (matching pi-mono behavior).
+                    sig = string(field)
+                    if isempty(assistant_message.content) || !(assistant_message.content[end] isa ThinkingContent)
+                        push!(assistant_message.content, ThinkingContent(; thinking = value, thinkingSignature = sig))
+                    else
+                        block = assistant_message.content[end]
+                        block.thinking *= value
+                        block.thinkingSignature === nothing && (block.thinkingSignature = sig)
+                    end
+                    f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, value, nothing))
                 end
-                # Store field name as thinkingSignature so message building can
-                # replay thinking to the correct field (matching pi-mono behavior).
-                sig = string(field)
-                if isempty(assistant_message.content) || !(assistant_message.content[end] isa ThinkingContent)
-                    push!(assistant_message.content, ThinkingContent(; thinking = value, thinkingSignature = sig))
-                else
-                    block = assistant_message.content[end]
-                    block.thinking *= value
-                    block.thinkingSignature === nothing && (block.thinkingSignature = sig)
-                end
-                f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, value, nothing))
             end
         end
         if delta.tool_calls !== nothing

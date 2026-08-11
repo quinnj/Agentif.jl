@@ -749,16 +749,20 @@ function stream(
                     !isempty(thinking) && append_thinking!(assistant_message, thinking)
                 end
             end
-            reasoning_parts = String[]
-            for field in (:reasoning_content, :reasoning, :reasoning_text)
-                value = getfield(choice.message, field)
-                value === nothing && continue
-                isempty(value) && continue
-                push!(reasoning_parts, value)
-            end
-            isempty(reasoning_parts) || append_thinking!(assistant_message, join(reasoning_parts, "\n\n"))
+            # reasoning_details is canonical when present: providers (e.g.
+            # OpenRouter) mirror the same text into the plain reasoning fields,
+            # so appending both would duplicate the thinking content.
             if choice.message.reasoning_details !== nothing
                 openai_completions_append_thinking_with_details!(assistant_message, choice.message.reasoning_details)
+            else
+                reasoning_parts = String[]
+                for field in (:reasoning_content, :reasoning, :reasoning_text)
+                    value = getfield(choice.message, field)
+                    value === nothing && continue
+                    isempty(value) && continue
+                    push!(reasoning_parts, value)
+                end
+                isempty(reasoning_parts) || append_thinking!(assistant_message, join(reasoning_parts, "\n\n"))
             end
             text = message_text(assistant_message)
             if !isempty(text)

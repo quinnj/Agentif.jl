@@ -3693,3 +3693,50 @@ end
         close(ws_server)
     end
 end
+
+@testset "openrouter reasoning_details deltas are not double-appended" begin
+    # OpenRouter mirrors each reasoning token into BOTH delta.reasoning and
+    # delta.reasoning_details[].text. The details stream is canonical; the
+    # plain field must be skipped for those deltas or every token doubles.
+    chunks = String[]
+    for tok in ("Let", " me", " think")
+        push!(chunks, "data: " * JSON.json((; choices = [(; index = 0,
+            delta = (; reasoning = tok,
+                reasoning_details = [Dict("type" => "reasoning.text", "text" => tok)]),
+            finish_reason = nothing)])))
+    end
+    push!(chunks, "data: " * JSON.json((; choices = [(; index = 0,
+        delta = (; content = "42"), finish_reason = nothing)])))
+    push!(chunks, "data: " * JSON.json((; choices = [(; index = 0, delta = (;), finish_reason = "stop")])))
+    push!(chunks, "data: [DONE]")
+    body = join(chunks, "\n\n") * "\n\n"
+
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], body)
+    end
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "test-reasoning", name = "test-reasoning", api = "openai-completions",
+            provider = "openrouter", baseUrl = "http://127.0.0.1:$port", reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000, maxTokens = 4096,
+            compat = Dict{String, Any}("thinkingFormat" => "openrouter"),
+        )
+        agent = Agent(prompt = "p", model = model, apikey = "k")
+        reasoning_deltas = String[]
+        state = stream(agent, AgentState(), "q", Abort()) do event
+            if event isa MessageUpdateEvent && event.kind == :reasoning
+                push!(reasoning_deltas, event.delta)
+            end
+        end
+        msg = state.messages[end]
+        thinking = join((b.thinking for b in msg.content if b isa Agentif.ThinkingContent), "")
+        @test thinking == "Let me think"
+        @test join(reasoning_deltas, "") == "Let me think"
+        @test Agentif.message_text(msg) == "42"
+    finally
+        close(server)
+    end
+end
