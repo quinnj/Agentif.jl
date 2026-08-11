@@ -785,13 +785,18 @@ Example output:
     a === nothing && return "No assistant initialized"
     # Refresh channels from all event sources
     sources = lock(() -> collect(EVENT_SOURCES), EVENT_SOURCES_LOCK)
-    channels = Agentif.AbstractChannel[]
+    channels = Tuple{EventSource, Union{Nothing, String}, Agentif.AbstractChannel}[]
     for es in sources
-        append!(channels, get_channels(es))
+        integration = _integration_name_for(es)
+        append!(channels, ((es, integration, ch) for ch in get_channels(es)))
     end
     pairs = lock(a._integrations_lock) do
-        for ch in channels
-            a._channels[Agentif.channel_id(ch)] = ch
+        for (source, integration, ch) in channels
+            id = Agentif.channel_id(ch)
+            if integration === nothing ||
+                    _track_integration_channel_locked!(a, source, id, ch)
+                a._channels[id] = ch
+            end
         end
         collect(a._channels)
     end

@@ -360,6 +360,21 @@ end
         @test !event_type_registered(a, "toy_event")
         @test !haskey(a._channels, "runtime-shared")
         @test first.source.stopped[]
+
+        # A list operation that captured this source before disable must not put
+        # its channels back after the integration state is gone.
+        old = Claw.CURRENT_ASSISTANT[]
+        Claw.CURRENT_ASSISTANT[] = a
+        Claw.register_event_source!(first.source)
+        try
+            Claw.list_channels()
+            @test !haskey(a._channels, "toy-chan")
+        finally
+            Claw.CURRENT_ASSISTANT[] = old
+            lock(Claw.EVENT_SOURCES_LOCK) do
+                Base.delete!(Claw.EVENT_SOURCES, first.source)
+            end
+        end
     finally
         Claw.shutdown!(a; timeout_s = 5)
     end
