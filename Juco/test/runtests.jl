@@ -1,4 +1,5 @@
 using Test
+using JSON
 using Juco
 using Agentif
 
@@ -121,7 +122,10 @@ end
 
 @testset "openrouter provider prefs" begin
     delete!(ENV, "JUCO_OPENROUTER_ORDER")
-    @test Juco.openrouter_provider_prefs() == Dict{String, Any}("sort" => "price")
+    prefs = Juco.openrouter_provider_prefs()
+    @test prefs["sort"] == "price"
+    @test prefs["require_parameters"] === true
+    @test "fp8" in prefs["quantizations"] && !("fp4" in prefs["quantizations"])
     ENV["JUCO_OPENROUTER_ORDER"] = "atlas-cloud/fp4, siliconflow/fp8"
     prefs = Juco.openrouter_provider_prefs()
     @test prefs["order"] == ["atlas-cloud/fp4", "siliconflow/fp8"]
@@ -154,6 +158,71 @@ end
         @test names(Juco.toolset(:pi, dir)) == ["bash", "read", "edit", "write"]
         @test names(Juco.toolset(:bash, dir)) == ["bash"]
         @test_throws ArgumentError Juco.toolset(:nope, dir)
+    end
+end
+
+@testset "display formatters" begin
+    @test Juco.format_tool_call("bash", "{\"command\": \"ls -la\\nfoo\"}") == "▸ bash ls -la foo"
+    @test Juco.format_tool_call("read", "{\"path\": \"a.jl\", \"offset\": 10}") == "▸ read a.jl:10"
+    @test Juco.format_tool_call("edit", "{\"path\": \"a.jl\", \"oldText\": \"x\"}") == "▸ edit a.jl"
+    @test Juco.format_tool_call("edit", "{\"path\": \"a.jl\", \"oldText\": \"\"}") == "▸ edit a.jl (new file)"
+    @test Juco.format_tool_call("bash", "not json") == "▸ bash not json"
+    long = Juco.format_tool_call("bash", JSON.json(Dict("command" => "x"^300)))
+    @test length(long) < 120 && endswith(long, "…")
+    @test Juco.format_duration(75) == "75ms"
+    @test Juco.format_duration(2350) == "2.4s"
+    @test Juco.format_tokens(950) == "950"
+    @test Juco.format_tokens(18234) == "18.2k"
+    usage = Agentif.Usage(input = 1000, output = 200, cacheRead = 500, cacheWrite = 0, total = 1700)
+    m = Agentif.getModel("anthropic", "claude-sonnet-4-5")
+    line = Juco.usage_line(usage, m, 3, 12.34)
+    @test occursin("12.3s", line)
+    @test occursin("3 tools", line)
+    @test occursin("1.5k in (33% cached)", line)
+    @test occursin("200 out", line)
+    @test occursin("\$", line)
+end
+
+@testset "display handler renders tool lines" begin
+    buf = IOBuffer()
+    handler = Juco.display_handler(buf)
+    tc = Agentif.PendingToolCall(call_id = "c1", name = "bash", arguments = "{\"command\": \"echo hi\"}")
+    handler(Agentif.ToolExecutionStartEvent(tc))
+    result = Agentif.ToolResultMessage(call_id = "c1", name = "bash",
+        content = [Agentif.TextContent(text = "hi")], is_error = false)
+    handler(Agentif.ToolExecutionEndEvent(1, tc, result, 42))
+    out = String(take!(buf))
+    @test occursin("▸ bash echo hi", out)
+    @test occursin("✓ 42ms", out)
+    # error results show the message
+    handler(Agentif.ToolExecutionStartEvent(tc))
+    errres = Agentif.ToolResultMessage(call_id = "c1", name = "bash",
+        content = [Agentif.TextContent(text = "{\"message\": \"boom happened\"}")], is_error = true)
+    handler(Agentif.ToolExecutionEndEvent(1, tc, errres, 10))
+    @test occursin("✗ boom happened", String(take!(buf)))
+end
+
+@testset "repl slash commands" begin
+    mktempdir() do dir
+        jdb = Juco.opendb(joinpath(dir, "t.sqlite"))
+        st = Juco.ReplState(jdb, "s-original", "anthropic", "claude-sonnet-4-5", false)
+        buf = IOBuffer()
+        Juco.handle_command(st, "/new", buf)
+        @test st.session_id != "s-original"
+        Juco.handle_command(st, "/model", buf)
+        @test occursin("anthropic/claude-sonnet-4-5", String(take!(buf)))
+        Juco.handle_command(st, "/model nonsense-model-id", buf)
+        @test occursin("unknown model", String(take!(buf)))
+        @test st.model_id == "claude-sonnet-4-5"
+        Juco.handle_command(st, "/model anthropic claude-haiku-4-5", buf)
+        @test st.model_id == "claude-haiku-4-5"
+        Juco.remember!(jdb, "a memory")
+        Juco.handle_command(st, "/memories", buf)
+        @test occursin("a memory", String(take!(buf)))
+        Juco.handle_command(st, "/quit", buf)
+        @test st.quit
+        Juco.handle_command(st, "/bogus", buf)
+        @test occursin("unknown command", String(take!(buf)))
     end
 end
 

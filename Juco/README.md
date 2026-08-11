@@ -34,12 +34,29 @@ using Juco
 Juco.repl()                      # interactive session
 Juco.evaluate("fix the bug")     # one programmatic turn
 Juco.main(["-p", "explain this repo", "--preset", "pi"])  # CLI form
+Juco.install_cli()               # write a `juco` shell launcher to ~/.local/bin
 ```
+
+Or live inside the standard Julia REPL, Pkg-style:
+
+```julia
+using Juco, ReplMaker
+Juco.repl_mode!()   # press } at an empty julia> prompt for a juco> mode
+```
+
+The REPL shows tool calls as compact one-liners (`▸ bash julia test.jl ✓ 0.4s`),
+streams model reasoning dimmed as it happens, renders final answers as Markdown,
+and prints a per-turn usage line (`⏱ 12s · 5 tools · 18k in (38% cached) · $0.002`).
+Slash commands: `/help`, `/new`, `/sessions`, `/resume`, `/model`, `/memories`.
+End a line with `\\` to continue on the next line. Ctrl-C interrupts the current
+response, not the session; `NO_COLOR` is respected.
 
 Configuration via environment: `JUCO_MODEL_PROVIDER` / `JUCO_MODEL` select the model
 (defaults: `anthropic` / `claude-sonnet-4-5`); the API key comes from the provider's
 conventional env var (`ANTHROPIC_API_KEY`, `XAI_API_KEY`, ...) or `JUCO_API_KEY`.
-See `Juco.main(["-h"])` for all CLI flags.
+`JUCO_REASONING` sets reasoning effort (e.g. `medium`); for OpenRouter models,
+`JUCO_OPENROUTER_ORDER` pins endpoint routing (stable routing keeps upstream
+prompt caches warm). See `Juco.main(["-h"])` for all CLI flags.
 
 ## Eval
 
