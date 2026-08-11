@@ -299,7 +299,9 @@ end
         # new source's channels, event types, and tools.
         @test timedwait(() -> istaskdone(enable_task), 0.2) == :timed_out
         notify(BLOCKING_STOP_RELEASE[])
-        wait(disable_task)
+        @test timedwait(() -> istaskdone(disable_task), 5.0) == :ok
+        @test timedwait(() -> istaskdone(enable_task), 5.0) == :ok
+        fetch(disable_task)
         second = fetch(enable_task)
         @test second.source !== first.source
         @test haskey(a._channels, "blocking-chan")
@@ -311,7 +313,8 @@ end
         notify(BLOCKING_STOP_RELEASE[])
         first.source.block_stop[] = false
         try
-            wait(disable_task)
+            timedwait(() -> istaskdone(disable_task), 5.0)
+            istaskdone(disable_task) && fetch(disable_task)
         catch
         end
         st = lock(() -> get(a._integrations, "blocking", nothing), a._integrations_lock)
@@ -398,7 +401,8 @@ end
         st.source.stopping[] = true
         notify(st.source.start_release)
         disable_task === nothing || try
-            wait(disable_task)
+            timedwait(() -> istaskdone(disable_task), 5.0)
+            istaskdone(disable_task) && fetch(disable_task)
         catch
         end
         Claw.shutdown!(a; timeout_s = 5)
