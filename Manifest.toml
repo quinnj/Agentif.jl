@@ -133,7 +133,6 @@ version = "1.7.0"
 [[deps.Encid]]
 deps = ["Random"]
 git-tree-sha1 = "6f6b18ea53e4b4cc1dbdacfccc4584d4008f2c8f"
-repo-rev = "main"
 repo-url = "https://github.com/JuliaServices/Encid.jl.git"
 uuid = "22e113d6-bca1-46f4-8715-c46169ad70b7"
 version = "1.0.0"
@@ -227,10 +226,10 @@ version = "1.6.0"
     JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 
 [[deps.Juco]]
-deps = ["Agentif", "LLMTools"]
+deps = ["Agentif", "Dates", "LLMProviders", "LLMTools", "LocalSearch", "SQLite"]
 path = "Juco"
 uuid = "a4f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2e"
-version = "0.1.0"
+version = "0.2.0"
 
 [[deps.JuliaSyntaxHighlighting]]
 deps = ["StyledStrings"]
@@ -289,7 +288,6 @@ version = "1.11.0"
 [[deps.LocalSearch]]
 deps = ["Dates", "Downloads", "Libdl", "SHA", "SQLite", "llama_cpp_jll", "sqlite_vec_jll"]
 git-tree-sha1 = "d82d515cc679ffe4d291c7d0f20a9bedc948715f"
-repo-rev = "main"
 repo-url = "https://github.com/quinnj/LocalSearch.jl.git"
 uuid = "3edf9609-13f2-4288-b0a3-8bd6d521158e"
 version = "0.1.0"
@@ -307,7 +305,6 @@ version = "1.2.0"
 [[deps.MSTeams]]
 deps = ["Dates", "HTTP", "JSON", "Logging", "ZipFile"]
 git-tree-sha1 = "ff0eaa9ea9ef66a663a5d44bd659cd8abc9d093e"
-repo-rev = "main"
 repo-url = "https://github.com/quinnj/MSTeams.jl.git"
 uuid = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
 version = "0.1.0"
@@ -320,7 +317,6 @@ version = "1.11.0"
 [[deps.Mattermost]]
 deps = ["HTTP", "JSON", "Logging", "ScopedValues"]
 git-tree-sha1 = "a393e6065bdf755871445f249e0663ca0cdc20e6"
-repo-rev = "main"
 repo-url = "https://github.com/quinnj/Mattermost.jl.git"
 uuid = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
 version = "0.1.0"
@@ -394,7 +390,6 @@ version = "1.11.0"
 
 [[deps.PtySessions]]
 git-tree-sha1 = "90364bf2f528abd8fe6f0ff8da9813b1864b4200"
-repo-rev = "main"
 repo-url = "https://github.com/JuliaServices/PtySessions.jl.git"
 uuid = "581b29ee-4021-4243-bea3-a8421693f905"
 version = "0.1.0"
@@ -445,7 +440,6 @@ version = "1.11.0"
 [[deps.Signal]]
 deps = ["HTTP", "JSON", "Logging", "ScopedValues", "StructUtils"]
 git-tree-sha1 = "49d93bac17dc64ba7c0b77b7f37127af2de2c7ba"
-repo-rev = "main"
 repo-url = "https://github.com/quinnj/Signal.jl.git"
 uuid = "0944c9af-6677-4ce2-950b-62b1fa25f333"
 version = "0.1.0"
@@ -453,7 +447,6 @@ version = "0.1.0"
 [[deps.Slack]]
 deps = ["Base64", "HTTP", "JSON", "Logging", "StructUtils"]
 git-tree-sha1 = "70d1af45c5e47b733b0b9d77a9acb4be946a9b70"
-repo-rev = "main"
 repo-url = "https://github.com/quinnj/Slack.jl.git"
 uuid = "4d517630-ce0d-4555-8fa7-416d9f8f5684"
 version = "0.1.0"
@@ -514,7 +507,6 @@ version = "1.13.0"
 [[deps.Telegram]]
 deps = ["HTTP", "JSON", "Logging", "ScopedValues"]
 git-tree-sha1 = "f5c920fdbdc1ae1730336cad734c83b02b326469"
-repo-rev = "main"
 repo-url = "https://github.com/quinnj/Telegram.jl.git"
 uuid = "0f099131-46f3-42ed-8989-d9c7888465f9"
 version = "0.1.0"

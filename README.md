@@ -23,7 +23,7 @@ using Agentif, LLMTools, LLMProviders, Claw, LLMOAuth, Juco
 - `LLMProviders`: model registry plus request/response types for the supported LLM providers.
 - `Claw`: SQLite-backed event-driven assistant app built on top of `Agentif` and `LLMTools`.
 - `LLMOAuth`: OAuth helpers for Codex/OpenAI and Anthropic flows.
-- `Juco`: placeholder coding-assistant package that will be rewritten; see `Juco/README.md` before using it.
+- `Juco`: uber-minimal coding agent (bash/read/edit + memory, single-SQLite persistence); see `Juco/README.md`.
 
 Each package has its own README:
 

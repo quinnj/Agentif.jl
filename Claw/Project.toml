@@ -67,6 +67,7 @@ LoggingExtras = "1"
 julia = "1.10"
 
 [extras]
+GitHub = "bc5e4493-9b4d-5f90-b8aa-2b2bcaad7a26"
 MSTeams = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
 Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
 Signal = "0944c9af-6677-4ce2-950b-62b1fa25f333"
@@ -75,4 +76,4 @@ Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "MSTeams", "Mattermost", "Signal", "Slack", "Telegram"]
+test = ["Test", "GitHub", "MSTeams", "Mattermost", "Signal", "Slack", "Telegram"]

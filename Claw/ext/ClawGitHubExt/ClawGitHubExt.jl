@@ -7,23 +7,341 @@ import Claw
 
 export GitHubEventSource
 
+_get(p, keys...) = _get(String, p, keys...)
+function _get(::Type{T}, p, keys...) where {T}
+    v = p
+    for k in keys
+        v isa AbstractDict || return nothing
+        v = get(() -> nothing, v, k)
+    end
+    v === nothing ? nothing : T == String ? string(v) : v
+end
+
+_string_or_empty(v) = v === nothing ? "" : string(v)
+
+function _int_or_nothing(v)
+    if v === nothing
+        return nothing
+    elseif v isa Integer
+        return Int(v)
+    end
+    try
+        return parse(Int, string(v))
+    catch
+        return nothing
+    end
+end
+
+function _github_headers(auth)
+    headers = Dict{String, String}(
+        "Accept" => "application/vnd.github+json",
+        "User-Agent" => "ClawGitHubExt",
+        "X-GitHub-Api-Version" => "2022-11-28",
+    )
+    auth === nothing || GitHub.authenticate_headers!(headers, auth)
+    return headers
+end
+
+function _github_request(method::String, endpoint::String; auth = nothing, params = nothing)
+    headers = _github_headers(auth)
+    response = if params === nothing
+        HTTP.request(method, "https://api.github.com$endpoint", headers;
+            status_exception=false, retry=false, idle_timeout=30)
+    else
+        HTTP.request(method, "https://api.github.com$endpoint", headers, JSON.json(params);
+            status_exception=false, retry=false, idle_timeout=30)
+    end
+    if !(200 <= response.status < 300)
+        body = String(HTTP.payload(response))
+        error("GitHub API request failed ($(response.status)) for $method $endpoint: $body")
+    end
+    return response
+end
+
+function _github_json(method::String, endpoint::String; auth = nothing, params = nothing)
+    response = _github_request(method, endpoint; auth, params)
+    payload = HTTP.payload(response)
+    isempty(payload) && return nothing
+    return JSON.parse(payload)
+end
+
+function _create_issue_comment(repo_name::String, issue_number::Int, body::String, auth)
+    return _github_json("POST", "/repos/$repo_name/issues/$issue_number/comments";
+        auth, params=Dict("body" => body))
+end
+
+const CREATE_COMMENT_FN = Ref{Function}(_create_issue_comment)
+
+# ─── Channel ───
+
+mutable struct GitHubChannel <: Agentif.AbstractChannel
+    repo_name::String
+    issue_number::Union{Nothing, Int}
+    pull_request_number::Union{Nothing, Int}
+    source_kind::String
+    source_id::Union{Nothing, Int}
+    source_reaction_path::Union{Nothing, String}
+    auth::Any
+    io::Union{Nothing, IOBuffer}
+    response_id::Union{Nothing, Int}
+    user_login::String
+    display_name::String
+end
+
+function _channel_display_name(repo_name::String, issue_number::Union{Nothing, Int}, pull_request_number::Union{Nothing, Int})
+    if pull_request_number !== nothing
+        return "GitHub PR $repo_name#$pull_request_number"
+    elseif issue_number !== nothing
+        return "GitHub Issue $repo_name#$issue_number"
+    elseif !isempty(repo_name)
+        return "GitHub $repo_name"
+    else
+        return "GitHub"
+    end
+end
+
+function _comment_target_number(ch::GitHubChannel)
+    ch.pull_request_number !== nothing && return ch.pull_request_number
+    return ch.issue_number
+end
+
+function Agentif.start_streaming(ch::GitHubChannel)
+    ch.io = IOBuffer()
+    return nothing
+end
+
+function Agentif.append_to_stream(ch::GitHubChannel, delta::AbstractString)
+    io = ch.io
+    if io === nothing
+        io = IOBuffer()
+        ch.io = io
+    end
+    write(io, String(delta))
+    return nothing
+end
+
+Agentif.finish_streaming(::GitHubChannel) = nothing
+
+function Agentif.close_channel(ch::GitHubChannel)
+    io = ch.io
+    io === nothing && return nothing
+    text = String(take!(io))
+    ch.io = nothing
+    isempty(text) && return nothing
+    Agentif.send_message(ch, text)
+    return nothing
+end
+
+function Agentif.send_message(ch::GitHubChannel, msg)
+    auth = ch.auth
+    auth === nothing && error("GitHub installation auth is unavailable for this event; cannot post a comment.")
+    issue_number = _comment_target_number(ch)
+    issue_number === nothing && error("This GitHub event has no issue or pull request target for comments.")
+    response = CREATE_COMMENT_FN[](ch.repo_name, issue_number, string(msg), auth)
+    if response isa AbstractDict
+        ch.response_id = _int_or_nothing(get(() -> nothing, response, "id"))
+    end
+    return response
+end
+
+function Agentif.channel_id(ch::GitHubChannel)
+    if ch.pull_request_number !== nothing
+        return "github:$(ch.repo_name):pr:$(ch.pull_request_number)"
+    elseif ch.issue_number !== nothing
+        return "github:$(ch.repo_name):issue:$(ch.issue_number)"
+    elseif !isempty(ch.repo_name)
+        return "github:$(ch.repo_name)"
+    end
+    return "github"
+end
+
+Agentif.channel_name(ch::GitHubChannel) = ch.display_name
+Agentif.is_group(::GitHubChannel) = true
+Agentif.is_private(::GitHubChannel) = true
+
+function Agentif.get_current_user(ch::GitHubChannel)
+    isempty(ch.user_login) && return nothing
+    return Agentif.ChannelUser(ch.user_login, ch.user_login)
+end
+
+Agentif.entry_id(ch::GitHubChannel) = ch.source_id === nothing ? nothing : string(ch.source_id)
+Agentif.response_entry_id(ch::GitHubChannel) = ch.response_id === nothing ? nothing : string(ch.response_id)
+
+# PR metadata, file lists, and reactions are left to the GitHub CLI (`gh`) in the agent environment.
+
+function Agentif.create_channel_tools(::GitHubChannel)
+    return Agentif.AgentTool[]
+end
+
+function _issue_number(payload::AbstractDict)
+    issue = get(() -> nothing, payload, "issue")
+    issue isa AbstractDict && return _int_or_nothing(get(() -> nothing, issue, "number"))
+    return nothing
+end
+
+function _pull_request_number(kind::String, payload::AbstractDict)
+    if kind == "pull_request"
+        number = _int_or_nothing(get(() -> nothing, payload, "number"))
+        number !== nothing && return number
+    end
+    issue = get(() -> nothing, payload, "issue")
+    if issue isa AbstractDict
+        pr_ref = get(() -> nothing, issue, "pull_request")
+        if pr_ref isa AbstractDict
+            return _int_or_nothing(get(() -> nothing, issue, "number"))
+        end
+    end
+    pr = get(() -> nothing, payload, "pull_request")
+    pr isa AbstractDict || return nothing
+    return _int_or_nothing(get(() -> nothing, pr, "number"))
+end
+
+function _reaction_path(kind::String, repo_name::String, payload::AbstractDict)
+    if kind == "pull_request"
+        number = _pull_request_number(kind, payload)
+        number === nothing && return nothing
+        return "/repos/$repo_name/issues/$number/reactions"
+    elseif kind == "issues"
+        number = _issue_number(payload)
+        number === nothing && return nothing
+        return "/repos/$repo_name/issues/$number/reactions"
+    elseif kind == "issue_comment"
+        comment = get(() -> nothing, payload, "comment")
+        comment isa AbstractDict || return nothing
+        comment_id = _int_or_nothing(get(() -> nothing, comment, "id"))
+        comment_id === nothing && return nothing
+        return "/repos/$repo_name/issues/comments/$comment_id/reactions"
+    elseif kind == "pull_request_review_comment"
+        comment = get(() -> nothing, payload, "comment")
+        comment isa AbstractDict || return nothing
+        comment_id = _int_or_nothing(get(() -> nothing, comment, "id"))
+        comment_id === nothing && return nothing
+        return "/repos/$repo_name/pulls/comments/$comment_id/reactions"
+    end
+    return nothing
+end
+
+function _build_channel(kind::String, payload::AbstractDict, repo_name::String, sender_login::String, auth)
+    issue_number = _issue_number(payload)
+    pull_request_number = _pull_request_number(kind, payload)
+    source_id = if kind == "pull_request"
+        _int_or_nothing(_get(payload, "pull_request", "id"))
+    elseif kind == "issues"
+        _int_or_nothing(_get(payload, "issue", "id"))
+    elseif kind == "pull_request_review"
+        _int_or_nothing(_get(payload, "review", "id"))
+    else
+        _int_or_nothing(_get(payload, "comment", "id"))
+    end
+    reaction_path = isempty(repo_name) ? nothing : _reaction_path(kind, repo_name, payload)
+    display_name = _channel_display_name(repo_name, issue_number, pull_request_number)
+    return GitHubChannel(
+        repo_name,
+        issue_number,
+        pull_request_number,
+        kind,
+        source_id,
+        reaction_path,
+        auth,
+        nothing,
+        nothing,
+        sender_login,
+        display_name,
+    )
+end
+
+function _comment_body(kind::String, payload::AbstractDict)
+    if kind == "pull_request"
+        return _get(payload, "pull_request", "body")
+    elseif kind == "issues"
+        return _get(payload, "issue", "body")
+    elseif kind == "pull_request_review"
+        return _get(payload, "review", "body")
+    end
+    return _get(payload, "comment", "body")
+end
+
+function _normalize_mention_aliases(aliases::Vector{String})
+    normalized = String[]
+    seen = Set{String}()
+    for alias in aliases
+        clean = lowercase(strip(alias))
+        isempty(clean) && continue
+        clean in seen && continue
+        push!(normalized, clean)
+        push!(seen, clean)
+    end
+    return normalized
+end
+
+function _has_direct_ping(kind::String, payload::AbstractDict, mention_aliases::Vector{String})
+    isempty(mention_aliases) && return false
+    body = _comment_body(kind, payload)
+    body === nothing && return false
+    text = lowercase(string(body))
+    for alias in mention_aliases
+        occursin("@" * alias, text) && return true
+    end
+    return false
+end
+
+"""Map `pull_request` webhook actions to a Claw event name, or `nothing` to skip enqueueing."""
+function _pull_request_claw_event_name(action::String, payload::AbstractDict)
+    pr = get(() -> nothing, payload, "pull_request")
+    pr isa AbstractDict || return nothing
+    if action == "closed"
+        return "GitHubPRDone"
+    elseif action == "ready_for_review"
+        return "GitHubPRReady"
+    elseif action == "opened"
+        _get(Bool, pr, "draft") === true && return nothing
+        return "GitHubPRReady"
+    elseif action == "reopened"
+        _get(Bool, pr, "draft") === true && return nothing
+        return "GitHubPRReady"
+    end
+    return nothing
+end
+
+"""Claw-registered event name for this delivery (`GitHubPRReady` / `GitHubPRDone` replace `github_pull_request`)."""
+function _github_webhook_claw_name(kind::String, action::String, payload::AbstractDict)
+    if kind == "pull_request"
+        return _pull_request_claw_event_name(action, payload)
+    end
+    return "github_$kind"
+end
+
 # ─── Event ───
 
-struct GitHubWebhookEvent <: Claw.Event
+struct GitHubWebhookEvent <: Claw.ChannelEvent
+    name::String
     kind::String
     action::String
     payload::AbstractDict
     repo_name::String
     sender_login::String
+    channel::GitHubChannel
+    direct_ping::Bool
 end
 
-Claw.get_name(ev::GitHubWebhookEvent) = "github_$(ev.kind)"
+function GitHubWebhookEvent(name::String, kind::String, action::String, payload::AbstractDict, repo_name::String, sender_login::String;
+        auth = nothing,
+        mention_aliases::Vector{String} = String[],
+    )
+    channel = _build_channel(kind, payload, repo_name, sender_login, auth)
+    direct_ping = _has_direct_ping(kind, payload, mention_aliases)
+    return GitHubWebhookEvent(name, kind, action, payload, repo_name, sender_login, channel, direct_ping)
+end
+
+Claw.get_name(ev::GitHubWebhookEvent) = ev.name
+Claw.get_channel(ev::GitHubWebhookEvent) = ev.channel
 
 function Claw.event_content(ev::GitHubWebhookEvent)
     p = ev.payload
-    lines = String["[GitHub $(ev.kind) event on $(ev.repo_name)]"]
+    lines = String["[$(ev.name) — GitHub $(ev.kind) on $(ev.repo_name)]"]
     !isempty(ev.action) && push!(lines, "Action: $(ev.action)")
     !isempty(ev.sender_login) && push!(lines, "By: $(ev.sender_login)")
+    ev.direct_ping && push!(lines, "Direct mention: yes")
 
     if ev.kind == "push"
         _format_push!(lines, p)
@@ -64,16 +382,6 @@ end
 
 # ─── Content formatters ───
 
-_get(p, keys...) = _get(String, p, keys...)
-function _get(::Type{T}, p, keys...) where {T}
-    v = p
-    for k in keys
-        v isa AbstractDict || return nothing
-        v = get(() -> nothing, v, k)
-    end
-    v === nothing ? nothing : T == String ? string(v) : v
-end
-
 function _format_push!(lines, p)
     ref = _get(p, "ref")
     ref !== nothing && push!(lines, "Ref: $ref")
@@ -95,6 +403,9 @@ end
 function _format_pull_request!(lines, p)
     pr = get(() -> nothing, p, "pull_request")
     pr isa AbstractDict || return
+    number = _int_or_nothing(get(() -> nothing, p, "number"))
+    number === nothing && (number = _int_or_nothing(get(() -> nothing, pr, "number")))
+    number !== nothing && push!(lines, "PR #$number")
     title = _get(pr, "title")
     title !== nothing && push!(lines, "Title: $title")
     url = _get(pr, "html_url")
@@ -116,6 +427,8 @@ end
 function _format_issue!(lines, p)
     issue = get(() -> nothing, p, "issue")
     issue isa AbstractDict || return
+    number = _int_or_nothing(get(() -> nothing, issue, "number"))
+    number !== nothing && push!(lines, "Issue #$number")
     title = _get(issue, "title")
     title !== nothing && push!(lines, "Title: $title")
     url = _get(issue, "html_url")
@@ -163,6 +476,8 @@ function _format_pr_review!(lines, p)
     end
     pr = get(() -> nothing, p, "pull_request")
     if pr isa AbstractDict
+        number = _int_or_nothing(get(() -> nothing, pr, "number"))
+        number !== nothing && push!(lines, "PR #$number")
         title = _get(pr, "title")
         title !== nothing && push!(lines, "PR: $title")
     end
@@ -180,6 +495,8 @@ function _format_pr_review_comment!(lines, p)
     path !== nothing && push!(lines, "File: $path")
     pr = get(() -> nothing, p, "pull_request")
     if pr isa AbstractDict
+        number = _int_or_nothing(get(() -> nothing, pr, "number"))
+        number !== nothing && push!(lines, "PR #$number")
         title = _get(pr, "title")
         title !== nothing && push!(lines, "PR: $title")
     end
@@ -371,7 +688,19 @@ const GITHUB_WEBHOOK_KINDS = [
     "workflow_run",
 ]
 
-const ALL_EVENT_TYPES = [Claw.EventType("github_$k", "GitHub $k webhook event") for k in GITHUB_WEBHOOK_KINDS]
+# `pull_request` is split into synthetic types `GitHubPRReady` and `GitHubPRDone` (not `github_pull_request`).
+const GITHUB_WEBHOOK_KINDS_WITHOUT_PULL_REQUEST =
+    [k for k in GITHUB_WEBHOOK_KINDS if k != "pull_request"]
+
+const GITHUB_PR_SYNTHETIC_EVENT_TYPES = Claw.EventType[
+    Claw.EventType("GitHubPRReady", "Pull request ready for review: non-draft open, reopened when not draft, or ready_for_review."),
+    Claw.EventType("GitHubPRDone", "Pull request closed (merged or unmerged)."),
+]
+
+const ALL_EVENT_TYPES = vcat(
+    [Claw.EventType("github_$k", "GitHub $k webhook event") for k in GITHUB_WEBHOOK_KINDS_WITHOUT_PULL_REQUEST],
+    GITHUB_PR_SYNTHETIC_EVENT_TYPES,
+)
 
 # ─── EventSource ───
 
@@ -382,8 +711,17 @@ Base.@kwdef mutable struct GitHubEventSource <: Claw.EventSource
     # away from being the internet's event source.
     host::String = get(ENV, "GITHUB_WEBHOOK_HOST", "127.0.0.1")
     port::Int = parse(Int, get(ENV, "GITHUB_WEBHOOK_PORT", "8080"))
+    app_id::Union{Nothing, Int} = let v = get(ENV, "GITHUB_APP_ID", ""); isempty(v) ? nothing : parse(Int, v) end
+    private_key_path::Union{Nothing, String} = let v = get(ENV, "GITHUB_PRIVATE_KEY_PATH", ""); isempty(v) ? nothing : v end
+    app_slug::Union{Nothing, String} = let v = strip(get(ENV, "GITHUB_APP_SLUG", "")); isempty(v) ? nothing : v end
+    mention_aliases::Vector{String} = let
+        v = get(ENV, "GITHUB_MENTION_ALIASES", "")
+        isempty(v) ? String[] : filter(x -> !isempty(x), strip.(split(v, ",")))
+    end
     repos::Union{Nothing, Vector{String}} = nothing
     events::Union{Nothing, Vector{String}} = nothing
+    # populated lazily by _get_jwt_auth
+    _jwt_auth::Any = nothing
     _server::Any = nothing
     _stopping::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
     _lock::ReentrantLock = ReentrantLock()
@@ -403,7 +741,41 @@ function _register_github_rehydrator!()
     return nothing
 end
 
+function _get_jwt_auth(source::GitHubEventSource)
+    source._jwt_auth !== nothing && return source._jwt_auth::GitHub.JWTAuth
+    source.app_id === nothing && return nothing
+    source.private_key_path === nothing && return nothing
+    auth = GitHub.JWTAuth(source.app_id, source.private_key_path)
+    source._jwt_auth = auth
+    return auth
+end
+
+function _get_installation_auth(source::GitHubEventSource, payload::AbstractDict)
+    jwt = _get_jwt_auth(source)
+    jwt === nothing && return nothing
+    inst_data = get(() -> nothing, payload, "installation")
+    inst_data isa AbstractDict || return nothing
+    inst_id = get(() -> nothing, inst_data, "id")
+    inst_id === nothing && return nothing
+    try
+        return GitHub.create_access_token(GitHub.Installation(; id=inst_id); auth=jwt)
+    catch e
+        @warn "ClawGitHubExt: failed to create installation access token" exception=(e, catch_backtrace())
+        return nothing
+    end
+end
+
 Claw.get_event_types(::GitHubEventSource) = ALL_EVENT_TYPES
+
+function _mention_aliases(source::GitHubEventSource)
+    aliases = copy(source.mention_aliases)
+    slug = source.app_slug
+    if slug !== nothing && !isempty(strip(slug))
+        push!(aliases, slug)
+        push!(aliases, "$slug[bot]")
+    end
+    return _normalize_mention_aliases(aliases)
+end
 
 function Claw.validate_source(source::GitHubEventSource)
     isempty(strip(source.secret)) && error(
@@ -425,6 +797,7 @@ function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
     repos = source.repos !== nothing ? map(GitHub.Repo, source.repos) : nothing
     host = Sockets.IPv4(source.host)
     port = source.port
+    mention_aliases = _mention_aliases(source)
     lock(source._lock) do
         source._server = nothing
         source._stopping[] = false
@@ -450,9 +823,17 @@ function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
             end
             action = get(() -> "", payload, "action")
             action = action === nothing ? "" : string(action)
+            auth = _get_installation_auth(source, payload)
 
-            ghev = GitHubWebhookEvent(kind, action, payload, repo_name, sender_login)
-            @info "ClawGitHubExt: event" kind action repo=repo_name sender=sender_login name=Claw.get_name(ghev)
+            claw_name = _github_webhook_claw_name(kind, action, payload)
+            if claw_name === nothing
+                @info "ClawGitHubExt: ignored pull_request delivery" action repo=repo_name
+                return HTTP.Response(200, "OK")
+            end
+
+            ghev = GitHubWebhookEvent(claw_name, kind, action, payload, repo_name, sender_login;
+                auth, mention_aliases)
+            @info "ClawGitHubExt: event" kind action repo=repo_name sender=sender_login direct_ping=ghev.direct_ping name=Claw.get_name(ghev)
             # Persist before returning 200. A crash after the response is covered
             # by Claw's durable inbox; a failure before it lets GitHub redeliver.
             #

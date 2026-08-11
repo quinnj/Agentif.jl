@@ -72,48 +72,59 @@ if HAS_GITHUB
     event_types = Claw.get_event_types(source)
     et_names = Set(et.name for et in event_types)
 
-    # One event type per webhook kind
+    # One event type per webhook kind, except `pull_request` → GitHubPRReady / GitHubPRDone
     @test "github_push" in et_names
     @test "github_fork" in et_names
     @test "github_ping" in et_names
-    @test "github_pull_request" in et_names
+    @test "GitHubPRReady" in et_names
+    @test "GitHubPRDone" in et_names
+    @test !("github_pull_request" in et_names)
     @test "github_issues" in et_names
     @test "github_issue_comment" in et_names
     @test "github_release" in et_names
     @test "github_workflow_run" in et_names
     @test "github_star" in et_names
-    @test length(event_types) == length(ext.GITHUB_WEBHOOK_KINDS)
+    @test length(event_types) == length(ext.GITHUB_WEBHOOK_KINDS) + 1
 
     # No default handlers (non-channel event source)
     @test isempty(Claw.get_event_handlers(source))
     @test isempty(Claw.get_channels(source))
     @test isempty(Claw.get_tools(source))
 
-    # Event name is always per-kind (action is in event_content, not name)
-    ev_push = ext.GitHubWebhookEvent("push", "", Dict{String,Any}("ref" => "refs/heads/main"), "owner/repo", "alice")
+    ev_push = ext.GitHubWebhookEvent("github_push", "push", "", Dict{String,Any}("ref" => "refs/heads/main"), "owner/repo", "alice")
     @test Claw.get_name(ev_push) == "github_push"
 
-    ev_pr = ext.GitHubWebhookEvent("pull_request", "opened",
-        Dict{String,Any}("action" => "opened", "pull_request" => Dict{String,Any}(
+    auth = GitHub.OAuth2("ghs_test_token")
+    ev_pr = ext.GitHubWebhookEvent("GitHubPRReady", "pull_request", "opened",
+        Dict{String,Any}(
+            "action" => "opened",
+            "number" => 42,
+            "pull_request" => Dict{String,Any}(
             "title" => "Add feature", "body" => "Description here",
             "html_url" => "https://github.com/owner/repo/pull/42",
-            "number" => 42, "base" => Dict("ref" => "main"), "head" => Dict("ref" => "feature"),
+            "number" => 42, "draft" => false, "base" => Dict("ref" => "main"), "head" => Dict("ref" => "feature"),
         )),
-        "owner/repo", "bob")
-    @test Claw.get_name(ev_pr) == "github_pull_request"
+        "owner/repo", "bob"; auth)
+    @test Claw.get_name(ev_pr) == "GitHubPRReady"
+    pr_channel = Claw.get_channel(ev_pr)
+    @test Agentif.channel_id(pr_channel) == "github:owner/repo:pr:42"
+    @test Agentif.entry_id(pr_channel) === nothing
+    @test Agentif.is_group(pr_channel)
+    @test Agentif.is_private(pr_channel)
 
     # Event content formatting
     content_pr = Claw.event_content(ev_pr)
     @test occursin("owner/repo", content_pr)
     @test occursin("Add feature", content_pr)
     @test occursin("opened", content_pr)
+    @test occursin("PR #42", content_pr)
 
     content_push = Claw.event_content(ev_push)
     @test occursin("push", content_push)
     @test occursin("refs/heads/main", content_push)
 
     # Push with commits
-    ev_push_commits = ext.GitHubWebhookEvent("push", "",
+    ev_push_commits = ext.GitHubWebhookEvent("github_push", "push", "",
         Dict{String,Any}(
             "ref" => "refs/heads/main",
             "commits" => [
@@ -128,22 +139,60 @@ if HAS_GITHUB
     @test occursin("Commits (2)", content_commits)
 
     # Issue comment event
-    ev_comment = ext.GitHubWebhookEvent("issue_comment", "created",
+    ev_comment = ext.GitHubWebhookEvent("github_issue_comment", "issue_comment", "created",
         Dict{String,Any}("action" => "created",
-            "comment" => Dict{String,Any}("body" => "LGTM!", "html_url" => "https://github.com/owner/repo/issues/7#issuecomment-1"),
-            "issue" => Dict{String,Any}("title" => "Bug report", "number" => 7),
+            "comment" => Dict{String,Any}("id" => 17, "body" => "@ando LGTM!", "html_url" => "https://github.com/owner/repo/issues/7#issuecomment-1"),
+            "issue" => Dict{String,Any}("title" => "Bug report", "number" => 7, "pull_request" => Dict{String,Any}("url" => "https://api.github.com/repos/owner/repo/pulls/7")),
         ),
-        "owner/repo", "eve")
+        "owner/repo", "eve"; auth, mention_aliases=["ando"])
     content_comment = Claw.event_content(ev_comment)
     @test occursin("LGTM!", content_comment)
     @test occursin("Bug report", content_comment)
+    @test occursin("Direct mention: yes", content_comment)
+    @test ev_comment.direct_ping
+    comment_channel = Claw.get_channel(ev_comment)
+    @test Agentif.channel_id(comment_channel) == "github:owner/repo:pr:7"
+    @test Agentif.entry_id(comment_channel) == "17"
 
     # Generic event fallback
-    ev_star = ext.GitHubWebhookEvent("star", "created", Dict{String,Any}("action" => "created"), "owner/repo", "fan")
+    ev_star = ext.GitHubWebhookEvent("github_star", "star", "created", Dict{String,Any}("action" => "created"), "owner/repo", "fan")
     @test Claw.get_name(ev_star) == "github_star"
     content_star = Claw.event_content(ev_star)
     @test occursin("star", content_star)
     @test occursin("fan", content_star)
+
+    original_create_comment_fn = ext.CREATE_COMMENT_FN[]
+    try
+        comment_calls = NamedTuple[]
+        ext.CREATE_COMMENT_FN[] = function (repo_name, issue_number, body, auth_arg)
+            push!(comment_calls, (; repo_name, issue_number, body, auth=auth_arg))
+            return Dict{String, Any}("id" => 99, "body" => body)
+        end
+
+        @test isempty(Agentif.create_channel_tools(pr_channel))
+
+        comment_response = Agentif.send_message(pr_channel, "Thanks for the PR")
+        @test length(comment_calls) == 1
+        @test only(comment_calls).repo_name == "owner/repo"
+        @test only(comment_calls).issue_number == 42
+        @test only(comment_calls).body == "Thanks for the PR"
+        @test Agentif.response_entry_id(pr_channel) == "99"
+        @test comment_response["id"] == 99
+
+        ev_pr_done = ext.GitHubWebhookEvent("GitHubPRDone", "pull_request", "closed",
+            Dict{String,Any}(
+                "action" => "closed",
+                "number" => 99,
+                "pull_request" => Dict{String,Any}(
+                    "title" => "Done", "number" => 99, "merged" => true,
+                    "html_url" => "https://github.com/owner/repo/pull/99",
+                ),
+            ),
+            "owner/repo", "bob"; auth)
+        @test Claw.get_name(ev_pr_done) == "GitHubPRDone"
+    finally
+        ext.CREATE_COMMENT_FN[] = original_create_comment_fn
+    end
 end
 else
     @info "Skipping ClawGitHubExt tests: GitHub package unavailable in test environment"

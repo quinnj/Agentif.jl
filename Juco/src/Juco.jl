@@ -1,20 +1,29 @@
 """
-Juco.jl - A coding assistant app built on top of Agentif and LLMTools
+Juco — an uber-minimal pure-Julia coding agent built on Agentif.
 
-This package provides a ready-to-use coding assistant agent with predefined
-tools for common coding tasks like reading, writing, and editing files,
-running shell commands, and more.
+Three coding tools (bash, read, edit — where edit also creates files) plus one
+memory tool (remember). A single SQLite file persists both session history and
+memories; memories are auto-injected into the system prompt each session.
+
+Usage:
+    Juco.main()                      # CLI (see juco --help)
+    Juco.repl()                      # interactive session
+    Juco.evaluate("fix the bug")     # one programmatic turn
 """
 module Juco
 
+using Dates
 using Agentif
 using LLMTools
+using LLMProviders
+using SQLite
+using LocalSearch
 
-# Include coding assistant functionality
-# For now, this is a minimal scaffold - you can expand with your specific coding assistant code
-include("coding_assistant.jl")
+include("db.jl")
+include("tools.jl")
+include("prompt.jl")
+include("agent.jl")
 
-# Exports
-export coding_agent, default_coding_prompt
+export repl
 
 end
