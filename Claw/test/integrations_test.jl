@@ -440,6 +440,33 @@ end
     end
 end
 
+@testset "event type cleanup failure keeps runtime enabled" begin
+    a = make_assistant()
+    a._state[] = :running
+    st = Claw.enable_integration!(a, "toy")
+    try
+        Claw.execute_write(a._writer, """
+            CREATE TRIGGER reject_event_type_cleanup
+            BEFORE DELETE ON claw_event_types
+            WHEN OLD.name = 'toy_event'
+            BEGIN SELECT RAISE(ABORT, 'event type cleanup blocked'); END
+        """)
+        @test_throws SQLite.SQLiteException Claw.disable_integration!(a, "toy")
+        @test lock(() -> get(a._integrations, "toy", nothing), a._integrations_lock) === st
+        @test !st.source.stopped[]
+        @test any(ss -> ss.source === st.source && !ss.stopped[], a._sources)
+        @test haskey(a._channels, "toy-chan")
+        @test has_tool(a, "toy_integration_tool")
+        @test event_type_registered(a, "toy_event")
+        @test integration_row(a, "toy").enabled == 1
+    finally
+        Claw.execute_write(a._writer, "DROP TRIGGER IF EXISTS reject_event_type_cleanup")
+        lock(() -> haskey(a._integrations, "toy"), a._integrations_lock) &&
+            Claw.disable_integration!(a, "toy")
+        Claw.shutdown!(a; timeout_s = 5)
+    end
+end
+
 # ─── Persisted enabled-set reconciliation ───
 
 @testset "init! reconciles the persisted enabled-set" begin

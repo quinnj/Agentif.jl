@@ -240,7 +240,7 @@ function _register_event_source_tracked!(assistant::AgentAssistant, es::EventSou
             assistant._channels[id] = ch
         end
         append!(assistant.tools, tools)
-        return (; channel_ids, event_type_names, tool_names, channels, tools)
+        return (; channel_ids, event_type_names, tool_names, channels, event_types, tools)
     end
 end
 
@@ -298,7 +298,7 @@ function enable_integration!(assistant::AgentAssistant, name::AbstractString;
         end
         reg = _register_event_source_tracked!(assistant, es)
         st = IntegrationState(key, es, nothing, reg.channel_ids, reg.event_type_names,
-            reg.tool_names, reg.channels, reg.tools)
+            reg.tool_names, reg.channels, reg.event_types, reg.tools)
         assistant._integrations[key] = st
         st.supervised = _start_supervised_source!(assistant, es; validated = true)
         if persist
@@ -369,21 +369,52 @@ function _disable_integration_locked!(assistant::AgentAssistant, key::String,
             idx === nothing ? nothing : assistant._sources[idx]
         end
     end
-    ss === nothing || _stop_supervised_source!(assistant, ss)
+    other_sources = lock(assistant._sources_lock) do
+        EventSource[other.source for other in assistant._sources
+            if other.source !== state.source && !other.stopped[]]
+    end
+    other_types = Set{String}()
+    for source in other_sources
+        try
+            union!(other_types, (et.name for et in get_event_types(source)))
+        catch
+        end
+    end
+    removed_types = EventType[et for et in state.event_types if !(et.name in other_types)]
+    if !isempty(removed_types)
+        placeholders = join(fill("?", length(removed_types)), ", ")
+        execute_write(assistant._writer,
+            "DELETE FROM claw_event_types WHERE name IN ($placeholders)",
+            Tuple(et.name for et in removed_types))
+    end
+    try
+        ss === nothing || _stop_supervised_source!(assistant, ss)
+    catch
+        # The stop helper restores supervision after a timeout. Restore the
+        # registrations removed before stop! so runtime and durable state agree.
+        try
+            _writer_txn(assistant) do db
+                for et in removed_types
+                    _exec!(db, "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
+                        (et.name, et.description))
+                end
+                return nothing
+            end
+        catch restore_error
+            @error "Claw: failed to restore integration event types after stop failure" integration = key exception = (restore_error, catch_backtrace())
+        end
+        rethrow()
+    end
     # Channels: remove the ids attributed to this source. If another active source
     # publishes the same id, restore its object instead of deleting the shared id.
     owned_channels = Dict{String, Agentif.AbstractChannel}(
-        Agentif.channel_id(ch) => ch for ch in state.channels)
+        id => ch for (id, ch) in zip(state.channel_ids, state.channels))
     try
         for ch in get_channels(state.source)
             get!(owned_channels, Agentif.channel_id(ch), ch)
         end
     catch e
         @debug "Claw: get_channels failed during disable" integration = key exception = (e,)
-    end
-    other_sources = lock(assistant._sources_lock) do
-        EventSource[other.source for other in assistant._sources
-            if other.source !== state.source && !other.stopped[]]
     end
     for id in keys(owned_channels)
         replacement = nothing
@@ -412,24 +443,6 @@ function _disable_integration_locked!(assistant::AgentAssistant, key::String,
     for tool in Iterators.reverse(state.tools)
         idx = findlast(t -> t === tool, assistant.tools)
         idx === nothing || deleteat!(assistant.tools, idx)
-    end
-    if !isempty(state.event_type_names)
-        other_types = Set{String}()
-        for source in other_sources
-            try
-                union!(other_types, (et.name for et in get_event_types(source)))
-            catch
-            end
-        end
-        execute_write(assistant._writer) do db
-            _with_busy_retry() do
-                for et in state.event_type_names
-                    et in other_types && continue
-                    _exec!(db, "DELETE FROM claw_event_types WHERE name = ?", (et,))
-                end
-                return nothing
-            end
-        end
     end
     lock(EVENT_SOURCES_LOCK) do
         Base.delete!(EVENT_SOURCES, state.source)
@@ -460,7 +473,7 @@ function _adopt_explicit_integrations!(assistant::AgentAssistant, regs)
             idx === nothing ? nothing : assistant._sources[idx]
         end
         state = IntegrationState(name, es, ss, reg.channel_ids, reg.event_type_names,
-            reg.tool_names, reg.channels, reg.tools)
+            reg.tool_names, reg.channels, reg.event_types, reg.tools)
         lock(assistant._integrations_lock) do
             assistant._integrations[name] = state
         end

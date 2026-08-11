@@ -120,6 +120,7 @@ mutable struct IntegrationState
     event_type_names::Vector{String}
     tool_names::Vector{String}
     channels::Vector{Agentif.AbstractChannel}
+    event_types::Vector{EventType}
     tools::Vector{Agentif.AgentTool}
 end
 
