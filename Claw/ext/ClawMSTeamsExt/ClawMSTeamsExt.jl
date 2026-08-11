@@ -373,4 +373,8 @@ function Claw.start!(source::MSTeamsEventSource, assistant::Claw.AgentAssistant)
     end)
 end
 
+# Loading the trigger package makes this integration enable-able by name
+# (list_integrations / enable_integration!).
+__init__() = Claw.register_integration!("msteams", MSTeamsEventSource)
+
 end # module ClawMSTeamsExt

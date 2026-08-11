@@ -941,4 +941,8 @@ const JMAP_TOOLS = Agentif.AgentTool[
     EMAIL_UNMUTE_THREAD_TOOL,
 ]
 
+# Loading the trigger package makes this integration enable-able by name
+# (list_integrations / enable_integration!).
+__init__() = Claw.register_integration!("fastmail", FastmailEventSource)
+
 end # module ClawJMAPExt

@@ -440,9 +440,17 @@ end
     Claw.get_name(::TestContentEvent) = "test"
     Claw.event_content(e::TestContentEvent) = e.content
 
-    @test Claw.make_prompt("", TestContentEvent("hello")) == "hello"
-    @test Claw.make_prompt("Prompt", TestContentEvent("content")) == "Prompt\n\nEvent content:\n\ncontent"
+    # Plain (non-channel) events are third-party content, so their body arrives
+    # fenced as untrusted data; chat channel events pass through untouched.
+    fenced = Claw.make_prompt("", TestContentEvent("hello"))
+    @test startswith(fenced, Claw.UNTRUSTED_EVENT_OPEN)
+    @test occursin("hello", fenced)
+    with_prompt = Claw.make_prompt("Prompt", TestContentEvent("content"))
+    @test startswith(with_prompt, "Prompt\n\nEvent content:\n\n")
+    @test occursin(Claw.UNTRUSTED_EVENT_OPEN, with_prompt)
+    @test occursin("content", with_prompt)
     @test Claw.make_prompt("", TestContentEvent("")) == ""
+    @test Claw.make_prompt("", Claw.ReplInputEvent("hi", Claw.ReplChannel())) == "hi"
 
     # TempusJobEvent
     ev = Claw.TempusJobEvent("tempus_job:test")

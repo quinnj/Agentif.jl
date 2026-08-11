@@ -358,7 +358,9 @@ end
 # ─── §1.4 Lanes ───
 
 @testset "lane serialization: same channel never overlaps" begin
-    a = make_assistant(":memory:"; max_concurrent_evals = 4, FAST...)
+    # max_coalesce = 1: this test is about serialization; with coalescing on, the
+    # second event would fold into the first drain and there would be one eval.
+    a = make_assistant(":memory:"; max_concurrent_evals = 4, max_coalesce = 1, FAST...)
     Claw.CURRENT_ASSISTANT[] = a
     ch = RecordingChannel("lane-serial")
     a._channels[ch.id] = ch
@@ -1110,6 +1112,197 @@ end
 
     # With a parked cursor this connection would still see only the pre-write snapshot.
     @test Claw._get_agent_metadata(db, "probe-key2") == "second"
+end
+
+# ─── Coalescing + subscription filters in the pipeline ───
+
+@testset "coalescing: burst on one lane folds into a demarcated batch" begin
+    a = make_assistant(":memory:"; max_concurrent_evals = 4, FAST...)
+    Claw.CURRENT_ASSISTANT[] = a
+    ch = RecordingChannel("coalesce-lane")
+    a._channels[ch.id] = ch
+    register_test_handler!(a)
+
+    seen = []
+    slock = ReentrantLock()
+    gate = Base.Channel{Nothing}(1)
+    runner = function (assistant, ev, handler; kwargs...)
+        lock(slock) do
+            push!(seen, ev)
+        end
+        take!(gate)
+        return nothing
+    end
+    with_handler(runner) do
+        Claw.start_event_loop!(a)
+        Claw.submit_event!(a, PipelineTestEvent("one", ch))
+        @test timedwait(() -> length(seen) == 1, 15.0) == :ok
+        # These three arrive while the first evaluation is still running, so they
+        # pile up on the lane and the next drain folds them into one batch.
+        Claw.submit_event!(a, PipelineTestEvent("two", ch))
+        Claw.submit_event!(a, PipelineTestEvent("three", ch))
+        Claw.submit_event!(a, PipelineTestEvent("four", ch))
+        @test timedwait(() -> begin
+            lane = get(a._lanes, "coalesce-lane", nothing)
+            lane !== nothing && lane.depth[] == 3
+        end, 15.0) == :ok
+        put!(gate, nothing)
+        @test timedwait(() -> length(seen) == 2, 15.0) == :ok
+        put!(gate, nothing)
+        @test timedwait(() -> count_rows(a, "WHERE status='done'") == 4, 15.0) == :ok
+    end
+    @test length(seen) == 2
+    @test seen[1] isa PipelineTestEvent
+    batch = seen[2]
+    @test batch isa Claw.ChannelEventBatch
+    @test length(Claw.batch_events(batch)) == 3
+    @test Claw.get_channel(batch) === ch
+    content = Claw.event_content(batch)
+    @test occursin("3 'pipeline_test_event' events", content)
+    @test occursin("--- Event 1 of 3 ---\ntwo", content)
+    @test occursin("--- Event 2 of 3 ---\nthree", content)
+    @test occursin("--- Event 3 of 3 ---\nfour", content)
+    Claw.shutdown!(a; timeout_s = 5)
+end
+
+@testset "coalescing: filters run per event before the batch forms" begin
+    a = make_assistant(":memory:"; max_concurrent_evals = 4, FAST...)
+    Claw.CURRENT_ASSISTANT[] = a
+    ch = RecordingChannel("filter-lane")
+    a._channels[ch.id] = ch
+    Claw.execute_write(a._writer,
+        "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
+        ("pipeline_test_event", "pipeline test"))
+    Claw.register_event_handler!(a, Claw.EventHandler(
+        "filtering_handler", ["pipeline_test_event"], "";
+        filter = Claw.EventFilter(:regex, "keep")))
+
+    seen = []
+    slock = ReentrantLock()
+    gate = Base.Channel{Nothing}(1)
+    runner = function (assistant, ev, handler; kwargs...)
+        lock(slock) do
+            push!(seen, ev)
+        end
+        take!(gate)
+        return nothing
+    end
+    with_handler(runner) do
+        Claw.start_event_loop!(a)
+        Claw.submit_event!(a, PipelineTestEvent("keep-1", ch))
+        @test timedwait(() -> length(seen) == 1, 15.0) == :ok
+        Claw.submit_event!(a, PipelineTestEvent("drop-2", ch))
+        Claw.submit_event!(a, PipelineTestEvent("keep-3", ch))
+        Claw.submit_event!(a, PipelineTestEvent("drop-4", ch))
+        @test timedwait(() -> begin
+            lane = get(a._lanes, "filter-lane", nothing)
+            lane !== nothing && lane.depth[] == 3
+        end, 15.0) == :ok
+        put!(gate, nothing)
+        @test timedwait(() -> length(seen) == 2, 15.0) == :ok
+        put!(gate, nothing)
+        # Filtered events complete too: nothing stays pending, nothing dead.
+        @test timedwait(() -> count_rows(a, "WHERE status='done'") == 4, 15.0) == :ok
+        # A drain whose events are all filtered runs no evaluation at all.
+        Claw.submit_event!(a, PipelineTestEvent("drop-5", ch))
+        @test timedwait(() -> count_rows(a, "WHERE status='done'") == 5, 15.0) == :ok
+    end
+    @test length(seen) == 2
+    @test Claw.event_content(seen[1]) == "keep-1"
+    # Only the matching event survived into the second drain — and a single
+    # survivor is delivered as a plain event, not a batch of one.
+    @test seen[2] isa PipelineTestEvent
+    @test Claw.event_content(seen[2]) == "keep-3"
+    Claw.shutdown!(a; timeout_s = 5)
+end
+
+@testset "prompt filter transport failure rides the retry ladder" begin
+    a = make_assistant(":memory:"; max_concurrent_evals = 2,
+        retry_backoff_s = [0.05], FAST...)
+    Claw.CURRENT_ASSISTANT[] = a
+    ch = RecordingChannel("prompt-filter-lane")
+    a._channels[ch.id] = ch
+    Claw.execute_write(a._writer,
+        "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
+        ("pipeline_test_event", "pipeline test"))
+    Claw.register_event_handler!(a, Claw.EventHandler(
+        "prompt_filtered_handler", ["pipeline_test_event"], "";
+        filter = Claw.EventFilter(:prompt, "only real questions")))
+
+    model_down = Ref(true)
+    original_filter = Claw.PROMPT_FILTER_FN[]
+    Claw.PROMPT_FILTER_FN[] = (assistant, criteria, content) ->
+        model_down[] ? error("model unreachable") : true
+    ran = Threads.Atomic{Int}(0)
+    runner = (assistant, ev, handler; kwargs...) -> (Threads.atomic_add!(ran, 1); nothing)
+    try
+        with_handler(runner) do
+            Claw.start_event_loop!(a)
+            id = Claw.submit_event!(a, PipelineTestEvent("is this a question?", ch))
+            # The filter error sends the event to retry, not to done/dead, and the
+            # evaluation never ran.
+            @test timedwait(() -> begin
+                row = event_row(a, id)
+                row !== nothing && row.status == "pending" && row.attempts >= 1
+            end, 15.0) == :ok
+            @test ran[] == 0
+            # Once the "model" recovers, the scheduled retry passes the filter and
+            # the handler finally runs.
+            model_down[] = false
+            @test timedwait(() -> event_row(a, id).status == "done", 15.0) == :ok
+            @test ran[] == 1
+        end
+    finally
+        Claw.PROMPT_FILTER_FN[] = original_filter
+    end
+    Claw.shutdown!(a; timeout_s = 5)
+end
+
+@testset "coalesced REPL inputs release every waiter" begin
+    a = make_assistant(":memory:"; max_concurrent_evals = 2, FAST...)
+    Claw.CURRENT_ASSISTANT[] = a
+    Claw.execute_write(a._writer,
+        "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
+        ("repl_input", "repl"))
+    Claw.register_event_handler!(a, Claw.EventHandler("repl_default", ["repl_input"], "", nothing))
+
+    gate = Base.Channel{Nothing}(1)
+    runner = function (assistant, ev, handler; kwargs...)
+        # Emulate the real evaluation's channel lifecycle: stream to the resolved
+        # channel and finish it (which notifies that ReplChannel's completion).
+        if ev isa Claw.ChannelEvent
+            resolved = Claw.get_channel(ev)
+            Agentif.finish_streaming(resolved)
+        end
+        take!(gate)
+        return nothing
+    end
+    ch1 = Claw.ReplChannel(devnull, Threads.Event())
+    ch2 = Claw.ReplChannel(devnull, Threads.Event())
+    ch3 = Claw.ReplChannel(devnull, Threads.Event())
+    with_handler(runner) do
+        Claw.start_event_loop!(a)
+        Claw.submit_event!(a, Claw.ReplInputEvent("first", ch1))
+        @test timedwait(() -> begin
+            lane = get(a._lanes, "repl", nothing)
+            lane !== nothing && lane.busy[]
+        end, 15.0) == :ok
+        # Two more REPL inputs while the first is evaluating: they coalesce, the
+        # response streams to the *last* channel, and the non-primary waiter (ch2)
+        # must still be released via close_channel.
+        Claw.submit_event!(a, Claw.ReplInputEvent("second", ch2))
+        Claw.submit_event!(a, Claw.ReplInputEvent("third", ch3))
+        @test timedwait(() -> begin
+            lane = get(a._lanes, "repl", nothing)
+            lane !== nothing && lane.depth[] == 2
+        end, 15.0) == :ok
+        put!(gate, nothing)   # release first eval
+        put!(gate, nothing)   # release batch eval
+        @test timedwait(() -> count_rows(a, "WHERE status='done'") == 3, 15.0) == :ok
+    end
+    waiters = [Threads.@spawn wait(ch.completion) for ch in (ch1, ch2, ch3)]
+    @test timedwait(() -> all(istaskdone, waiters), 5.0) == :ok
+    Claw.shutdown!(a; timeout_s = 5)
 end
 
 end # module PipelineTests

@@ -509,4 +509,8 @@ function Claw.start!(source::TelegramEventSource, assistant::Claw.AgentAssistant
     end)
 end
 
+# Loading the trigger package makes this integration enable-able by name
+# (list_integrations / enable_integration!).
+__init__() = Claw.register_integration!("telegram", TelegramEventSource)
+
 end # module ClawTelegramExt

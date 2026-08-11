@@ -621,4 +621,8 @@ function Claw.start!(source::SlackEventSource, assistant::Claw.AgentAssistant)
     end)
 end
 
+# Loading the trigger package makes this integration enable-able by name
+# (list_integrations / enable_integration!).
+__init__() = Claw.register_integration!("slack", SlackEventSource)
+
 end # module ClawSlackExt

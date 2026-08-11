@@ -554,18 +554,35 @@ function _lane_loop(assistant::AgentAssistant, lane::Lane)
             end
             Threads.atomic_sub!(lane.depth, 1)
             assistant._state[] === :running || break
-            id, enqueued_at = item
-            waited = time() - enqueued_at
-            if waited > assistant.pipeline.lane_backlog_warn_s
-                @warn "Claw: lane backlog" lane = lane.key wait_s = round(waited; digits = 2) queue_depth = lane.depth[]
+            # Coalesce: drain whatever else is already queued on this lane (up to
+            # max_coalesce), so a burst that piled up behind a slow evaluation is
+            # handled as one demarcated batch instead of N sequential evaluations.
+            # Only this worker consumes the queue, so isready/take! cannot race.
+            items = [item]
+            max_coalesce = max(assistant.pipeline.max_coalesce, 1)
+            while length(items) < max_coalesce && isready(lane.queue)
+                extra = try
+                    take!(lane.queue)
+                catch
+                    break
+                end
+                Threads.atomic_sub!(lane.depth, 1)
+                push!(items, extra)
             end
+            waited = time() - items[1][2]
+            if waited > assistant.pipeline.lane_backlog_warn_s
+                @warn "Claw: lane backlog" lane = lane.key wait_s = round(waited; digits = 2) queue_depth = lane.depth[] drained = length(items)
+            end
+            ids = [id for (id, _) in items]
             lane.busy[] = true
             Base.acquire(assistant._sem)
             try
-                _process_event!(assistant, id)
+                _process_event_batch!(assistant, ids)
             catch e
-                @error "Claw: lane worker error" lane = lane.key event_id = id exception = (e, catch_backtrace())
-                _clear_wakeup!(assistant, id)
+                @error "Claw: lane worker error" lane = lane.key event_ids = ids exception = (e, catch_backtrace())
+                for id in ids
+                    _clear_wakeup!(assistant, id)
+                end
             finally
                 Base.release(assistant._sem)
                 lane.last_active[] = time()
@@ -616,7 +633,8 @@ function _dead_letter_notify!(assistant::AgentAssistant, id::Int, ev::Event, han
     return nothing
 end
 
-function _handle_event_failure!(assistant::AgentAssistant, row::EventRow, ev::Event, handlers, err)
+function _handle_event_failure!(assistant::AgentAssistant, row::EventRow, ev::Event, handlers, err;
+        notify::Bool = true)
     cfg = assistant.pipeline
     class = classify_eval_failure(err)
     action, delay = _retry_decision(cfg, class, row.attempts)
@@ -631,82 +649,174 @@ function _handle_event_failure!(assistant::AgentAssistant, row::EventRow, ev::Ev
     else
         @error "Claw: event dead-lettered" event_id = row.id event_name = row.name class attempts = row.attempts error = text
         _finish_event!(assistant, row.id, "dead"; last_error = text)
-        _dead_letter_notify!(assistant, row.id, ev, handlers, class, text)
+        notify && _dead_letter_notify!(assistant, row.id, ev, handlers, class, text)
         _forget_live_event!(assistant, row.id)
     end
     return nothing
 end
 
-function _process_event!(assistant::AgentAssistant, id::Int)
-    row = try
-        _claim_event!(assistant, id)
-    catch e
-        @error "Claw: claim failed" event_id = id exception = (e, catch_backtrace())
-        nothing
-    end
-    if row === nothing
-        _clear_wakeup!(assistant, id)
-        return nothing
-    end
+"""
+    _process_event_batch!(assistant, ids)
 
-    ev = lock(assistant._live_lock) do
-        get(assistant._live_events, id, nothing)
-    end
-    if ev === nothing
-        ev = rehydrate_event(row.source, row)
-    end
-    if ev === nothing
-        # The owning source is not registered (or could not rebuild the channel).
-        # Leave the row pending and try again later rather than dropping it.
-        _release_claim!(assistant, id; delay = 60.0, last_error = "no rehydrator for source '$(row.source)'")
-        _clear_wakeup!(assistant, id)
-        return nothing
-    end
+Claim and process one lane drain. Claimed events are split into runs of
+consecutive rows with the same event name; each run is handled as one group —
+its events go through the group's handler filters individually, and the
+survivors are folded into a single coalesced evaluation per handler.
+"""
+function _process_event_batch!(assistant::AgentAssistant, ids::Vector{Int})
+    claimed = Tuple{EventRow, Event}[]
+    for id in ids
+        row = try
+            _claim_event!(assistant, id)
+        catch e
+            @error "Claw: claim failed" event_id = id exception = (e, catch_backtrace())
+            nothing
+        end
+        if row === nothing
+            _clear_wakeup!(assistant, id)
+            continue
+        end
 
+        ev = lock(assistant._live_lock) do
+            get(assistant._live_events, id, nothing)
+        end
+        if ev === nothing
+            ev = rehydrate_event(row.source, row)
+        end
+        if ev === nothing
+            # The owning source is not registered (or could not rebuild the channel).
+            # Leave the row pending and try again later rather than dropping it.
+            _release_claim!(assistant, id; delay = 60.0, last_error = "no rehydrator for source '$(row.source)'")
+            _clear_wakeup!(assistant, id)
+            continue
+        end
+        push!(claimed, (row, ev))
+    end
+    isempty(claimed) && return nothing
+
+    # Consecutive same-name runs only: grouping non-adjacent events would reorder
+    # them relative to interleaved events of other types on the same lane.
+    i = 1
+    while i <= length(claimed)
+        j = i
+        while j < length(claimed) && claimed[j + 1][1].name == claimed[i][1].name
+            j += 1
+        end
+        _process_claimed_group!(assistant, claimed[i:j])
+        i = j + 1
+    end
+    return nothing
+end
+
+_process_event!(assistant::AgentAssistant, id::Int) = _process_event_batch!(assistant, [id])
+
+function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{EventRow, Event}})
+    name = group[1][1].name
     handlers = try
-        _event_handlers_for(assistant, row.name)
+        _event_handlers_for(assistant, name)
     catch e
-        @error "Claw: event handler lookup failed" event_id = id event = row.name exception = (e, catch_backtrace())
-        _release_claim!(assistant, id; delay = assistant.pipeline.min_refire_gap_s)
-        _clear_wakeup!(assistant, id)
+        @error "Claw: event handler lookup failed" event = name exception = (e, catch_backtrace())
+        for (row, _) in group
+            _release_claim!(assistant, row.id; delay = assistant.pipeline.min_refire_gap_s)
+            _clear_wakeup!(assistant, row.id)
+        end
         return nothing
     end
 
     if isempty(handlers)
-        @debug "Claw: no handlers for event" event_id = id event_name = row.name
-        _finish_event!(assistant, id, "done")
-        _forget_live_event!(assistant, id)
-        _clear_wakeup!(assistant, id)
+        for (row, _) in group
+            @debug "Claw: no handlers for event" event_id = row.id event_name = name
+            _finish_event!(assistant, row.id, "done")
+            _forget_live_event!(assistant, row.id)
+            _clear_wakeup!(assistant, row.id)
+        end
+        _release_group_channels!(group, nothing)
         return nothing
     end
 
     abort = Agentif.Abort()
     lock(assistant._inflight_lock) do
-        assistant._inflight[id] = abort
+        for (row, _) in group
+            assistant._inflight[row.id] = abort
+        end
     end
     started_at = time()
+    # Channels an evaluation actually streamed to; every other channel event in the
+    # group is released afterwards so nothing waits on a response that will never
+    # come (a coalesced member, or an event a filter rejected).
+    streamed = Base.IdSet{Any}()
     try
         for handler in handlers
-            @info "Claw: running handler" handler_id = handler.id event_name = row.name event_id = id attempt = row.attempts
+            kept = Event[]
+            for (row, ev) in group
+                # Filter errors (e.g. a :prompt filter that cannot reach the model)
+                # propagate: the group rides the retry ladder rather than the event
+                # being silently dropped or spuriously delivered.
+                passes_filter(assistant, handler, ev, row.extra) && push!(kept, ev)
+            end
+            if isempty(kept)
+                @debug "Claw: filter matched no events" handler_id = handler.id event_name = name group_size = length(group)
+                continue
+            end
+            ev_input = length(kept) == 1 ? kept[1] : _make_event_batch(name, kept)
+            @info "Claw: running handler" handler_id = handler.id event_name = name event_ids = [row.id for (row, _) in group] coalesced = length(kept)
             RUN_EVENT_HANDLER_FN[](
                 assistant,
-                ev,
+                ev_input,
                 handler;
                 level = assistant.log_level,
                 abort,
                 pipeline_managed = true,
             )
-            @info "Claw: handler completed" handler_id = handler.id event_name = row.name duration_s = round(time() - started_at; digits = 4)
+            ev_input isa ChannelEvent && push!(streamed, get_channel(ev_input))
+            @info "Claw: handler completed" handler_id = handler.id event_name = name duration_s = round(time() - started_at; digits = 4)
         end
-        _finish_event!(assistant, id, "done")
-        _forget_live_event!(assistant, id)
+        for (row, _) in group
+            _finish_event!(assistant, row.id, "done")
+            _forget_live_event!(assistant, row.id)
+        end
+        _release_group_channels!(group, streamed)
     catch e
-        _handle_event_failure!(assistant, row, ev, handlers, e)
+        # One failure fails the whole group: every row returns to the retry ladder
+        # together (same at-least-once semantics as a multi-handler single event).
+        # Only the first row sends a dead-letter notice, so a dead group does not
+        # spam its channel N times.
+        notify = true
+        for (row, ev) in group
+            _handle_event_failure!(assistant, row, ev, handlers, e; notify)
+            notify = false
+        end
     finally
         lock(assistant._inflight_lock) do
-            Base.delete!(assistant._inflight, id)
+            for (row, _) in group
+                Base.delete!(assistant._inflight, row.id)
+            end
         end
-        _clear_wakeup!(assistant, id)
+        for (row, _) in group
+            _clear_wakeup!(assistant, row.id)
+        end
+    end
+    return nothing
+end
+
+# Close channel-event channels that no evaluation streamed to (coalesced members
+# and filter-rejected events). `close_channel` flushes buffered transports and
+# unblocks REPL waiters; without this, `a"..."` would hang whenever its event was
+# coalesced into a batch whose response streamed to a newer channel object.
+function _release_group_channels!(group::Vector{Tuple{EventRow, Event}}, streamed)
+    for (_, ev) in group
+        ev isa ChannelEvent || continue
+        ch = try
+            get_channel(ev)
+        catch
+            continue
+        end
+        streamed !== nothing && ch in streamed && continue
+        try
+            Agentif.close_channel(ch)
+        catch e
+            @debug "Claw: failed to release coalesced channel" exception = (e,)
+        end
     end
     return nothing
 end
@@ -917,7 +1027,7 @@ function _health_loop(assistant::AgentAssistant)
     cfg = assistant.pipeline
     while assistant._state[] === :running
         _sleep_interruptible(assistant, cfg.source_health_interval_s) || break
-        for ss in assistant._sources
+        for ss in lock(() -> copy(assistant._sources), assistant._sources_lock)
             ss.stopped[] && continue
             ok = try
                 is_healthy(ss.source)
@@ -941,6 +1051,64 @@ function _health_loop(assistant::AgentAssistant)
     return nothing
 end
 
+function _ensure_health_loop!(assistant::AgentAssistant)
+    assistant._health_loop_started[] && return nothing
+    assistant._health_loop_started[] = true
+    push!(assistant._tasks, errormonitor(Threads.@spawn _health_loop(assistant)))
+    return nothing
+end
+
+"""
+    _start_supervised_source!(assistant, es) -> SupervisedSource
+
+Validate one source and start it in its own supervised task. A validation failure
+marks it stopped but never throws — one bad source must not take down the rest.
+"""
+function _start_supervised_source!(assistant::AgentAssistant, es::EventSource)
+    tag = _source_tag(es)
+    ss = SupervisedSource(es, tag)
+    lock(() -> push!(assistant._sources, ss), assistant._sources_lock)
+    try
+        validate_source(es)
+    catch e
+        ss.stopped[] = true
+        _journal_source!(assistant, tag, "invalid_config", sprint(showerror, _unwrap_error(e)))
+        @error "Claw: source configuration invalid; not started" source = tag exception = (e, catch_backtrace())
+        _ensure_health_loop!(assistant)
+        return ss
+    end
+    ss.task = errormonitor(Threads.@spawn _supervise_source!(assistant, ss))
+    _ensure_health_loop!(assistant)
+    return ss
+end
+
+"""
+    _stop_supervised_source!(assistant, ss)
+
+Stop one supervised source and drop it from supervision: no further restarts,
+`stop!` requested, its task interrupted.
+"""
+function _stop_supervised_source!(assistant::AgentAssistant, ss::SupervisedSource)
+    ss.stopped[] = true
+    try
+        stop!(ss.source)
+    catch e
+        @debug "Claw: source stop! failed" source = ss.tag exception = (e,)
+    end
+    inner = ss.inner
+    if inner !== nothing && !istaskdone(inner)
+        try
+            schedule(inner, InterruptException(); error = true)
+        catch
+        end
+    end
+    lock(assistant._sources_lock) do
+        idx = findfirst(s -> s === ss, assistant._sources)
+        idx === nothing || deleteat!(assistant._sources, idx)
+    end
+    return nothing
+end
+
 """
     start_sources!(assistant, sources)
 
@@ -949,27 +1117,13 @@ One source failing must not abort `init!` or take down the others.
 """
 function start_sources!(assistant::AgentAssistant, sources)
     for es in sources
-        tag = _source_tag(es)
-        ss = SupervisedSource(es, tag)
-        push!(assistant._sources, ss)
-        try
-            validate_source(es)
-        catch e
-            ss.stopped[] = true
-            _journal_source!(assistant, tag, "invalid_config", sprint(showerror, _unwrap_error(e)))
-            @error "Claw: source configuration invalid; not started" source = tag exception = (e, catch_backtrace())
-            continue
-        end
-        ss.task = errormonitor(Threads.@spawn _supervise_source!(assistant, ss))
-    end
-    if !isempty(assistant._sources)
-        push!(assistant._tasks, errormonitor(Threads.@spawn _health_loop(assistant)))
+        _start_supervised_source!(assistant, es)
     end
     return assistant._sources
 end
 
 function _stop_sources!(assistant::AgentAssistant)
-    for ss in assistant._sources
+    for ss in lock(() -> copy(assistant._sources), assistant._sources_lock)
         ss.stopped[] = true
         try
             stop!(ss.source)
@@ -1068,7 +1222,7 @@ function shutdown!(assistant::AgentAssistant; timeout_s::Real = assistant.pipeli
     end
 
     source_tasks = Task[]
-    for ss in assistant._sources
+    for ss in lock(() -> copy(assistant._sources), assistant._sources_lock)
         ss.task === nothing || push!(source_tasks, ss.task)
         ss.inner === nothing || push!(source_tasks, ss.inner)
     end

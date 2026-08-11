@@ -182,6 +182,64 @@ Useful starting points in the repo:
 
 Examples live in `Claw/examples/`.
 
+## Integrations (user-driven enablement)
+
+Every integration (Slack, Telegram, Signal, MS Teams, Mattermost, GitHub, Fastmail)
+lives in a static catalog with its config keys, listable before anything is loaded
+or enabled. Loading the trigger package (`using Slack`) registers the integration's
+factory; enabling it constructs, registers and starts the source, and persists it
+in the `claw_integrations` table so it comes back on the next `init!`:
+
+```julia
+using Claw, Slack           # load: the "slack" factory registers itself
+assistant = Claw.init!(db_path; ...)
+Claw.enable_integration!(assistant, "slack")   # env vars supply the config
+Claw.disable_integration!(assistant, "slack")  # stops it, persists disabled
+```
+
+The agent has the same surface as tools: `list_integrations`,
+`enable_integration`, `disable_integration`. Sources passed explicitly via
+`init!(event_sources = [...])` still work and are adopted under their catalog
+names (the runner re-enables them every boot). All integration code loads
+eagerly — a toggle activates code that is already loadable, so nothing here
+depends on runtime `require` (trim-compile friendly).
+
+## Subscription filters
+
+`EventHandler` accepts an optional `filter` that narrows which events fire it:
+
+```julia
+EventHandler("main-repo", ["github_push"], "Summarize the push.", "mm-dev";
+    filter = EventFilter(:jsonpath, "\$.extra.repo", "^quinnj/"))
+EventFilter(:regex, "(?i)urgent")               # regex over event content
+EventFilter(:prompt, "a real person wrote it")  # one-shot LLM classifier per event
+```
+
+JSONPath filters evaluate against `{"name": ..., "content": ... (parsed as JSON
+when possible), "extra": ...}` with a `$.a.b`, `['name']`, `[0]`, `[*]` subset.
+Filters run per event *before* coalescing; a `:prompt` filter that cannot reach
+the model sends the event to the pipeline's retry ladder rather than silently
+dropping or delivering it. The `add_event_handler` tool takes
+`filter_type`/`filter_expr`/`filter_pattern` arguments.
+
+## Coalescing
+
+When several events of the same type pile up on one lane behind a running
+evaluation (a burst of chat messages), the next drain folds up to
+`PipelineConfig.max_coalesce` (default 8) of them into a single evaluation whose
+prompt demarcates each event (`--- Event i of N ---`). Filters apply per event
+before the batch forms. `max_coalesce = 1` disables coalescing. The global
+concurrency cap is `PipelineConfig.max_concurrent_evals`.
+
+## Untrusted event content
+
+Non-conversational event content (inbound email bodies, webhook payloads) is
+fenced in the evaluation prompt between `<<<UNTRUSTED_EVENT_CONTENT>>>` markers
+with an instruction to treat it as data, not instructions; markers appearing
+inside the payload are defanged. Chat messages on connected channels are the
+operator's interface and pass through unfenced — tool restriction for
+third-party-fed handlers is the trust tier's job (see `EventHandler`'s `trust`).
+
 ## Watcher (dual-model supervision)
 
 An assistant can be configured with a second, cheaper "watcher" model that supervises

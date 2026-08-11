@@ -37,6 +37,8 @@ Base.@kwdef struct PipelineConfig
     scan_interval_s::Float64 = 1.0
     "Log lane wait time + depth once an item waited longer than this."
     lane_backlog_warn_s::Float64 = 2.0
+    "Max events one lane drain coalesces into a single evaluation (1 disables)."
+    max_coalesce::Int = 8
     "Retire an idle lane (and its worker task) after this long with no work."
     lane_idle_timeout_s::Float64 = 300.0
     "Emit at most one PTY output event per this interval."
@@ -100,6 +102,22 @@ SupervisedSource(es::EventSource, tag::String) = SupervisedSource(
     Threads.Atomic{Bool}(false), Threads.Atomic{Bool}(true), Threads.Atomic{Bool}(false),
     ReentrantLock(),
 )
+
+"""
+    IntegrationState
+
+Runtime bookkeeping for one enabled integration: the live source, its supervisor
+(when the pipeline is running), and exactly what `register_event_source!` added on
+its behalf — so `disable_integration!` can remove precisely that and nothing else.
+"""
+mutable struct IntegrationState
+    name::String
+    source::EventSource
+    supervised::Union{Nothing, SupervisedSource}
+    channel_ids::Vector{String}
+    event_type_names::Vector{String}
+    tool_names::Vector{String}
+end
 
 # ─── Single writer task ───
 
@@ -294,7 +312,7 @@ end
 # the baseline tables are (idempotently) created, so the ladder below is the only
 # thing that ever has to change a live database.
 
-const CLAW_SCHEMA_VERSION = 3
+const CLAW_SCHEMA_VERSION = 4
 
 function _get_user_version(db::SQLite.DB)
     version = 0
@@ -368,7 +386,29 @@ function _migration_3!(db::SQLite.DB)
     return nothing
 end
 
-const CLAW_MIGRATIONS = Dict{Int, Function}(2 => _migration_2!, 3 => _migration_3!)
+# Subscription filters (per-handler event matchers) and the persisted integration
+# enabled-set. The filter columns are NULL for existing rows, which decodes to "no
+# filter" — the exact pre-migration behavior.
+function _migration_4!(db::SQLite.DB)
+    _column_exists(db, "claw_event_handlers", "filter_kind") ||
+        _exec!(db, "ALTER TABLE claw_event_handlers ADD COLUMN filter_kind TEXT")
+    _column_exists(db, "claw_event_handlers", "filter_expr") ||
+        _exec!(db, "ALTER TABLE claw_event_handlers ADD COLUMN filter_expr TEXT")
+    _column_exists(db, "claw_event_handlers", "filter_pattern") ||
+        _exec!(db, "ALTER TABLE claw_event_handlers ADD COLUMN filter_pattern TEXT")
+    _exec!(db, """
+        CREATE TABLE IF NOT EXISTS claw_integrations (
+            name TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            config TEXT,
+            status TEXT,
+            updated_at REAL NOT NULL DEFAULT 0
+        )
+    """)
+    return nothing
+end
+
+const CLAW_MIGRATIONS = Dict{Int, Function}(2 => _migration_2!, 3 => _migration_3!, 4 => _migration_4!)
 
 """
     _migrate_claw_schema!(db)

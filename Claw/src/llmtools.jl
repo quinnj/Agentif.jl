@@ -133,6 +133,12 @@ event_content(ev::WorkerOutputEvent) = ev.output
 event_source_tag(::SubagentOutputEvent) = "llmtools"
 event_source_tag(::PtyOutputEvent) = "llmtools"
 event_source_tag(::WorkerOutputEvent) = "llmtools"
+
+# Output of the agent's own subagents/processes/workers — self-initiated local
+# work, presented like any other tool output, not third-party event payloads.
+is_trusted_content(::SubagentOutputEvent) = true
+is_trusted_content(::PtyOutputEvent) = true
+is_trusted_content(::WorkerOutputEvent) = true
 event_lane(::SubagentOutputEvent) = "async"
 event_lane(::PtyOutputEvent) = "async"
 event_lane(::WorkerOutputEvent) = "async"

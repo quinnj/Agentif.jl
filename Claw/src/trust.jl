@@ -30,9 +30,10 @@ startup.
 const UNTRUSTED_ALLOWED_TOOLS = Set{String}([
     # Local file reads
     "read", "grep", "find", "ls",
-    # Claw configuration discovery
+    # Claw configuration discovery (read-only; enable/disable_integration are
+    # standing-configuration mutations and stay denied)
     "list_channels", "list_event_types", "list_event_handlers",
-    "get_system_prompt", "list_jobs",
+    "get_system_prompt", "list_jobs", "list_integrations",
     # Local scratch space
     "db_store", "db_search", "db_list_keys", "db_list_tags", "db_remove",
     # Read-only JMAP operations
