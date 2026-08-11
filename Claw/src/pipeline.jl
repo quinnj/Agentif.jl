@@ -656,12 +656,33 @@ end
 """
     _process_event_batch!(assistant, ids)
 
-Claim and process one lane drain. Claimed events are split into runs of
-consecutive rows with the same event name; each run is handled as one group —
-its events go through the group's handler filters individually, and the
+Claim and process one lane drain. Event ids are split into runs of
+consecutive rows with the same event name. Each run is claimed only when the
+prior run is complete, so it does not spend its lease waiting for another event
+type. Its events go through the group's handler filters individually, and the
 survivors are folded into a single coalesced evaluation per handler.
 """
-function _process_event_batch!(assistant::AgentAssistant, ids::Vector{Int})
+function _pending_event_name(assistant::AgentAssistant, id::Int)
+    return try
+        with_read(assistant._readers) do db
+            name = nothing
+            for row in SQLite.DBInterface.execute(db,
+                    "SELECT name, status FROM claw_events WHERE id = ?", (id,))
+                String(row.status) == "pending" && (name = String(row.name))
+            end
+            return name
+        end
+    catch e
+        @error "Claw: failed to resolve event name" event_id = id exception = (e, catch_backtrace())
+        return nothing
+    end
+end
+
+function _process_event_run!(assistant::AgentAssistant, ids::Vector{Int})
+    if assistant._state[] !== :running
+        foreach(id -> _clear_wakeup!(assistant, id), ids)
+        return nothing
+    end
     claimed = Tuple{EventRow, Event}[]
     for id in ids
         row = try
@@ -700,26 +721,35 @@ function _process_event_batch!(assistant::AgentAssistant, ids::Vector{Int})
     end
     isempty(claimed) && return nothing
 
-    # Consecutive same-name runs only: grouping non-adjacent events would reorder
-    # them relative to interleaved events of other types on the same lane.
-    i = 1
-    while i <= length(claimed)
-        if assistant._state[] !== :running
-            remaining = claimed[i:end]
-            for (row, _) in remaining
-                _release_claim!(assistant, row.id)
-                _clear_wakeup!(assistant, row.id)
-            end
-            _release_group_channels!(remaining, nothing)
-            break
+    if assistant._state[] !== :running
+        for (row, _) in claimed
+            _release_claim!(assistant, row.id)
+            _clear_wakeup!(assistant, row.id)
         end
-        j = i
-        while j < length(claimed) && claimed[j + 1][1].name == claimed[i][1].name
-            j += 1
-        end
-        _process_claimed_group!(assistant, claimed[i:j])
-        i = j + 1
+        _release_group_channels!(claimed, nothing)
+        return nothing
     end
+    _process_claimed_group!(assistant, claimed)
+    return nothing
+end
+
+function _process_event_batch!(assistant::AgentAssistant, ids::Vector{Int})
+    run = Int[]
+    run_name = nothing
+    for id in ids
+        name = _pending_event_name(assistant, id)
+        if name === nothing
+            _clear_wakeup!(assistant, id)
+            continue
+        end
+        if run_name !== nothing && name != run_name
+            _process_event_run!(assistant, run)
+            empty!(run)
+        end
+        run_name = name
+        push!(run, id)
+    end
+    isempty(run) || _process_event_run!(assistant, run)
     return nothing
 end
 

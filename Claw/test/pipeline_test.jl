@@ -1261,6 +1261,55 @@ end
     Claw.shutdown!(a; timeout_s = 5)
 end
 
+@testset "coalescing claims mixed event types just in time" begin
+    a = make_assistant(":memory:"; lease_duration_s = 0.1, FAST...)
+    Claw.CURRENT_ASSISTANT[] = a
+    a._state[] = :running
+    ch = RecordingChannel("mixed-claim-lane")
+    a._channels[ch.id] = ch
+    for name in ("event_a", "event_b")
+        Claw.execute_write(a._writer,
+            "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
+            (name, name))
+        Claw.register_event_handler!(a, Claw.EventHandler(name * "_handler", [name], ""))
+    end
+
+    first_started = Base.Channel{Nothing}(1)
+    release_first = Base.Channel{Nothing}(1)
+    seen = String[]
+    seen_lock = ReentrantLock()
+    runner = function (assistant, ev, handler; kwargs...)
+        if Claw.get_name(ev) == "event_a"
+            put!(first_started, nothing)
+            take!(release_first)
+        end
+        lock(() -> push!(seen, Claw.get_name(ev)), seen_lock)
+        return nothing
+    end
+    with_handler(runner) do
+        id_a = Claw.submit_event!(a, NamedPipelineEvent("event_a", "a", ch))
+        id_b = Claw.submit_event!(a, NamedPipelineEvent("event_b", "b", ch))
+        worker = Threads.@spawn Claw._process_event_batch!(a, [id_a, id_b])
+        @test timedwait(() -> isready(first_started), 5.0) == :ok
+        @test event_row(a, id_a).status == "running"
+        # event_b must not spend its lease waiting for event_a's evaluation.
+        @test event_row(a, id_b).status == "pending"
+        @test event_row(a, id_b).attempts == 0
+        sleep(0.15)
+        Claw._scan_due_events!(a)
+        @test event_row(a, id_b).status == "pending"
+        @test event_row(a, id_b).attempts == 0
+        put!(release_first, nothing)
+        @test timedwait(() -> istaskdone(worker), 5.0) == :ok
+        fetch(worker)
+        @test lock(() -> copy(seen), seen_lock) == ["event_a", "event_b"]
+        @test event_row(a, id_a).status == "done"
+        @test event_row(a, id_b).status == "done"
+        @test event_row(a, id_b).attempts == 1
+    end
+    Claw.shutdown!(a; timeout_s = 5)
+end
+
 @testset "coalescing: filters run per event before the batch forms" begin
     a = make_assistant(":memory:"; max_concurrent_evals = 4, FAST...)
     Claw.CURRENT_ASSISTANT[] = a
