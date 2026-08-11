@@ -46,6 +46,9 @@ if HAS_GITHUB
     @test ext !== nothing
 
     source = ext.GitHubEventSource(; secret="test-secret", port=19876)
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
     event_types = Claw.get_event_types(source)
     et_names = Set(et.name for et in event_types)
 
@@ -132,6 +135,9 @@ if HAS_JMAP
     @test ext !== nothing
 
     source = ext.FastmailEventSource(; token="test-token")
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
     assistant = Claw.AgentAssistant(":memory:";
         provider="openai-completions",
         model_id="gpt-4o-mini",
@@ -321,6 +327,9 @@ end
     @test ext !== nothing
 
     source = ext.SlackEventSource(; app_token="xapp-test", bot_token="xoxb-test")
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
     event_types = Set(et.name for et in Claw.get_event_types(source))
     @test "slack_message" in event_types
     @test "slack_reaction" in event_types
@@ -646,6 +655,9 @@ end
     @test ext !== nothing
 
     source = ext.MattermostEventSource()
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
     event_types = Set(et.name for et in Claw.get_event_types(source))
     @test "mattermost_message" in event_types
     @test "mattermost_reaction" in event_types
@@ -893,6 +905,9 @@ end
     @test ext !== nothing
 
     source = ext.SignalEventSource(; number="+15550000000", base_url="http://127.0.0.1:8080", auto_reconnect=false)
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
     event_types = Set(et.name for et in Claw.get_event_types(source))
     @test event_types == Set(["signal_message"])
     handlers = Claw.get_event_handlers(source)
@@ -967,6 +982,9 @@ end
     @test ext !== nothing
 
     source = ext.MSTeamsEventSource(; app_id="app-id", app_password="secret")
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
     event_types = Set(et.name for et in Claw.get_event_types(source))
     @test "msteams_message" in event_types
     @test "msteams_reaction" in event_types
@@ -1068,6 +1086,9 @@ end
 
     client = Telegram.Client("test-token", "https://example.invalid/")
     source = ext.TelegramEventSource(; client)
+    @test which(Claw.stop!, (typeof(source),)).module === ext
+    @test Claw.stop!(source) === nothing
+    @test source._stopping[]
     ch = ext.TelegramChannel(
         -100123,
         Int64(42),

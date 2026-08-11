@@ -122,7 +122,7 @@ Two §2.1 changes from the original: `host` defaults to **loopback**, not
 and every inbound activity must carry a valid Bot Framework JWT before an event is
 created.
 """
-Base.@kwdef struct MSTeamsEventSource <: Claw.EventSource
+Base.@kwdef mutable struct MSTeamsEventSource <: Claw.EventSource
     app_id::String = get(ENV, "MSTEAMS_APP_ID", "")
     app_password::String = get(ENV, "MSTEAMS_APP_PASSWORD", "")
     host::String = get(ENV, "MSTEAMS_HOST", "127.0.0.1")
@@ -132,6 +132,9 @@ Base.@kwdef struct MSTeamsEventSource <: Claw.EventSource
     issuers::Vector{String} = BF_DEFAULT_ISSUERS
     clock_skew_s::Float64 = 300.0
     openid_config_url::String = BF_OPENID_CONFIG_URL
+    _server::Any = nothing
+    _stopping::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
+    _lock::ReentrantLock = ReentrantLock()
 end
 
 # Teams messages are written by whoever is in the conversation, and the default
@@ -342,6 +345,10 @@ function Claw.start!(source::MSTeamsEventSource, assistant::Claw.AgentAssistant)
     isempty(app_id) && error("ClawMSTeamsExt: missing MSTEAMS_APP_ID")
     isempty(app_password) && error("ClawMSTeamsExt: missing MSTEAMS_APP_PASSWORD")
     Claw.validate_source(source)
+    lock(source._lock) do
+        source._server = nothing
+        source._stopping[] = false
+    end
 
     errormonitor(Threads.@spawn begin
         client = MSTeams.BotClient(; app_id=app_id, app_password=app_password)
@@ -369,8 +376,31 @@ function Claw.start!(source::MSTeamsEventSource, assistant::Claw.AgentAssistant)
         _bf_refresh_keys!(keys)
         handler = _authenticating_handler(routed, source, keys)
         @info "ClawMSTeamsExt: Starting authenticated webhook server" host=source.host port=source.port path=source.path
-        HTTP.serve(handler, source.host, source.port)
+        server = HTTP.serve!(handler, source.host, source.port)
+        lock(source._lock) do
+            source._server = server
+            source._stopping[] && close(server)
+        end
+        try
+            wait(server)
+        finally
+            lock(source._lock) do
+                source._server === server && (source._server = nothing)
+            end
+            try
+                close(server)
+            catch
+            end
+        end
     end)
+end
+
+function Claw.stop!(source::MSTeamsEventSource)
+    lock(source._lock) do
+        source._stopping[] = true
+        source._server === nothing || close(source._server)
+    end
+    return nothing
 end
 
 # Loading the trigger package makes this integration enable-able by name

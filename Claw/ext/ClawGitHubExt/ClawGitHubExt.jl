@@ -384,6 +384,9 @@ Base.@kwdef mutable struct GitHubEventSource <: Claw.EventSource
     port::Int = parse(Int, get(ENV, "GITHUB_WEBHOOK_PORT", "8080"))
     repos::Union{Nothing, Vector{String}} = nothing
     events::Union{Nothing, Vector{String}} = nothing
+    _server::Any = nothing
+    _stopping::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
+    _lock::ReentrantLock = ReentrantLock()
 end
 
 # Issue bodies, PR descriptions and comments are written by anyone with a GitHub
@@ -422,6 +425,10 @@ function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
     repos = source.repos !== nothing ? map(GitHub.Repo, source.repos) : nothing
     host = Sockets.IPv4(source.host)
     port = source.port
+    lock(source._lock) do
+        source._server = nothing
+        source._stopping[] = false
+    end
 
     errormonitor(Threads.@spawn begin
         listener = GitHub.EventListener(;
@@ -459,8 +466,31 @@ function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
             return HTTP.Response(200, "OK")
         end
         @info "ClawGitHubExt: listening on $(source.host):$(source.port)"
-        Base.run(listener, host, port)
+        server = HTTP.serve!(listener.handle_request, string(host), port)
+        lock(source._lock) do
+            source._server = server
+            source._stopping[] && close(server)
+        end
+        try
+            wait(server)
+        finally
+            lock(source._lock) do
+                source._server === server && (source._server = nothing)
+            end
+            try
+                close(server)
+            catch
+            end
+        end
     end)
+end
+
+function Claw.stop!(source::GitHubEventSource)
+    lock(source._lock) do
+        source._stopping[] = true
+        source._server === nothing || close(source._server)
+    end
+    return nothing
 end
 
 # Loading the trigger package makes this integration enable-able by name

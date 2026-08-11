@@ -3,6 +3,7 @@ module ClawSignalExt
 using Signal
 import Agentif
 import Claw
+import HTTP
 
 export SignalEventSource
 
@@ -105,10 +106,14 @@ end
 
 const MESSAGE_EVENT_TYPE = Claw.EventType("signal_message", "A new Signal message")
 
-Base.@kwdef struct SignalEventSource <: Claw.EventSource
+Base.@kwdef mutable struct SignalEventSource <: Claw.EventSource
     number::String = get(ENV, "SIGNAL_NUMBER", "")
     base_url::String = get(ENV, "SIGNAL_API_URL", "http://127.0.0.1:8080")
     auto_reconnect::Bool = true
+    client::Union{Nothing, Signal.Client} = nothing
+    _ws::Any = nothing
+    _stopping::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
+    _lock::ReentrantLock = ReentrantLock()
 end
 
 Claw.get_event_types(::SignalEventSource) = Claw.EventType[MESSAGE_EVENT_TYPE]
@@ -202,20 +207,68 @@ function Claw.validate_source(source::SignalEventSource)
     return nothing
 end
 
+function _run_signal_websocket(source::SignalEventSource, handler::Function)
+    client = source.client
+    client === nothing && error("ClawSignalExt: no Signal client")
+    ws_base = replace(client.base_url, r"^http" => "ws")
+    url = string(ws_base, "/v1/receive/", HTTP.URIs.escapeuri(client.number))
+    while !source._stopping[]
+        try
+            HTTP.WebSockets.open(url) do ws
+                lock(source._lock) do
+                    source._ws = ws
+                    source._stopping[] && HTTP.WebSockets.close(ws)
+                end
+                for msg in ws
+                    source._stopping[] && break
+                    raw = msg isa AbstractVector{UInt8} ? String(msg) : String(msg)
+                    envelope = Signal._parse_ws_message(raw)
+                    if envelope !== nothing
+                        try
+                            handler(envelope)
+                        catch e
+                            @error "ClawSignalExt: WebSocket event failed" exception=(e, catch_backtrace())
+                        end
+                    end
+                end
+            end
+        catch e
+            source._stopping[] && break
+            source.auto_reconnect || rethrow()
+            @warn "ClawSignalExt: WebSocket connection failed" exception=(e, catch_backtrace())
+        finally
+            lock(source._lock) do
+                source._ws = nothing
+            end
+        end
+        source.auto_reconnect || break
+        for _ in 1:10
+            source._stopping[] && break
+            sleep(0.1)
+        end
+    end
+    return nothing
+end
+
 function Claw.start!(source::SignalEventSource, assistant::Claw.AgentAssistant)
     number = strip(source.number)
     isempty(number) && error("ClawSignalExt: missing SIGNAL_NUMBER")
+    lock(source._lock) do
+        source._ws = nothing
+        source._stopping[] = false
+    end
 
     errormonitor(Threads.@spawn begin
         Signal.with_signal(number; base_url=source.base_url) do
             client = Signal._get_client()
+            source.client = client
             Claw.register_rehydrator!(
                 "signal",
                 row -> _rehydrate_signal_event(client, row),
             )
             @info "ClawSignalExt: Starting websocket listener" number=number base_url=source.base_url
 
-            Signal.run_websocket(; auto_reconnect=source.auto_reconnect) do envelope
+            _run_signal_websocket(source) do envelope
                 event = _envelope_to_message_event(envelope, client, number)
                 event === nothing && return
                 ch = event.channel
@@ -224,6 +277,14 @@ function Claw.start!(source::SignalEventSource, assistant::Claw.AgentAssistant)
             end
         end
     end)
+end
+
+function Claw.stop!(source::SignalEventSource)
+    lock(source._lock) do
+        source._stopping[] = true
+        source._ws === nothing || HTTP.WebSockets.close(source._ws)
+    end
+    return nothing
 end
 
 # Loading the trigger package makes this integration enable-able by name

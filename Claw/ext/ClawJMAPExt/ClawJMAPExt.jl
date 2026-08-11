@@ -3,6 +3,8 @@ module ClawJMAPExt
 using JMAP
 import Agentif
 import Claw
+import HTTP
+import JSON
 
 export FastmailEventSource
 
@@ -85,6 +87,8 @@ Base.@kwdef mutable struct FastmailEventSource <: Claw.EventSource
     _inbox_mailbox_ids::Dict{String, Set{String}} = Dict{String, Set{String}}()
     _lock::ReentrantLock = ReentrantLock()
     _session::Union{Nothing, JMAP.Session} = nothing
+    _context::Union{Nothing, HTTP.RequestContext} = nothing
+    _stopping::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
 end
 
 Claw.get_event_types(::FastmailEventSource) = Claw.EventType[NEW_EMAIL_EVENT_TYPE]
@@ -295,23 +299,49 @@ function _sse_loop(source::FastmailEventSource, assistant::Claw.AgentAssistant)
     backoff = 1.0
     max_backoff = 60.0
 
-    while true
+    while !source._stopping[]
         try
             @info "ClawJMAPExt: connecting to SSE" types=source.types ping=source.ping
-            JMAP.listen_events(session; types=source.types, ping=source.ping) do sc::JMAP.StateChange
-                backoff = 1.0  # reset on successful event
-                _handle_state_change!(source, assistant, sc)
+            url = JMAP.event_source_url(session;
+                types=source.types, closeafter="no", ping=source.ping)
+            headers = Pair{String, String}[
+                "Authorization" => "Bearer $(session.token)",
+                "Accept" => "text/event-stream",
+                "Cache-Control" => "no-cache",
+                "Connection" => "keep-alive",
+                "Keep-Alive" => "timeout=$(source.ping * 4)",
+            ]
+            context = HTTP.RequestContext()
+            lock(source._lock) do
+                source._context = context
+                source._stopping[] && HTTP.cancel!(context; message="JMAP source stopping")
+            end
+            HTTP.open("GET", url, headers; context) do stream
+                HTTP._parse_sse_stream!(stream) do event
+                    event.event !== nothing && event.event != "state" && return
+                    isempty(event.data) && return
+                    sc = JSON.parse(Vector{UInt8}(codeunits(event.data)),
+                        JMAP.StateChange; dicttype=Dict{String, Any})
+                    isempty(sc.changed) && return
+                    backoff = 1.0
+                    _handle_state_change!(source, assistant, sc)
+                end
             end
         catch e
-            if e isa InterruptException
-                @info "ClawJMAPExt: SSE interrupted"
-                break
-            end
+            source._stopping[] && break
             @warn "ClawJMAPExt: SSE connection error, reconnecting in $(backoff)s" exception=(e, catch_backtrace())
-            sleep(backoff)
+            deadline = time() + backoff
+            while time() < deadline && !source._stopping[]
+                sleep(min(0.1, max(0.0, deadline - time())))
+            end
             backoff = min(backoff * 2, max_backoff)
+        finally
+            lock(source._lock) do
+                source._context = nothing
+            end
         end
     end
+    return nothing
 end
 
 # ─── Initial state seeding ───
@@ -364,6 +394,10 @@ function Claw.start!(source::FastmailEventSource, assistant::Claw.AgentAssistant
 
     source._session = session
     JMAP_SESSION[] = session
+    lock(source._lock) do
+        source._context = nothing
+        source._stopping[] = false
+    end
     # JMAP events carry no channel, so replay only needs name + content.
     Claw.register_rehydrator!("jmap", row -> Claw.ReplayedEvent(row.name, row.content))
     lock(source._lock) do
@@ -376,6 +410,15 @@ function Claw.start!(source::FastmailEventSource, assistant::Claw.AgentAssistant
     errormonitor(Threads.@spawn begin
         _sse_loop(source, assistant)
     end)
+end
+
+function Claw.stop!(source::FastmailEventSource)
+    lock(source._lock) do
+        source._stopping[] = true
+        source._context === nothing ||
+            HTTP.cancel!(source._context; message="JMAP source stopping")
+    end
+    return nothing
 end
 # ═══════════════════════════════════════════════════════════
 # Tools

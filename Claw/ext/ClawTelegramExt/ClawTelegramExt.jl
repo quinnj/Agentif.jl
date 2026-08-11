@@ -3,6 +3,8 @@ module ClawTelegramExt
 using Telegram
 import Agentif
 import Claw
+import HTTP
+import JSON
 
 export TelegramEventSource
 
@@ -283,6 +285,9 @@ Base.@kwdef mutable struct TelegramEventSource <: Claw.EventSource
     end
     # Runtime state (set during start!)
     client::Union{Nothing, Telegram.Client} = nothing
+    _server::Any = nothing
+    _stopping::Threads.Atomic{Bool} = Threads.Atomic{Bool}(false)
+    _lock::ReentrantLock = ReentrantLock()
 end
 
 Claw.get_event_types(::TelegramEventSource) = Claw.EventType[MESSAGE_EVENT_TYPE, REACTION_EVENT_TYPE]
@@ -458,8 +463,90 @@ end
 
 # ─── start! ───
 
+function _telegram_sleep(source::TelegramEventSource, seconds::Real)
+    deadline = time() + seconds
+    while time() < deadline
+        source._stopping[] && return false
+        sleep(min(0.1, max(0.0, deadline - time())))
+    end
+    return !source._stopping[]
+end
+
+function _run_telegram_polling(source::TelegramEventSource, handler::Function)
+    offset = 0
+    consecutive_errors = 0
+    while !source._stopping[]
+        updates = try
+            # A short upstream long-poll bound makes cooperative stop prompt.
+            result = Telegram.get_updates(; offset, timeout=min(source.timeout, 1),
+                allowed_updates=["message", "message_reaction"])
+            consecutive_errors = 0
+            result
+        catch e
+            source._stopping[] && break
+            consecutive_errors += 1
+            backoff = min(60, 2^min(consecutive_errors, 6))
+            @error "ClawTelegramExt: polling failed" exception=(e, catch_backtrace())
+            _telegram_sleep(source, backoff) || break
+            continue
+        end
+        for update in updates
+            source._stopping[] && break
+            try
+                handler(update)
+            catch e
+                @error "ClawTelegramExt: update handler failed" exception=(e, catch_backtrace())
+            end
+            offset = update.update_id + 1
+        end
+    end
+    return nothing
+end
+
+function _telegram_webhook_response(source::TelegramEventSource, handler::Function,
+        req::HTTP.Request)
+    (req.method == "POST" && req.target == source.path) ||
+        return HTTP.Response(404, "Not Found")
+    token = source.secret_token
+    if token !== nothing && HTTP.header(req, "X-Telegram-Bot-Api-Secret-Token", "") != token
+        return HTTP.Response(403, "Forbidden")
+    end
+    try
+        update = JSON.parse(String(req.body), Telegram.Update)
+        handler(update)
+    catch e
+        @error "ClawTelegramExt: webhook update failed" exception=(e, catch_backtrace())
+    end
+    return HTTP.Response(200, "OK")
+end
+
+function _run_telegram_webhook(source::TelegramEventSource, handler::Function)
+    server = HTTP.serve!(req -> _telegram_webhook_response(source, handler, req),
+        source.host, source.port)
+    lock(source._lock) do
+        source._server = server
+        source._stopping[] && close(server)
+    end
+    try
+        wait(server)
+    finally
+        lock(source._lock) do
+            source._server === server && (source._server = nothing)
+        end
+        try
+            close(server)
+        catch
+        end
+    end
+    return nothing
+end
+
 function Claw.start!(source::TelegramEventSource, assistant::Claw.AgentAssistant)
     Claw.validate_source(source)
+    lock(source._lock) do
+        source._server = nothing
+        source._stopping[] = false
+    end
     errormonitor(Threads.@spawn begin
         Telegram.with_telegram(ENV["TELEGRAM_BOT_TOKEN"]) do
             me = Telegram.get_me()
@@ -491,22 +578,23 @@ function Claw.start!(source::TelegramEventSource, assistant::Claw.AgentAssistant
 
             if source.use_polling
                 @info "ClawTelegramExt: Starting polling mode (timeout=$(source.timeout)s)"
-                Telegram.run_polling(
-                    update -> _handle_update(update, bot_user_id, bot_username, assistant);
-                    timeout=source.timeout,
-                    allowed_updates=["message", "message_reaction"],
-                )
+                _run_telegram_polling(source,
+                    update -> _handle_update(update, bot_user_id, bot_username, assistant))
             else
                 @info "ClawTelegramExt: Starting webhook mode ($(source.host):$(source.port)$(source.path))"
-                Telegram.run_webhook(
-                    update -> _handle_update(update, bot_user_id, bot_username, assistant);
-                    host=source.host, port=source.port, path=source.path,
-                    secret_token=source.secret_token,
-                    allowed_updates=["message", "message_reaction"],
-                )
+                _run_telegram_webhook(source,
+                    update -> _handle_update(update, bot_user_id, bot_username, assistant))
             end
         end
     end)
+end
+
+function Claw.stop!(source::TelegramEventSource)
+    lock(source._lock) do
+        source._stopping[] = true
+        source._server === nothing || close(source._server)
+    end
+    return nothing
 end
 
 # Loading the trigger package makes this integration enable-able by name

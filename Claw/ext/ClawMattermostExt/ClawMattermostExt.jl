@@ -4,6 +4,7 @@ using Mattermost
 using Mattermost: JSON
 import Agentif
 import Claw
+import HTTP
 
 export MattermostEventSource
 
@@ -240,8 +241,12 @@ Keep your response concise."""
 mutable struct MattermostEventSource <: Claw.EventSource
     client::Union{Nothing, Mattermost.Client}
     bot_user_id::Union{Nothing, String}
+    _ws::Any
+    _stopping::Threads.Atomic{Bool}
+    _lock::ReentrantLock
 end
-MattermostEventSource() = MattermostEventSource(nothing, nothing)
+MattermostEventSource() = MattermostEventSource(
+    nothing, nothing, nothing, Threads.Atomic{Bool}(false), ReentrantLock())
 
 function Claw.get_channels(source::MattermostEventSource)
     source.client === nothing && return Agentif.AbstractChannel[]
@@ -411,7 +416,61 @@ function _fetch_channels(client::Mattermost.Client, bot_user_id::String)
     return channels
 end
 
+function _mattermost_sleep(source::MattermostEventSource, seconds::Real)
+    deadline = time() + seconds
+    while time() < deadline
+        source._stopping[] && return false
+        sleep(min(0.1, max(0.0, deadline - time())))
+    end
+    return !source._stopping[]
+end
+
+function _run_mattermost_websocket(source::MattermostEventSource, handler::Function)
+    client = source.client
+    client === nothing && error("ClawMattermostExt: no Mattermost client")
+    ws_url = Mattermost._websocket_url(client)
+    headers = ["Authorization" => "Bearer $(client.token)"]
+    consecutive_errors = 0
+    while !source._stopping[]
+        try
+            HTTP.WebSockets.open(ws_url; headers) do ws
+                lock(source._lock) do
+                    source._ws = ws
+                    source._stopping[] && HTTP.WebSockets.close(ws)
+                end
+                consecutive_errors = 0
+                for msg in ws
+                    source._stopping[] && break
+                    try
+                        data = JSON.parse(String(msg))
+                        haskey(data, "event") || continue
+                        handler(Mattermost._parse_result(Mattermost.WebSocketEvent, data))
+                    catch e
+                        (e isa HTTP.WebSockets.WebSocketError || e isa EOFError) && rethrow()
+                        @error "ClawMattermostExt: WebSocket event failed" exception=(e, catch_backtrace())
+                    end
+                end
+            end
+        catch e
+            source._stopping[] && break
+            consecutive_errors += 1
+            backoff = min(60, 2^min(consecutive_errors, 6))
+            @error "ClawMattermostExt: WebSocket connection failed" exception=(e, catch_backtrace())
+            _mattermost_sleep(source, backoff) || break
+        finally
+            lock(source._lock) do
+                source._ws = nothing
+            end
+        end
+    end
+    return nothing
+end
+
 function Claw.start!(source::MattermostEventSource, assistant::Claw.AgentAssistant)
+    lock(source._lock) do
+        source._ws = nothing
+        source._stopping[] = false
+    end
     errormonitor(Threads.@spawn begin
         Mattermost.with_mattermost(ENV["MATTERMOST_TOKEN"], ENV["MATTERMOST_URL"]) do
             me = Mattermost.get_me()
@@ -423,11 +482,19 @@ function Claw.start!(source::MattermostEventSource, assistant::Claw.AgentAssista
             Claw.register_channels!(assistant, _fetch_channels(source.client, bot_user_id))
             @info "ClawMattermostExt: Bot user: $(me.username) ($(bot_user_id))"
 
-            Mattermost.run_websocket() do event
+            _run_mattermost_websocket(source) do event
                 _handle_event(event, bot_user_id, bot_username, assistant)
             end
         end
     end)
+end
+
+function Claw.stop!(source::MattermostEventSource)
+    lock(source._lock) do
+        source._stopping[] = true
+        source._ws === nothing || HTTP.WebSockets.close(source._ws)
+    end
+    return nothing
 end
 
 # Loading the trigger package makes this integration enable-able by name
