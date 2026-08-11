@@ -218,7 +218,7 @@ function _track_integration_channel_locked!(assistant::AgentAssistant,
             break
         end
     end
-    state === nothing && return nothing
+    state === nothing && return false
     idx = findfirst(==(id), state.channel_ids)
     if idx === nothing
         push!(state.channel_ids, id)
@@ -226,13 +226,12 @@ function _track_integration_channel_locked!(assistant::AgentAssistant,
     else
         state.channels[idx] = channel
     end
-    return nothing
+    return true
 end
 
 function _track_integration_channel!(assistant::AgentAssistant,
         source_tag::AbstractString, id::String, channel)
     lock(assistant._integrations_lock) do
-        assistant._channels[id] = channel
         tag = lowercase(String(source_tag))
         state = get(assistant._integrations, tag, nothing)
         if state === nothing
@@ -243,10 +242,17 @@ function _track_integration_channel!(assistant::AgentAssistant,
                 end
             end
         end
-        state === nothing && return nothing
-        _track_integration_channel_locked!(assistant, state.source, id, channel)
+        if state === nothing
+            # Non-integration channels (for example REPL) still join the runtime
+            # registry. A late event from a disabled built-in must not revive its
+            # channel after cleanup.
+            known = lock(() -> haskey(INTEGRATION_SPECS, tag), INTEGRATIONS_LOCK)
+            known || (assistant._channels[id] = channel)
+            return false
+        end
+        assistant._channels[id] = channel
+        return _track_integration_channel_locked!(assistant, state.source, id, channel)
     end
-    return nothing
 end
 
 # `register_event_source!` plus a record of exactly what it added, so disable can
@@ -456,21 +462,31 @@ function _disable_integration_locked!(assistant::AgentAssistant, key::String,
     catch e
         @debug "Claw: get_channels failed during disable" integration = key exception = (e,)
     end
+    other_runtime_channels = Dict{String, Agentif.AbstractChannel}()
+    for other_state in values(assistant._integrations)
+        other_state.source === state.source && continue
+        any(source -> source === other_state.source, other_sources) || continue
+        for (id, ch) in zip(other_state.channel_ids, other_state.channels)
+            other_runtime_channels[id] = ch
+        end
+    end
     for id in keys(owned_channels)
-        replacement = nothing
-        for source in other_sources
-            channels = try
-                get_channels(source)
-            catch
-                Agentif.AbstractChannel[]
-            end
-            for ch in channels
-                if Agentif.channel_id(ch) == id
-                    replacement = ch
-                    break
+        replacement = get(other_runtime_channels, id, nothing)
+        if replacement === nothing
+            for source in other_sources
+                channels = try
+                    get_channels(source)
+                catch
+                    Agentif.AbstractChannel[]
                 end
+                for ch in channels
+                    if Agentif.channel_id(ch) == id
+                        replacement = ch
+                        break
+                    end
+                end
+                replacement === nothing || break
             end
-            replacement === nothing || break
         end
         if replacement === nothing
             Base.delete!(assistant._channels, id)

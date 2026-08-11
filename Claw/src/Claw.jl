@@ -492,8 +492,9 @@ function register_channels!(assistant::AgentAssistant, channels;
         found = false
         for ch in channels
             id = Agentif.channel_id(ch)
+            source !== nothing &&
+                !_track_integration_channel_locked!(assistant, source, id, ch) && continue
             assistant._channels[id] = ch
-            source === nothing || _track_integration_channel_locked!(assistant, source, id, ch)
             found = true
         end
         found

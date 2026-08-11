@@ -330,15 +330,24 @@ end
         Claw.register_channels!(a, Agentif.AbstractChannel[runtime_channel]; source = first.source)
         event_channel = ToyChannel("event-only")
         @test Claw._resolve_event_channel(a, ToyChannelEvent(event_channel), nothing) === event_channel
+        first_shared = ToyChannel("runtime-shared")
+        second_shared = ToyChannel("runtime-shared")
+        Claw.register_channels!(a, Agentif.AbstractChannel[first_shared]; source = first.source)
+        Claw.register_channels!(a, Agentif.AbstractChannel[second_shared]; source = second.source)
         @test a._channels["toy-chan"] === second.source.channel
         @test a._channels["runtime-only"] === runtime_channel
         @test a._channels["event-only"] === event_channel
+        @test a._channels["runtime-shared"] === second_shared
         @test count(t -> Agentif.tool_name(t) == "toy_integration_tool", a.tools) == 2
 
         Claw.disable_integration!(a, "toy")
         @test a._channels["toy-chan"] === second.source.channel
         @test !haskey(a._channels, "runtime-only")
         @test !haskey(a._channels, "event-only")
+        @test a._channels["runtime-shared"] === second_shared
+        Claw.register_channels!(a, Agentif.AbstractChannel[ToyChannel("late-channel")];
+            source = first.source)
+        @test !haskey(a._channels, "late-channel")
         @test has_tool(a, "toy_integration_tool")
         @test event_type_registered(a, "toy_event")
 
@@ -346,6 +355,7 @@ end
         @test !haskey(a._channels, "toy-chan")
         @test !has_tool(a, "toy_integration_tool")
         @test !event_type_registered(a, "toy_event")
+        @test !haskey(a._channels, "runtime-shared")
         @test first.source.stopped[]
     finally
         Claw.shutdown!(a; timeout_s = 5)
