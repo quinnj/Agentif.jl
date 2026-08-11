@@ -1306,7 +1306,8 @@ end
 end
 
 @testset "handler lookup failure releases REPL waiters" begin
-    a = make_assistant(":memory:"; FAST...)
+    a = make_assistant(":memory:"; retry_backoff_s = [0.05],
+        unknown_max_attempts = 2, FAST...)
     a._state[] = :running
     ch = Claw.ReplChannel(devnull, Threads.Event())
     id = Claw.submit_event!(a, Claw.ReplInputEvent("lookup failure", ch))
@@ -1321,6 +1322,16 @@ end
         Tuple{Claw.EventRow, Claw.Event}[(row, Claw.ReplInputEvent("lookup failure", ch))])
     @test timedwait(() -> istaskdone(waiter), 5.0) == :ok
     @test event_row(a, id).status == "pending"
+    @test event_row(a, id).attempts == 1
+
+    # A persistent lookup failure is an infrastructure failure. It must consume
+    # the retry budget instead of returning to attempt zero forever.
+    row = Claw._claim_event!(a, id)
+    @test row !== nothing
+    Claw._process_claimed_group!(a,
+        Tuple{Claw.EventRow, Claw.Event}[(row, Claw.ReplInputEvent("lookup failure", ch))])
+    @test event_row(a, id).status == "dead"
+    @test event_row(a, id).attempts == 2
     Claw.shutdown!(a; timeout_s = 5)
 end
 

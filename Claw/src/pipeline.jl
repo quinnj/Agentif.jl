@@ -655,7 +655,7 @@ function _handle_event_failure!(assistant::AgentAssistant, row::EventRow, ev::Ev
         notify && _dead_letter_notify!(assistant, row.id, ev, handlers, class, text)
         _forget_live_event!(assistant, row.id)
     end
-    return nothing
+    return action
 end
 
 """
@@ -719,8 +719,10 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
         _event_handlers_for(assistant, name)
     catch e
         @error "Claw: event handler lookup failed" event = name exception = (e, catch_backtrace())
-        for (row, _) in group
-            _release_claim!(assistant, row.id; delay = assistant.pipeline.min_refire_gap_s)
+        notify = true
+        for (row, ev) in group
+            action = _handle_event_failure!(assistant, row, ev, (), e; notify)
+            action === :dead && (notify = false)
             _clear_wakeup!(assistant, row.id)
         end
         _release_group_channels!(group, nothing)
@@ -787,8 +789,8 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
         # spam its channel N times.
         notify = true
         for (row, ev) in group
-            _handle_event_failure!(assistant, row, ev, handlers, e; notify)
-            notify = false
+            action = _handle_event_failure!(assistant, row, ev, handlers, e; notify)
+            action === :dead && (notify = false)
         end
         _release_group_channels!(group, streamed)
     finally
