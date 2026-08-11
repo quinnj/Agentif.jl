@@ -119,6 +119,8 @@ mutable struct IntegrationState
     channel_ids::Vector{String}
     event_type_names::Vector{String}
     tool_names::Vector{String}
+    channels::Vector{Agentif.AbstractChannel}
+    tools::Vector{Agentif.AgentTool}
 end
 
 # ─── Single writer task ───

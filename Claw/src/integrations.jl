@@ -240,7 +240,7 @@ function _register_event_source_tracked!(assistant::AgentAssistant, es::EventSou
             assistant._channels[id] = ch
         end
         append!(assistant.tools, tools)
-        return (; channel_ids, event_type_names, tool_names)
+        return (; channel_ids, event_type_names, tool_names, channels, tools)
     end
 end
 
@@ -297,7 +297,8 @@ function enable_integration!(assistant::AgentAssistant, name::AbstractString;
             error("Integration '$key' configuration is invalid: $(_source_error_detail(es, e))")
         end
         reg = _register_event_source_tracked!(assistant, es)
-        st = IntegrationState(key, es, nothing, reg.channel_ids, reg.event_type_names, reg.tool_names)
+        st = IntegrationState(key, es, nothing, reg.channel_ids, reg.event_type_names,
+            reg.tool_names, reg.channels, reg.tools)
         assistant._integrations[key] = st
         st.supervised = _start_supervised_source!(assistant, es; validated = true)
         if persist
@@ -369,27 +370,61 @@ function _disable_integration_locked!(assistant::AgentAssistant, key::String,
         end
     end
     ss === nothing || _stop_supervised_source!(assistant, ss)
-    # Channels: the ones recorded at registration plus whatever the source reports
-    # now (sources like Slack register their channel list during start!).
-    channel_ids = Set{String}(state.channel_ids)
+    # Channels: remove the ids attributed to this source. If another active source
+    # publishes the same id, restore its object instead of deleting the shared id.
+    owned_channels = Dict{String, Agentif.AbstractChannel}(
+        Agentif.channel_id(ch) => ch for ch in state.channels)
     try
         for ch in get_channels(state.source)
-            push!(channel_ids, Agentif.channel_id(ch))
+            get!(owned_channels, Agentif.channel_id(ch), ch)
         end
     catch e
         @debug "Claw: get_channels failed during disable" integration = key exception = (e,)
     end
-    for id in channel_ids
-        Base.delete!(assistant._channels, id)
+    other_sources = lock(assistant._sources_lock) do
+        EventSource[other.source for other in assistant._sources
+            if other.source !== state.source && !other.stopped[]]
     end
-    if !isempty(state.tool_names)
-        remove = Set(state.tool_names)
-        filter!(t -> !(Agentif.tool_name(t) in remove), assistant.tools)
+    for id in keys(owned_channels)
+        replacement = nothing
+        for source in other_sources
+            channels = try
+                get_channels(source)
+            catch
+                Agentif.AbstractChannel[]
+            end
+            for ch in channels
+                if Agentif.channel_id(ch) == id
+                    replacement = ch
+                    break
+                end
+            end
+            replacement === nothing || break
+        end
+        if replacement === nothing
+            Base.delete!(assistant._channels, id)
+        else
+            assistant._channels[id] = replacement
+        end
+    end
+    # Remove one occurrence for every exact tool object this source appended.
+    # Name-based filtering also removed tools supplied by unrelated sources.
+    for tool in Iterators.reverse(state.tools)
+        idx = findlast(t -> t === tool, assistant.tools)
+        idx === nothing || deleteat!(assistant.tools, idx)
     end
     if !isempty(state.event_type_names)
+        other_types = Set{String}()
+        for source in other_sources
+            try
+                union!(other_types, (et.name for et in get_event_types(source)))
+            catch
+            end
+        end
         execute_write(assistant._writer) do db
             _with_busy_retry() do
                 for et in state.event_type_names
+                    et in other_types && continue
                     _exec!(db, "DELETE FROM claw_event_types WHERE name = ?", (et,))
                 end
                 return nothing
@@ -424,7 +459,8 @@ function _adopt_explicit_integrations!(assistant::AgentAssistant, regs)
             idx = findfirst(s -> s.source === es, assistant._sources)
             idx === nothing ? nothing : assistant._sources[idx]
         end
-        state = IntegrationState(name, es, ss, reg.channel_ids, reg.event_type_names, reg.tool_names)
+        state = IntegrationState(name, es, ss, reg.channel_ids, reg.event_type_names,
+            reg.tool_names, reg.channels, reg.tools)
         lock(assistant._integrations_lock) do
             assistant._integrations[name] = state
         end

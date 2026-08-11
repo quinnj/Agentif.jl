@@ -130,6 +130,19 @@ const PERMISSIVE_SPEC = Claw.IntegrationSpec(
     ["label" => "public label"])
 Claw.register_integration!(PERMISSIVE_SPEC, PermissiveEventSource)
 
+struct OverlapEventSource <: Claw.EventSource
+    channel::ToyChannel
+end
+OverlapEventSource() = OverlapEventSource(ToyChannel("toy-chan"))
+Claw.get_channels(es::OverlapEventSource) = Agentif.AbstractChannel[es.channel]
+Claw.get_event_types(::OverlapEventSource) =
+    Claw.EventType[Claw.EventType("toy_event", "overlapping event")]
+Claw.get_tools(::OverlapEventSource) = Agentif.AgentTool[TOY_TOOL]
+
+const OVERLAP_SPEC = Claw.IntegrationSpec(
+    "overlap", "OverlapPkg", "source with overlapping registrations", [])
+Claw.register_integration!(OVERLAP_SPEC, OverlapEventSource)
+
 mutable struct BlockingEventSource <: Claw.EventSource
     stop_entered::Base.Event
     stop_release::Base.Event
@@ -295,6 +308,30 @@ end
         end
         st = lock(() -> get(a._integrations, "blocking", nothing), a._integrations_lock)
         st === nothing || (st.source.block_stop[] = false)
+        Claw.shutdown!(a; timeout_s = 5)
+    end
+end
+
+@testset "disable preserves registrations from other sources" begin
+    a = make_assistant()
+    a._state[] = :running
+    try
+        first = Claw.enable_integration!(a, "toy")
+        second = Claw.enable_integration!(a, "overlap")
+        @test a._channels["toy-chan"] === second.source.channel
+        @test count(t -> Agentif.tool_name(t) == "toy_integration_tool", a.tools) == 2
+
+        Claw.disable_integration!(a, "toy")
+        @test a._channels["toy-chan"] === second.source.channel
+        @test has_tool(a, "toy_integration_tool")
+        @test event_type_registered(a, "toy_event")
+
+        Claw.disable_integration!(a, "overlap")
+        @test !haskey(a._channels, "toy-chan")
+        @test !has_tool(a, "toy_integration_tool")
+        @test !event_type_registered(a, "toy_event")
+        @test first.source.stopped[]
+    finally
         Claw.shutdown!(a; timeout_s = 5)
     end
 end
