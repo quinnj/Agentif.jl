@@ -235,6 +235,54 @@ end
     end
 end
 
+@testset "enable persistence failure rolls runtime back" begin
+    a = make_assistant()
+    a._state[] = :running
+    try
+        Claw.execute_write(a._writer, """
+            CREATE TRIGGER reject_integration_insert
+            BEFORE INSERT ON claw_integrations
+            BEGIN SELECT RAISE(ABORT, 'integration insert blocked'); END
+        """)
+        @test_throws SQLite.SQLiteException Claw.enable_integration!(a, "toy")
+        @test lock(() -> !haskey(a._integrations, "toy"), a._integrations_lock)
+        @test !haskey(a._channels, "toy-chan")
+        @test !has_tool(a, "toy_integration_tool")
+        @test !event_type_registered(a, "toy_event")
+        @test !any(es -> es isa ToyEventSource, Claw.EVENT_SOURCES)
+    finally
+        Claw.execute_write(a._writer, "DROP TRIGGER IF EXISTS reject_integration_insert")
+        lock(() -> haskey(a._integrations, "toy"), a._integrations_lock) &&
+            Claw.disable_integration!(a, "toy")
+        Claw.shutdown!(a; timeout_s = 5)
+    end
+end
+
+@testset "disable persistence failure keeps runtime enabled" begin
+    a = make_assistant()
+    a._state[] = :running
+    st = Claw.enable_integration!(a, "toy")
+    try
+        Claw.execute_write(a._writer, """
+            CREATE TRIGGER reject_integration_disable
+            BEFORE UPDATE OF enabled ON claw_integrations
+            WHEN NEW.enabled = 0
+            BEGIN SELECT RAISE(ABORT, 'integration disable blocked'); END
+        """)
+        @test_throws SQLite.SQLiteException Claw.disable_integration!(a, "toy")
+        @test lock(() -> get(a._integrations, "toy", nothing), a._integrations_lock) === st
+        @test haskey(a._channels, "toy-chan")
+        @test has_tool(a, "toy_integration_tool")
+        @test event_type_registered(a, "toy_event")
+        @test integration_row(a, "toy").enabled == 1
+    finally
+        Claw.execute_write(a._writer, "DROP TRIGGER IF EXISTS reject_integration_disable")
+        lock(() -> haskey(a._integrations, "toy"), a._integrations_lock) &&
+            Claw.disable_integration!(a, "toy")
+        Claw.shutdown!(a; timeout_s = 5)
+    end
+end
+
 # ─── Persisted enabled-set reconciliation ───
 
 @testset "init! reconciles the persisted enabled-set" begin

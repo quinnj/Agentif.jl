@@ -293,7 +293,17 @@ function enable_integration!(assistant::AgentAssistant, name::AbstractString;
         assistant._integrations[key] = st
         st.supervised = _start_supervised_source!(assistant, es; validated = true)
         if persist
-            _persist_integration!(assistant, key, true, config)
+            try
+                _persist_integration!(assistant, key, true, config)
+            catch
+                pop!(assistant._integrations, key, nothing)
+                try
+                    _disable_integration_locked!(assistant, key, st; persist = false)
+                catch rollback_error
+                    @error "Claw: failed to roll back integration after persistence failure" integration = key exception = (rollback_error, catch_backtrace())
+                end
+                rethrow()
+            end
             _set_integration_status!(assistant, key, "")
         end
         st
@@ -320,9 +330,13 @@ function disable_integration!(assistant::AgentAssistant, name::AbstractString; p
     lock(assistant._integrations_lock) do
         assistant._state[] === :running || error(
             "Cannot disable integration '$key' while the pipeline is $(assistant._state[]).")
-        state = pop!(assistant._integrations, key, nothing)
+        state = get(assistant._integrations, key, nothing)
         state === nothing && error("Integration '$key' is not enabled.")
-        _disable_integration_locked!(assistant, key, state; persist)
+        # Persist the transition before changing runtime state. If this write
+        # fails, the source stays fully enabled and a restart agrees with it.
+        persist && _persist_integration!(assistant, key, false, nothing)
+        pop!(assistant._integrations, key)
+        _disable_integration_locked!(assistant, key, state; persist = false)
     end
     return nothing
 end
