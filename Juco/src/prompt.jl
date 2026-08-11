@@ -41,6 +41,7 @@ Available tools:
 $tool_lines
 
 Guidelines:
+- When fixing a bug or failing test, REPRODUCE it first: run the failing command and read the actual error before reading or changing code.
 - Explore before editing; verify your changes (run tests or the code) before declaring success.
 - Keep edits surgical: change only what the task requires.
 - Be concise. When done, summarize what changed in a sentence or two.

@@ -327,12 +327,14 @@ const TASKS = [
     name = "output-discipline",
     setup = function (dir)
         write(joinpath(dir, "process.jl"), """
-            # Processes 8000 records; record 4217 is corrupt.
-            for i in 1:8000
-                if i == 4217
-                    println("record \$i: ERROR malformed field 'qty' (got \\"seven\\")")
+            # Validates every record in records.csv.
+            for (i, line) in enumerate(eachline("records.csv"))
+                id, qty = split(line, ",")
+                parsed = tryparse(Int, qty)
+                if parsed === nothing
+                    println("record \$i (\$id): ERROR malformed field 'qty' (got \\"\$qty\\")")
                 else
-                    println("record \$i: ok")
+                    println("record \$i (\$id): ok")
                 end
             end
             """)
