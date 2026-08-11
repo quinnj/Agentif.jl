@@ -1305,4 +1305,38 @@ end
     Claw.shutdown!(a; timeout_s = 5)
 end
 
+@testset "handler lookup failure releases REPL waiters" begin
+    a = make_assistant(":memory:"; FAST...)
+    a._state[] = :running
+    ch = Claw.ReplChannel(devnull, Threads.Event())
+    id = Claw.submit_event!(a, Claw.ReplInputEvent("lookup failure", ch))
+    @test take!(a.event_queue) == id
+    row = Claw._claim_event!(a, id)
+    @test row !== nothing
+    # Force the handler lookup itself to fail while leaving claw_events writable,
+    # which is the path that used to return the claim but strand the REPL waiter.
+    Claw.execute_write(a._writer, "DROP TABLE claw_event_handlers")
+    waiter = Threads.@spawn wait(ch.completion)
+    Claw._process_claimed_group!(a,
+        Tuple{Claw.EventRow, Claw.Event}[(row, Claw.ReplInputEvent("lookup failure", ch))])
+    @test timedwait(() -> istaskdone(waiter), 5.0) == :ok
+    @test event_row(a, id).status == "pending"
+    Claw.shutdown!(a; timeout_s = 5)
+end
+
+@testset "shutdown releases queued REPL waiters" begin
+    a = make_assistant(":memory:"; FAST...)
+    # Accept a durable event without starting the intake task. It remains queued
+    # when shutdown starts, as can happen when intake loses the shutdown race.
+    a._state[] = :running
+    ch = Claw.ReplChannel(devnull, Threads.Event())
+    id = Claw.submit_event!(a, Claw.ReplInputEvent("queued at shutdown", ch))
+    waiter = Threads.@spawn wait(ch.completion)
+    Claw.shutdown!(a; timeout_s = 5)
+    @test timedwait(() -> istaskdone(waiter), 5.0) == :ok
+    @test isempty(a._pending_wakeups)
+    @test isempty(a._live_events)
+    @test id isa Int
+end
+
 end # module PipelineTests

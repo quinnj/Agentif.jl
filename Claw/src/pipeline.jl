@@ -553,7 +553,10 @@ function _lane_loop(assistant::AgentAssistant, lane::Lane)
                 break
             end
             Threads.atomic_sub!(lane.depth, 1)
-            assistant._state[] === :running || break
+            if assistant._state[] !== :running
+                _clear_wakeup!(assistant, item[1])
+                break
+            end
             # Coalesce: drain whatever else is already queued on this lane (up to
             # max_coalesce), so a burst that piled up behind a slow evaluation is
             # handled as one demarcated batch instead of N sequential evaluations.
@@ -720,6 +723,7 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
             _release_claim!(assistant, row.id; delay = assistant.pipeline.min_refire_gap_s)
             _clear_wakeup!(assistant, row.id)
         end
+        _release_group_channels!(group, nothing)
         return nothing
     end
 
@@ -786,6 +790,7 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
             _handle_event_failure!(assistant, row, ev, handlers, e; notify)
             notify = false
         end
+        _release_group_channels!(group, streamed)
     finally
         lock(assistant._inflight_lock) do
             for (row, _) in group
@@ -817,6 +822,38 @@ function _release_group_channels!(group::Vector{Tuple{EventRow, Event}}, streame
         catch e
             @debug "Claw: failed to release coalesced channel" exception = (e,)
         end
+    end
+    return nothing
+end
+
+# Release every still-live channel event at shutdown. This covers queued rows that
+# intake or a lane did not consume, retrying rows whose next attempt is in the
+# future, and any straggler that ignored its abort. The durable rows stay pending;
+# only their process-local response waiters are completed.
+function _release_live_event_channels!(assistant::AgentAssistant)
+    events = lock(assistant._live_lock) do
+        result = collect(values(assistant._live_events))
+        empty!(assistant._live_events)
+        result
+    end
+    channels = Base.IdSet{Any}()
+    for ev in events
+        ev isa ChannelEvent || continue
+        ch = try
+            get_channel(ev)
+        catch
+            continue
+        end
+        ch in channels && continue
+        push!(channels, ch)
+        try
+            Agentif.close_channel(ch)
+        catch e
+            @debug "Claw: failed to release live channel during shutdown" exception = (e,)
+        end
+    end
+    lock(assistant._wakeup_lock) do
+        empty!(assistant._pending_wakeups)
     end
     return nothing
 end
@@ -1241,6 +1278,7 @@ function shutdown!(assistant::AgentAssistant; timeout_s::Real = assistant.pipeli
     )
     timedwait(() -> all(istaskdone, all_tasks), 5.0; pollint = 0.05)
 
+    _release_live_event_channels!(assistant)
     _return_claims!(assistant)
 
     close_writer!(assistant._writer)
