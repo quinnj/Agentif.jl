@@ -1015,6 +1015,24 @@ function _sleep_interruptible(assistant::AgentAssistant, seconds::Real)
     return assistant._state[] === :running
 end
 
+function _retire_source!(assistant::AgentAssistant, ss::SupervisedSource)
+    inner = lock(ss.lock) do
+        ss.stopped[] = true
+        try
+            stop!(ss.source)
+        catch e
+            @warn "Claw: source stop! failed after restart budget exhaustion" source = ss.tag exception = (e,)
+        end
+        ss.inner
+    end
+    if inner !== nothing && !istaskdone(inner)
+        result = timedwait(() -> istaskdone(inner),
+            assistant.pipeline.source_stop_timeout_s; pollint = 0.05)
+        result == :timed_out && @error "Claw: retired source did not stop" source = ss.tag
+    end
+    return nothing
+end
+
 function _supervise_source!(assistant::AgentAssistant, ss::SupervisedSource)
     backoff = assistant.pipeline.source_restart_backoff_s
     while assistant._state[] === :running && !ss.stopped[]
@@ -1053,7 +1071,7 @@ function _supervise_source!(assistant::AgentAssistant, ss::SupervisedSource)
             _journal_source!(assistant, ss.tag, "restart_cap_exceeded",
                 "more than $(assistant.pipeline.source_restart_cap) restarts within $(assistant.pipeline.source_restart_window_s)s")
             @error "Claw: source exceeded its restart budget; giving up" source = ss.tag cap = assistant.pipeline.source_restart_cap
-            ss.stopped[] = true
+            _retire_source!(assistant, ss)
             break
         end
         _sleep_interruptible(assistant, min(backoff, 60.0)) || break
@@ -1104,7 +1122,7 @@ function _health_loop(assistant::AgentAssistant)
             if !_record_restart!(assistant, ss)
                 _journal_source!(assistant, ss.tag, "restart_cap_exceeded", "unhealthy restart budget exhausted")
                 @error "Claw: unhealthy source exceeded its restart budget; giving up" source = ss.tag
-                ss.stopped[] = true
+                _retire_source!(assistant, ss)
                 continue
             end
             _request_source_restart!(assistant, ss)

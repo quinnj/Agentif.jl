@@ -834,16 +834,19 @@ end
 
 mutable struct FlakySource <: Claw.EventSource
     starts::Threads.Atomic{Int}
+    stops::Threads.Atomic{Int}
     fail::Bool
     healthy::Threads.Atomic{Bool}
 end
-FlakySource(; fail::Bool = true) = FlakySource(Threads.Atomic{Int}(0), fail, Threads.Atomic{Bool}(true))
+FlakySource(; fail::Bool = true) = FlakySource(
+    Threads.Atomic{Int}(0), Threads.Atomic{Int}(0), fail, Threads.Atomic{Bool}(true))
 
 Claw.get_channels(::FlakySource) = Agentif.AbstractChannel[]
 Claw.get_event_types(::FlakySource) = Claw.EventType[]
 Claw.get_event_handlers(::FlakySource) = Claw.EventHandler[]
 Claw.get_tools(::FlakySource) = Agentif.AgentTool[]
 Claw.is_healthy(s::FlakySource) = s.healthy[]
+Claw.stop!(s::FlakySource) = (Threads.atomic_add!(s.stops, 1); nothing)
 function Claw.start!(s::FlakySource, ::Claw.AgentAssistant)
     Threads.atomic_add!(s.starts, 1)
     s.fail || return nothing
@@ -880,6 +883,7 @@ journal_count(a, source, action) = Int(Claw._fetch_one(a.db,
     @test time() - started_at >= 0.28  # consecutive failures back off 0.1s, then 0.2s
     sleep(0.5)
     @test flaky.starts[] == 3
+    @test flaky.stops[] == 1
     @test journal_count(a, "flakysource", "restart_cap_exceeded") == 1
 
     # An invalid source is never started and does not abort the others.
@@ -911,6 +915,7 @@ end
     @test timedwait(() -> journal_count(a, "flakysource", "restart_cap_exceeded") >= 1, 15.0) == :ok
     sleep(0.4)
     @test src.starts[] == 2
+    @test src.stops[] == 2
 
     Claw.shutdown!(a; timeout_s = 5)
 end
