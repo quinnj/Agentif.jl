@@ -321,11 +321,9 @@ const CLAW_SCHEMA_VERSION = 5
 function _is_sensitive_integration_key(key)
     normalized = replace(lowercase(String(key)), r"[^a-z0-9]" => "")
     normalized in ("key", "auth", "authorization", "cookie", "credentials") && return true
-    occursin("apikey", normalized) && return true
-    occursin("privatekey", normalized) && return true
-    occursin("accesskey", normalized) && return true
-    return any(suffix -> endswith(normalized, suffix),
-        ("token", "secret", "password", "passphrase", "credential"))
+    return any(fragment -> occursin(fragment, normalized),
+        ("apikey", "privatekey", "accesskey", "authorization", "bearer",
+         "cookie", "token", "secret", "password", "passphrase", "credential"))
 end
 
 function _sanitize_integration_value(value)

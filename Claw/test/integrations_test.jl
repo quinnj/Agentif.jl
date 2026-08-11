@@ -495,7 +495,9 @@ end
     try
         Claw._exec!(a.db, """
             INSERT INTO claw_integrations (name, enabled, config, status, updated_at)
-            VALUES ('toy', 0, '{"token":"legacy-secret","label":"kept"}', NULL, 0)
+            VALUES ('toy', 0,
+                '{"token":"legacy-secret","credentials_json":"secret-json","label":"kept","nested":{"authorization_header":"Bearer hidden"},"items":[{"api_token_file":"/secret/path"}]}',
+                NULL, 0)
         """)
         Claw._set_user_version!(a.db, 4)
     finally
@@ -510,6 +512,9 @@ end
         @test !haskey(parsed, "token")
         @test parsed["label"] == "kept"
         @test !occursin("legacy-secret", String(row.config))
+        @test !haskey(parsed, "credentials_json")
+        @test !haskey(parsed["nested"], "authorization_header")
+        @test !haskey(only(parsed["items"]), "api_token_file")
     finally
         Claw.shutdown!(b; timeout_s = 5)
         rm(path; force = true)
