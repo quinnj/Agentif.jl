@@ -1008,11 +1008,18 @@ function _supervise_source!(assistant::AgentAssistant, ss::SupervisedSource)
     while assistant._state[] === :running && !ss.stopped[]
         started = false
         try
-            result = start!(ss.source, assistant)
+            result, should_start = lock(ss.lock) do
+                if assistant._state[] !== :running || ss.stopped[]
+                    return (nothing, false)
+                end
+                value = start!(ss.source, assistant)
+                ss.inner = value isa Task ? value : nothing
+                return (value, true)
+            end
+            should_start || break
             started = true
             _journal_source!(assistant, ss.tag, "started")
             if result isa Task
-                ss.inner = result
                 wait(result)
                 _journal_source!(assistant, ss.tag, "exited", "source task returned")
             else
@@ -1044,13 +1051,15 @@ function _supervise_source!(assistant::AgentAssistant, ss::SupervisedSource)
 end
 
 function _request_source_restart!(assistant::AgentAssistant, ss::SupervisedSource)
-    ss.restart_requested[] = true
-    try
-        stop!(ss.source)
-    catch e
-        @warn "Claw: source stop! failed" source = ss.tag exception = (e,)
+    inner = lock(ss.lock) do
+        ss.restart_requested[] = true
+        try
+            stop!(ss.source)
+        catch e
+            @warn "Claw: source stop! failed" source = ss.tag exception = (e,)
+        end
+        ss.inner
     end
-    inner = ss.inner
     if inner !== nothing && !istaskdone(inner)
         result = timedwait(() -> istaskdone(inner),
             assistant.pipeline.source_stop_timeout_s; pollint = 0.05)
@@ -1134,15 +1143,17 @@ Stop one supervised source and drop it from supervision. `stop!` must make a
 task returned by `start!` finish within `source_stop_timeout_s`.
 """
 function _stop_supervised_source!(assistant::AgentAssistant, ss::SupervisedSource)
-    ss.stopped[] = true
     timeout = assistant.pipeline.source_stop_timeout_s
     deadline = time() + timeout
-    try
-        stop!(ss.source)
-    catch e
-        @debug "Claw: source stop! failed" source = ss.tag exception = (e,)
+    inner = lock(ss.lock) do
+        ss.stopped[] = true
+        try
+            stop!(ss.source)
+        catch e
+            @debug "Claw: source stop! failed" source = ss.tag exception = (e,)
+        end
+        ss.inner
     end
-    inner = ss.inner
     if inner !== nothing && !istaskdone(inner)
         timedwait(() -> istaskdone(inner), max(0.0, deadline - time());
             pollint = 0.05)
@@ -1180,11 +1191,13 @@ end
 
 function _stop_sources!(assistant::AgentAssistant)
     for ss in lock(() -> copy(assistant._sources), assistant._sources_lock)
-        ss.stopped[] = true
-        try
-            stop!(ss.source)
-        catch e
-            @debug "Claw: source stop! failed during shutdown" source = ss.tag exception = (e,)
+        lock(ss.lock) do
+            ss.stopped[] = true
+            try
+                stop!(ss.source)
+            catch e
+                @debug "Claw: source stop! failed during shutdown" source = ss.tag exception = (e,)
+            end
         end
     end
     return nothing

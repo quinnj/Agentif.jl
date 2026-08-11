@@ -95,6 +95,29 @@ const SLOW_EXIT_SPEC = Claw.IntegrationSpec(
     "slow-exit", "SlowExitPkg", "source with observable asynchronous cleanup", [])
 Claw.register_integration!(SLOW_EXIT_SPEC, SlowExitSource)
 
+mutable struct StartRaceSource <: Claw.EventSource
+    start_entered::Threads.Atomic{Bool}
+    start_release::Base.Event
+    stopping::Threads.Atomic{Bool}
+end
+StartRaceSource() = StartRaceSource(
+    Threads.Atomic{Bool}(false), Base.Event(), Threads.Atomic{Bool}(false))
+function Claw.start!(es::StartRaceSource, ::Claw.AgentAssistant)
+    es.start_entered[] = true
+    wait(es.start_release)
+    es.stopping[] = false
+    return Threads.@spawn begin
+        while !es.stopping[]
+            sleep(0.01)
+        end
+    end
+end
+Claw.stop!(es::StartRaceSource) = (es.stopping[] = true; nothing)
+
+const START_RACE_SPEC = Claw.IntegrationSpec(
+    "start-race", "StartRacePkg", "source with a controlled start/stop race", [])
+Claw.register_integration!(START_RACE_SPEC, StartRaceSource)
+
 mutable struct BlockingEventSource <: Claw.EventSource
     stop_entered::Base.Event
     stop_release::Base.Event
@@ -263,6 +286,34 @@ end
         @test st.supervised.task === nothing || istaskdone(st.supervised.task)
     finally
         notify(st.source.stop_event)
+        Claw.shutdown!(a; timeout_s = 5)
+    end
+end
+
+@testset "disable serializes with source start" begin
+    cfg = Claw.PipelineConfig(; source_stop_timeout_s = 0.5)
+    a = Claw.AgentAssistant(":memory:";
+        provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key",
+        timezone = "UTC", level = :error, pipeline = cfg)
+    a._state[] = :running
+    st = Claw.enable_integration!(a, "start-race")
+    disable_task = nothing
+    try
+        @test timedwait(() -> st.source.start_entered[], 5.0) == :ok
+        disable_task = Threads.@spawn Claw.disable_integration!(a, "start-race")
+        @test timedwait(() -> st.source.stopping[], 0.1) == :timed_out
+        notify(st.source.start_release)
+        @test timedwait(() -> istaskdone(disable_task), 5.0) == :ok
+        fetch(disable_task)
+        @test st.source.stopping[]
+        @test st.supervised.task === nothing || istaskdone(st.supervised.task)
+    finally
+        st.source.stopping[] = true
+        notify(st.source.start_release)
+        disable_task === nothing || try
+            wait(disable_task)
+        catch
+        end
         Claw.shutdown!(a; timeout_s = 5)
     end
 end
