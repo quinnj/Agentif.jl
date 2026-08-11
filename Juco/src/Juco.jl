@@ -13,6 +13,8 @@ Usage:
 module Juco
 
 using Dates
+using JSON
+using Markdown
 using Agentif
 using LLMTools
 using LLMProviders
@@ -22,6 +24,7 @@ using LocalSearch
 include("db.jl")
 include("tools.jl")
 include("prompt.jl")
+include("display.jl")
 include("agent.jl")
 
 export repl

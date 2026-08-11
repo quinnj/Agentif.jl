@@ -38,20 +38,46 @@ function resolve_apikey(provider::String)
     error("No API key found: set JUCO_API_KEY$(isempty(env_var) ? "" : " or $env_var")")
 end
 
-# ─── Terminal channel: routes streamed assistant text to an IO, and gives the
-# session middleware a stable branch id (= the Juco session id). ───
+# ─── Terminal channel: collects streamed assistant text and gives the session
+# middleware a stable branch id (= the Juco session id). Text is buffered per
+# assistant message and rendered as Markdown when the message completes — tool
+# activity and reasoning stream live in between (see display.jl), so the
+# terminal stays responsive while answers come out cleanly formatted. ───
 
 struct TerminalChannel <: Agentif.AbstractChannel
     session_id::String
     io::IO
+    buf::IOBuffer
+    markdown::Bool
 end
+
+TerminalChannel(session_id::String, io::IO; markdown::Bool = true) =
+    TerminalChannel(session_id, io, IOBuffer(), markdown)
 
 Agentif.channel_id(ch::TerminalChannel) = ch.session_id
 Agentif.start_streaming(::TerminalChannel) = nothing
-Agentif.append_to_stream(ch::TerminalChannel, delta) = (print(ch.io, delta); flush(ch.io))
-Agentif.finish_streaming(ch::TerminalChannel) = println(ch.io)
+Agentif.append_to_stream(ch::TerminalChannel, delta) = write(ch.buf, delta)
+
+function render_text(ch::TerminalChannel)
+    text = strip(String(take!(ch.buf)))
+    isempty(text) && return
+    if ch.markdown && use_color(ch.io)
+        try
+            show(IOContext(ch.io, :color => true), MIME("text/plain"), Markdown.parse(String(text)))
+            println(ch.io)
+        catch
+            println(ch.io, text)
+        end
+    else
+        println(ch.io, text)
+    end
+    flush(ch.io)
+    return
+end
+
+Agentif.finish_streaming(ch::TerminalChannel) = render_text(ch)
 Agentif.send_message(ch::TerminalChannel, msg) = println(ch.io, msg)
-Agentif.close_channel(::TerminalChannel) = nothing
+Agentif.close_channel(ch::TerminalChannel) = render_text(ch)  # flush any tail text
 
 # ─── Agent construction ───
 
@@ -110,9 +136,12 @@ function evaluate(input::AbstractString;
         session_id::Union{Nothing, AbstractString} = nothing,
         io::IO = stdout,
         show_tools::Bool = true,
+        show_reasoning::Bool = true,
+        show_usage::Bool = false,
         max_turns::Int = DEFAULT_MAX_TURNS,
         reasoning_effort::Union{Nothing, String} = default_reasoning(),
         on_event::Union{Nothing, Function} = nothing,
+        abort::Agentif.Abort = Agentif.Abort(),
         level = nothing,
         kw...,
     )
@@ -120,23 +149,17 @@ function evaluate(input::AbstractString;
     touch_session!(jdb, sid; title = first(String(input), 80), cwd = abspath(base_dir))
     agent = build_agent(; base_dir, jdb, kw...)
     ch = TerminalChannel(sid, io)
-    abort = Agentif.Abort()
     # tool executions run on concurrent tasks, so the counter must be atomic
     tool_calls = Threads.Atomic{Int}(0)
     agent = Agentif.with_tools(agent,
         Agentif.AgentTool[with_budget_notice(t, tool_calls, max_turns) for t in agent.tools])
+    disp = show_tools ? display_handler(io; show_reasoning) : nothing
     handler = function (event)
         if event isa Agentif.ToolExecutionStartEvent
             n = Threads.atomic_add!(tool_calls, 1) + 1
-            if n > max_turns
-                Agentif.abort!(abort)
-            elseif show_tools
-                args = replace(event.tool_call.arguments, '\n' => "\\n")
-                println(io, "\e[2m[$(event.tool_call.name)] $(first(args, 160))\e[0m")
-            end
-        elseif event isa Agentif.AgentErrorEvent && show_tools
-            println(io, "\e[31m[error] $(event.error)\e[0m")
+            n > max_turns && Agentif.abort!(abort)
         end
+        disp === nothing || disp(event)
         on_event === nothing || on_event(event)
         return nothing
     end
@@ -151,42 +174,184 @@ function evaluate(input::AbstractString;
         (; reasoning_effort)
     end
     is_openrouter && (eval_kw = merge(eval_kw, (; provider = openrouter_provider_prefs())))
+    t0 = time()
     state = Agentif.evaluate(handler, agent, String(input);
         session_store = jdb.session_store, channel = ch, abort, level, eval_kw...)
+    show_usage && println(io, dim(io, usage_line(state.usage, agent.model, tool_calls[], time() - t0)))
     return (; state, session_id = sid, tool_calls = tool_calls[], aborted = Agentif.isaborted(abort))
 end
 
 # ─── REPL / CLI ───
 
+const REPL_HELP = """
+/help                 show this help
+/new                  start a new session
+/sessions             list recent sessions
+/resume [id]          resume a session (most recent if no id)
+/model [prov] [id]    show or switch the model
+/memories             list saved memories
+/quit                 exit (also: exit, quit, ctrl-d)
+End a line with \\ to continue typing on the next line.
+Ctrl-C during a response interrupts that response, not the REPL."""
+
+# Mutable REPL state threaded through slash commands.
+mutable struct ReplState
+    jdb::JucoDB
+    session_id::String
+    provider::String
+    model_id::String
+    quit::Bool
+end
+
+function handle_command(st::ReplState, input::AbstractString, io::IO)
+    parts = split(strip(input))
+    cmd = parts[1]
+    if cmd == "/help"
+        println(io, REPL_HELP)
+    elseif cmd == "/new"
+        st.session_id = "juco-" * string(Agentif.UID8())
+        println(io, dim(io, "new session $(st.session_id)"))
+    elseif cmd == "/sessions"
+        sessions = list_sessions(st.jdb)
+        isempty(sessions) && return println(io, "No sessions.")
+        for s in sessions
+            ts = Dates.format(Dates.unix2datetime(s.updated_at), "yyyy-mm-dd HH:MM")
+            marker = s.id == st.session_id ? "* " : "  "
+            println(io, marker, s.id, dim(io, "  $(ts)  $(first(s.title, 60))"))
+        end
+    elseif cmd == "/resume"
+        target = length(parts) >= 2 ? String(parts[2]) : latest_session(st.jdb)
+        target === nothing && return println(io, "No sessions to resume.")
+        st.session_id = target
+        println(io, dim(io, "resumed $(st.session_id)"))
+    elseif cmd == "/model"
+        if length(parts) == 1
+            println(io, "$(st.provider)/$(st.model_id)")
+        else
+            prov, mid = length(parts) >= 3 ? (String(parts[2]), String(parts[3])) : (st.provider, String(parts[2]))
+            getModel(prov, mid) === nothing && return println(io, red(io, "unknown model: $(prov)/$(mid)"))
+            st.provider, st.model_id = prov, mid
+            println(io, dim(io, "model set to $(prov)/$(mid)"))
+        end
+    elseif cmd == "/memories"
+        mems = memories(st.jdb)
+        isempty(mems) && return println(io, "No memories.")
+        foreach(m -> println(io, "- ", m), mems)
+    elseif cmd == "/quit"
+        st.quit = true
+    else
+        println(io, red(io, "unknown command $(cmd)"), " — /help for commands")
+    end
+    return nothing
+end
+
+# Read one logical input: trailing backslash continues on the next line.
+# Returns nothing on EOF.
+function read_input(io::IO)
+    print(io, bold(io, "juco> "))
+    raw = readline(stdin; keep = true)
+    isempty(raw) && return nothing
+    input = String(strip(raw))
+    while endswith(input, "\\")
+        input = chop(input; tail = 1)
+        print(io, bold(io, "  ..> "))
+        raw = readline(stdin; keep = true)
+        isempty(raw) && break
+        input *= "\n" * strip(raw)
+    end
+    return String(strip(input))
+end
+
+# Run one turn on a worker task so ctrl-c aborts the TURN (via Abort), not the
+# REPL. A second ctrl-c while aborting force-detaches.
+function run_turn(st::ReplState, input::String, io::IO; kw...)
+    abort = Agentif.Abort()
+    turn = @async evaluate(input; jdb = st.jdb, session_id = st.session_id,
+        provider = st.provider, model_id = st.model_id, io, show_usage = true, abort, kw...)
+    while true
+        try
+            return fetch(turn)
+        catch e
+            if e isa InterruptException
+                Agentif.abort!(abort)
+                println(io, dim(io, "\n^C interrupting — waiting for the turn to stop (ctrl-c again to detach)"))
+                timedwait(() -> istaskdone(turn), 10.0; pollint = 0.1) === :ok || return nothing
+            elseif e isa TaskFailedException
+                inner = e.task.exception
+                inner isa InterruptException && continue
+                msg = sprint(showerror, inner)
+                println(io, red(io, "error: " * first(split(msg, '\n'))))
+                println(io, dim(io, "the session is intact — try again or rephrase"))
+                return nothing
+            else
+                rethrow()
+            end
+        end
+    end
+end
+
 function repl(;
         db_path::AbstractString = DEFAULT_DB_PATH,
         continue_last::Bool = false,
+        provider::String = default_provider(),
+        model_id::String = default_model(),
+        io::IO = stdout,
         kw...,
     )
     jdb = opendb(db_path)
     session_id = continue_last ? latest_session(jdb) : nothing
-    continue_last && session_id === nothing && println("No previous session found; starting a new one.")
+    continue_last && session_id === nothing && println(io, "No previous session found; starting a new one.")
     session_id === nothing && (session_id = "juco-" * string(Agentif.UID8()))
-    println("juco · session $(session_id) · db $(abspath(db_path)) · type 'exit' to quit")
-    while true
-        print("\e[1mjuco>\e[0m ")
-        # keep=true distinguishes an empty line ("\n") from EOF ("")
-        raw = try
-            readline(stdin; keep = true)
-        catch e
-            e isa InterruptException ? "\n" : rethrow()
+    st = ReplState(jdb, session_id, provider, model_id, false)
+    println(io, bold(io, "juco"), dim(io, " · $(provider)/$(model_id) · session $(session_id)"))
+    println(io, dim(io, "db $(abspath(db_path)) · /help for commands · exit to quit"))
+    isa(stdin, Base.TTY) && Base.exit_on_sigint(false)
+    try
+        while !st.quit
+            input = try
+                read_input(io)
+            catch e
+                e isa InterruptException ? "" : rethrow()
+            end
+            input === nothing && break  # EOF (ctrl-d)
+            isempty(input) && continue
+            input in ("exit", "quit") && break
+            if startswith(input, "/")
+                handle_command(st, input, io)
+            else
+                run_turn(st, input, io; kw...)
+                println(io)
+            end
         end
-        isempty(raw) && break  # EOF (ctrl-d)
-        input = strip(raw)
-        isempty(input) && continue
-        input in ("exit", "quit") && break
-        try
-            evaluate(input; jdb, session_id, kw...)
-        catch e
-            e isa InterruptException || showerror(stderr, e, catch_backtrace())
-            println(stderr)
-        end
-        println()
+    finally
+        isa(stdin, Base.TTY) && Base.exit_on_sigint(true)
+    end
+    return nothing
+end
+
+# ─── In-REPL mode (implemented in the ReplMaker package extension) ───
+
+"""
+    Juco.repl_mode!(; db_path = DEFAULT_DB_PATH, start_key = '}')
+
+Register a `juco>` mode in the current Julia REPL (like Pkg's `]`): press
+`}` at an empty `julia>` prompt to talk to Juco, backspace to leave. Slash
+commands (`/help`, `/sessions`, ...) work inside the mode.
+
+Requires ReplMaker: `using Juco, ReplMaker; Juco.repl_mode!()`.
+"""
+function repl_mode! end
+
+mode_state(db_path::AbstractString = DEFAULT_DB_PATH) =
+    ReplState(opendb(db_path), "juco-" * string(Agentif.UID8()), default_provider(), default_model(), false)
+
+function mode_eval(st::ReplState, input::AbstractString; kw...)
+    s = String(strip(input))
+    isempty(s) && return nothing
+    if startswith(s, "/")
+        handle_command(st, s, stdout)
+    else
+        run_turn(st, s, stdout; kw...)
     end
     return nothing
 end
@@ -199,6 +364,26 @@ function print_sessions(db_path::AbstractString)
         ts = Dates.format(Dates.unix2datetime(s.updated_at), "yyyy-mm-dd HH:MM")
         println("$(s.id)  $(ts)  $(s.cwd)  $(s.title)")
     end
+end
+
+"""
+    Juco.install_cli(; dir = joinpath(homedir(), ".local", "bin"))
+
+Write a `juco` launcher script to `dir` so the agent can be started from any
+shell. The script runs this monorepo's environment.
+"""
+function install_cli(; dir::AbstractString = joinpath(homedir(), ".local", "bin"))
+    project = dirname(pkgdir(Juco))
+    mkpath(dir)
+    path = joinpath(dir, "juco")
+    write(path, """
+        #!/bin/sh
+        exec julia --project=$(project) --startup-file=no -e 'using Juco; Juco.main(ARGS)' -- "\$@"
+        """)
+    chmod(path, 0o755)
+    occursin(abspath(dir), get(ENV, "PATH", "")) ||
+        @info "add $(dir) to your PATH to use `juco` directly"
+    return path
 end
 
 const CLI_HELP = """

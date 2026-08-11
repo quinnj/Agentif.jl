@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "978c3dca275e54013b43a5e729c6441d8e653806"
+project_hash = "0dc391b6268dae8628484182440593ccb116681a"
 
 [[deps.AbstractStores]]
 deps = ["Base64", "Dates", "Serialization"]
@@ -226,10 +226,14 @@ version = "1.6.0"
     JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 
 [[deps.Juco]]
-deps = ["Agentif", "Dates", "LLMProviders", "LLMTools", "LocalSearch", "SQLite"]
+deps = ["Agentif", "Dates", "JSON", "LLMProviders", "LLMTools", "LocalSearch", "Markdown", "SQLite"]
 path = "Juco"
 uuid = "a4f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2e"
 version = "0.2.0"
+weakdeps = ["ReplMaker"]
+
+    [deps.Juco.extensions]
+    JucoReplMakerExt = ["ReplMaker"]
 
 [[deps.JuliaSyntaxHighlighting]]
 deps = ["StyledStrings"]
@@ -394,10 +398,21 @@ repo-url = "https://github.com/JuliaServices/PtySessions.jl.git"
 uuid = "581b29ee-4021-4243-bea3-a8421693f905"
 version = "0.1.0"
 
+[[deps.REPL]]
+deps = ["InteractiveUtils", "JuliaSyntaxHighlighting", "Markdown", "Sockets", "StyledStrings", "Unicode"]
+uuid = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
+version = "1.11.0"
+
 [[deps.Random]]
 deps = ["SHA"]
 uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 version = "1.11.0"
+
+[[deps.ReplMaker]]
+deps = ["REPL", "Unicode"]
+git-tree-sha1 = "f8bb680b97ee232c4c6591e213adc9c1e4ba0349"
+uuid = "b873ce64-0db9-51f5-a568-4457d8e49576"
+version = "0.2.7"
 
 [[deps.Reseau]]
 deps = ["NetworkOptions", "OpenSSL_jll", "PrecompileTools", "Random", "SHA"]
