@@ -53,6 +53,8 @@ Base.@kwdef struct PipelineConfig
     source_restart_backoff_s::Float64 = 1.0
     "How often `is_healthy` is polled per source."
     source_health_interval_s::Float64 = 300.0
+    "How long runtime disable waits for a source to finish cooperative cleanup."
+    source_stop_timeout_s::Float64 = 5.0
     "Default `shutdown!` drain budget."
     shutdown_timeout_s::Float64 = 30.0
     "Send a best-effort apology on the originating channel when an event dies."

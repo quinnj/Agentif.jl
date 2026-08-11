@@ -320,8 +320,8 @@ end
 """
     disable_integration!(assistant, name; persist = true)
 
-Stop the integration's source (supervision ends, `stop!` is called, its task is
-interrupted) and remove what enabling registered: its channels, its tools, and its
+Stop the integration's source (supervision ends and `stop!` is called) and remove
+what enabling registered: its channels, its tools, and its
 event types. Handlers subscribed to those event types are kept — they show as
 "(inactive)" in `list_event_handlers` and fire again when the integration is
 re-enabled. With `persist` (the default), the integration is recorded disabled so
@@ -337,8 +337,15 @@ function disable_integration!(assistant::AgentAssistant, name::AbstractString; p
         # Persist the transition before changing runtime state. If this write
         # fails, the source stays fully enabled and a restart agrees with it.
         persist && _persist_integration!(assistant, key, false, nothing)
-        pop!(assistant._integrations, key)
-        _disable_integration_locked!(assistant, key, state; persist = false)
+        try
+            _disable_integration_locked!(assistant, key, state; persist = false)
+            pop!(assistant._integrations, key)
+        catch
+            # If cooperative shutdown fails, keep durable and runtime state
+            # enabled. The supervisor is restored by the stop helper.
+            persist && _persist_integration!(assistant, key, true, nothing)
+            rethrow()
+        end
     end
     return nothing
 end

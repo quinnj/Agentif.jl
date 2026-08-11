@@ -69,6 +69,32 @@ const LEAKY_INVALID_SPEC = Claw.IntegrationSpec(
     "leaky-invalid", "LeakyPkg", "invalid source whose error contains its token", ["token" => "secret token"])
 Claw.register_integration!(LEAKY_INVALID_SPEC, LeakyInvalidSource)
 
+mutable struct SlowExitSource <: Claw.EventSource
+    entered::Threads.Atomic{Bool}
+    cleaned::Threads.Atomic{Bool}
+    stop_event::Base.Event
+end
+SlowExitSource() = SlowExitSource(
+    Threads.Atomic{Bool}(false), Threads.Atomic{Bool}(false), Base.Event())
+function Claw.start!(es::SlowExitSource, ::Claw.AgentAssistant)
+    return Threads.@spawn begin
+        es.entered[] = true
+        try
+            wait(es.stop_event)
+            sleep(0.25)
+        catch e
+            e isa InterruptException || rethrow()
+            sleep(0.25)
+        end
+        es.cleaned[] = true
+    end
+end
+Claw.stop!(es::SlowExitSource) = (notify(es.stop_event); nothing)
+
+const SLOW_EXIT_SPEC = Claw.IntegrationSpec(
+    "slow-exit", "SlowExitPkg", "source with observable asynchronous cleanup", [])
+Claw.register_integration!(SLOW_EXIT_SPEC, SlowExitSource)
+
 mutable struct BlockingEventSource <: Claw.EventSource
     stop_entered::Base.Event
     stop_release::Base.Event
@@ -222,6 +248,21 @@ end
         end
         st = lock(() -> get(a._integrations, "blocking", nothing), a._integrations_lock)
         st === nothing || (st.source.block_stop[] = false)
+        Claw.shutdown!(a; timeout_s = 5)
+    end
+end
+
+@testset "disable waits for source cleanup" begin
+    a = make_assistant()
+    a._state[] = :running
+    st = Claw.enable_integration!(a, "slow-exit")
+    try
+        @test timedwait(() -> st.source.entered[], 5.0) == :ok
+        Claw.disable_integration!(a, "slow-exit")
+        @test st.source.cleaned[]
+        @test st.supervised.task === nothing || istaskdone(st.supervised.task)
+    finally
+        notify(st.source.stop_event)
         Claw.shutdown!(a; timeout_s = 5)
     end
 end

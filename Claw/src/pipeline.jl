@@ -1052,9 +1052,10 @@ function _request_source_restart!(assistant::AgentAssistant, ss::SupervisedSourc
     end
     inner = ss.inner
     if inner !== nothing && !istaskdone(inner)
-        try
-            schedule(inner, InterruptException(); error = true)
-        catch
+        result = timedwait(() -> istaskdone(inner),
+            assistant.pipeline.source_stop_timeout_s; pollint = 0.05)
+        if result == :timed_out
+            @error "Claw: source did not stop; refusing to start a duplicate" source = ss.tag
         end
     end
     if ss.task === nothing || istaskdone(ss.task)
@@ -1129,11 +1130,13 @@ end
 """
     _stop_supervised_source!(assistant, ss)
 
-Stop one supervised source and drop it from supervision: no further restarts,
-`stop!` requested, its task interrupted.
+Stop one supervised source and drop it from supervision. `stop!` must make a
+task returned by `start!` finish within `source_stop_timeout_s`.
 """
 function _stop_supervised_source!(assistant::AgentAssistant, ss::SupervisedSource)
     ss.stopped[] = true
+    timeout = assistant.pipeline.source_stop_timeout_s
+    deadline = time() + timeout
     try
         stop!(ss.source)
     catch e
@@ -1141,9 +1144,18 @@ function _stop_supervised_source!(assistant::AgentAssistant, ss::SupervisedSourc
     end
     inner = ss.inner
     if inner !== nothing && !istaskdone(inner)
-        try
-            schedule(inner, InterruptException(); error = true)
-        catch
+        timedwait(() -> istaskdone(inner), max(0.0, deadline - time());
+            pollint = 0.05)
+    end
+    supervisor = ss.task
+    if supervisor !== nothing && !istaskdone(supervisor)
+        result = timedwait(() -> istaskdone(supervisor),
+            max(0.0, deadline - time()); pollint = 0.05)
+        if result == :timed_out
+            # The source is still live. Restore supervision so the integration
+            # remains internally consistent and can be disabled again later.
+            ss.stopped[] = false
+            error("Source '$(ss.tag)' did not stop within $timeout seconds.")
         end
     end
     lock(assistant._sources_lock) do
@@ -1173,13 +1185,6 @@ function _stop_sources!(assistant::AgentAssistant)
             stop!(ss.source)
         catch e
             @debug "Claw: source stop! failed during shutdown" source = ss.tag exception = (e,)
-        end
-        inner = ss.inner
-        if inner !== nothing && !istaskdone(inner)
-            try
-                schedule(inner, InterruptException(); error = true)
-            catch
-            end
         end
     end
     return nothing
