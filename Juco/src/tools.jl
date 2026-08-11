@@ -7,6 +7,17 @@
 
 const DEFAULT_BASH_TIMEOUT_S = 120
 const MAX_BASH_TIMEOUT_S = 600
+const MAX_BASH_LINE_CHARS = 2000
+
+# A single enormous line (a minified file, a dumped data structure) can eat the
+# whole 50KB output budget; cap lines the way grep output caps match lines.
+function cap_line_lengths(content::String; max_chars::Int = MAX_BASH_LINE_CHARS)
+    any(l -> length(l) > max_chars, eachsplit(content, '\n')) || return content
+    capped = map(split(content, '\n'; keepempty = true)) do line
+        length(line) > max_chars ? first(line, max_chars) * " …[line truncated]" : line
+    end
+    return join(capped, "\n")
+end
 
 # Keep the LAST max_lines/max_bytes of content (LLMTools only ships head
 # truncation; bash output wants the tail, where errors and results live).
@@ -79,7 +90,7 @@ Examples:
         bash(command::String, timeout::Union{Nothing, Int} = nothing) = begin
             timeout_s = clamp(something(timeout, DEFAULT_BASH_TIMEOUT_S), 1, MAX_BASH_TIMEOUT_S)
             output, exitcode, timedout = run_bash(base, command, timeout_s)
-            truncation = truncate_tail(output)
+            truncation = truncate_tail(cap_line_lengths(output))
             result = truncation.content
             if truncation.truncated
                 result = "[Output truncated: showing last $(truncation.output_lines) of $(truncation.total_lines) lines]\n" * result

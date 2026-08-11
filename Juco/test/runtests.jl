@@ -48,6 +48,11 @@ end
         result = bash.func("echo started; sleep 30 & disown", nothing)
         @test time() - t0 < 10
         @test occursin("started", result)
+        # a single giant line is capped instead of eating the whole byte budget
+        result = bash.func("printf 'x%.0s' {1..60000}; echo; echo done", nothing)
+        @test occursin("[line truncated]", result)
+        @test occursin("done", result)
+        @test length(result) < 5000
         # tail truncation keeps the END of output
         result = bash.func("seq 1 3000", nothing)
         @test occursin("[Output truncated: showing last 2000 of 3001 lines]", result)
