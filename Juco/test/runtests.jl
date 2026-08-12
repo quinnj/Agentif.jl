@@ -236,6 +236,12 @@ end
         @test occursin("unknown model", String(take!(buf)))
         Juco.handle_command(st, "/model codex gpt-5.3-codex", buf)
         @test st.mode == "codex" && st.model_id == "gpt-5.3-codex"
+        Juco.handle_command(st, "/model openrouter", buf)
+        @test st.mode == "openrouter"
+        @test st.model_id == Juco.MODE_DEFAULT_MODEL["openrouter"]
+        Juco.handle_command(st, "/model codex", buf)
+        @test st.mode == "codex"
+        @test st.model_id == Juco.MODE_DEFAULT_MODEL["codex"]
         # selection persists: a fresh state reloads it from the db
         st2 = Juco.ReplState(jdb, "other"; base_dir = dir)
         @test st2.mode == "codex" && st2.model_id == "gpt-5.3-codex"

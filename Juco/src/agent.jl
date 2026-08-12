@@ -313,7 +313,15 @@ function handle_command(st::ReplState, input::AbstractString, io::IO)
         if length(parts) == 1
             model_menu!(st, io)
         else
-            mode, mid = length(parts) >= 3 ? (String(parts[2]), String(parts[3])) : (st.mode, String(parts[2]))
+            length(parts) <= 3 || return println(io, red(io,
+                "usage: /model [mode] [model-id]"))
+            mode, mid = if length(parts) == 3
+                String(parts[2]), String(parts[3])
+            elseif parts[2] in MODEL_MODES
+                String(parts[2]), MODE_DEFAULT_MODEL[String(parts[2])]
+            else
+                st.mode, String(parts[2])
+            end
             mode in MODEL_MODES || return println(io, red(io, "unknown mode: $(mode) (expected $(join(MODEL_MODES, " or ")))"))
             getModel(mode_provider(mode), mid) === nothing && return println(io, red(io, "unknown model: $(mode)/$(mid)"))
             st.mode, st.model_id = mode, mid
