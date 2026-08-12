@@ -163,12 +163,7 @@ end
 # If the intended replacement already exists in the file, say so — the most
 # common cause of a not-found oldText is an edit that was already applied.
 function already_applied_hint(content::String, newText::String)
-    anchor = ""
-    for line in eachsplit(newText, '\n')
-        s = strip(line)
-        isempty(s) || (anchor = String(s); break)
-    end
-    (isempty(anchor) || !occursin(anchor, content)) && return ""
+    (isempty(newText) || !occursin(newText, content)) && return ""
     return " Note: the replacement text already appears in the file — this edit may already be applied."
 end
 

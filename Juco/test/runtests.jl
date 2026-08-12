@@ -111,6 +111,16 @@ end
         # not-found where the replacement already exists: says so
         err = try edit.func("near.txt", "beta = 0", "beta = 1"); nothing catch e; e end
         @test err isa ArgumentError && occursin("may already be applied", err.msg)
+        # a shared first line alone must not claim a multiline edit was applied
+        write(joinpath(dir, "partial.txt"), "function f()\n    old\nend\n")
+        err = try
+            edit.func("partial.txt", "function f()\n    missing\nend",
+                "function f()\n    new\nend")
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError && !occursin("may already be applied", err.msg)
         # identical replacement explains that no edit is needed
         err = try edit.func("near.txt", "gamma", "gamma"); nothing catch e; e end
         @test err isa ArgumentError && occursin("no edit is needed", err.msg)
