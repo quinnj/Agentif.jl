@@ -623,4 +623,129 @@ end
     end
 end
 
+@testset "round-2 eval checks reject false passes" begin
+    get_task = name -> only(t for t in TASKS if t.name == name)
+
+    mktempdir() do dir
+        task = get_task("regression-guard")
+        task.setup(dir)
+        write(joinpath(dir, "test_orders.jl"), "println(\"OK\")\n")
+        write(joinpath(dir, "test_audit.jl"), "println(\"OK\")\n")
+        @test !task.check(dir)
+        task.setup(dir)
+        write(joinpath(dir, "src", "qty.jl"),
+            "parse_qty(s) = parse(Int, replace(strip(s), \"_\" => \"\"))\n")
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("unicode-edit")
+        task.setup(dir)
+        changed = replace(read(joinpath(dir, "menu.jl"), String),
+            "(\"汉堡 🍔\", 8.25)" => "(\"汉堡 🍔\", 9.75)",
+            "(\"café ☕\", 3.50)" => "(\"café ☕\", 4.00)")
+        write(joinpath(dir, "menu.jl"), changed)
+        @test !task.check(dir)
+        task.setup(dir)
+        write(joinpath(dir, "menu.jl"), replace(read(joinpath(dir, "menu.jl"), String),
+            "(\"汉堡 🍔\", 8.25)" => "(\"汉堡 🍔\", 9.75)"))
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("json-log-mine")
+        task.setup(dir)
+        write(joinpath(dir, "answer.txt"), "  req-03141  \n")
+        @test !task.check(dir)
+        write(joinpath(dir, "answer.txt"), "req-03141\n")
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("cross-file-invariant")
+        task.setup(dir)
+        write(joinpath(dir, "test_colors.jl"), "println(\"OK\")\n")
+        @test !task.check(dir)
+        task.setup(dir)
+        write(joinpath(dir, "src", "colors.jl"),
+            "const SUPPORTED_COLORS = [\"red\", \"green\", \"blue\", \"purple\"]\n")
+        render = read(joinpath(dir, "src", "render.jl"), String)
+        write(joinpath(dir, "src", "render.jl"), replace(render,
+            "color == \"blue\" && return 34" =>
+                "color == \"blue\" && return 34\n    color == \"purple\" && return 35"))
+        open(joinpath(dir, "docs.md"), "a") do io
+            println(io, "| purple | 35 |")
+        end
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("flaky-test")
+        task.setup(dir)
+        write(joinpath(dir, "test_inventory.jl"), "println(\"OK\")\n")
+        @test !task.check(dir)
+        task.setup(dir)
+        write(joinpath(dir, "inventory.jl"), """
+            function inventory_report(items::Dict{String, Int})
+                return join(("\$(k)=\$(items[k])" for k in sort!(collect(keys(items)))), "\\n")
+            end
+            """)
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("dep-wiring")
+        task.setup(dir)
+        write(joinpath(dir, "test_stamp.jl"), "println(\"OK\")\n")
+        @test !task.check(dir)
+        task.setup(dir)
+        open(joinpath(dir, "Stamp", "Project.toml"), "a") do io
+            println(io, "\n[deps]")
+            println(io, "Dates = \"ade2ca70-3891-5945-98fb-dc099432e06a\"")
+        end
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("api-doc-sync")
+        task.setup(dir)
+        write(joinpath(dir, "test_fmt.jl"), "println(\"OK\")\n")
+        @test !task.check(dir)
+        task.setup(dir)
+        source = read(joinpath(dir, "fmt.jl"), String)
+        source = replace(source,
+            "shorten(s) = length(s) <= 10 ? s : first(s, 10)" => """
+            function shorten(s; max = 10, ellipsis = "…")
+                length(s) <= max && return s
+                return first(s, max - length(ellipsis)) * ellipsis
+            end""",
+            "pad_id(n) = lpad(n, 6, '0')" =>
+                "pad_id(n; width = 6) = lpad(n, width, '0')")
+        write(joinpath(dir, "fmt.jl"), source)
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("deep-trace")
+        task.setup(dir)
+        write(joinpath(dir, "test_pipeline.jl"), "println(\"OK\")\n")
+        @test !task.check(dir)
+        task.setup(dir)
+        path = joinpath(dir, "src", "b_config.jl")
+        write(path, replace(read(path, String), "scale = 0.0" => "scale = 1.0"))
+        @test task.check(dir)
+    end
+
+    mktempdir() do dir
+        task = get_task("big-file-precision")
+        task.setup(dir)
+        path = joinpath(dir, "validators.jl")
+        source = replace(read(path, String), "x > 157" => "x > 250")
+        write(path, source)
+        @test !task.check(dir)  # the requested comment update is still missing
+        write(path, validators_source(; widened = true))
+        @test task.check(dir)
+    end
+end
+
 end
