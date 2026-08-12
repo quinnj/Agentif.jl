@@ -20,18 +20,19 @@ function format_tool_call(name::AbstractString, arguments::AbstractString)
     end
     detail = if args isa AbstractDict
         if name == "bash"
-            replace(get(args, "command", ""), r"\s+" => " ")
+            replace(string(get(args, "command", "")), r"\s+" => " ")
         elseif name == "read"
-            path = get(args, "path", "")
+            path = string(get(args, "path", ""))
             offset = get(args, "offset", nothing)
             offset === nothing ? path : "$(path):$(offset)"
         elseif name == "edit"
-            path = get(args, "path", "")
-            isempty(get(args, "oldText", " ")) ? "$(path) (new file)" : path
+            path = string(get(args, "path", ""))
+            old_text = get(args, "oldText", " ")
+            old_text isa AbstractString && isempty(old_text) ? "$(path) (new file)" : path
         elseif name == "write"
-            get(args, "path", "")
+            string(get(args, "path", ""))
         elseif name == "remember"
-            "\"" * get(args, "content", "") * "\""
+            "\"" * string(get(args, "content", "")) * "\""
         else
             join((string(v) for v in values(args)), " ")
         end
@@ -50,7 +51,7 @@ function error_summary(result::Agentif.ToolResultMessage)
     text = join((b.text for b in result.content if b isa Agentif.TextContent), " ")
     msg = try
         parsed = JSON.parse(text)
-        parsed isa AbstractDict ? get(parsed, "message", text) : text
+        parsed isa AbstractDict ? string(get(parsed, "message", text)) : text
     catch
         text
     end

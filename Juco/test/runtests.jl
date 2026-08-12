@@ -188,6 +188,9 @@ end
     @test Juco.format_tool_call("edit", "{\"path\": \"a.jl\", \"oldText\": \"x\"}") == "▸ edit a.jl"
     @test Juco.format_tool_call("edit", "{\"path\": \"a.jl\", \"oldText\": \"\"}") == "▸ edit a.jl (new file)"
     @test Juco.format_tool_call("bash", "not json") == "▸ bash not json"
+    @test Juco.format_tool_call("bash", "{\"command\": 3}") == "▸ bash 3"
+    @test Juco.format_tool_call("edit", "{\"path\": 4, \"oldText\": null}") == "▸ edit 4"
+    @test Juco.format_tool_call("remember", "{\"content\": false}") == "▸ remember \"false\""
     long = Juco.format_tool_call("bash", JSON.json(Dict("command" => "x"^300)))
     @test length(long) < 120 && endswith(long, "…")
     @test Juco.format_duration(75) == "75ms"
@@ -202,6 +205,9 @@ end
     @test occursin("1.5k in (33% cached)", line)
     @test occursin("200 out", line)
     @test occursin("\$", line)
+    bad_message = Agentif.ToolResultMessage(call_id = "bad", name = "bash",
+        content = [Agentif.TextContent(text = "{\"message\": 7}")], is_error = true)
+    @test Juco.error_summary(bad_message) == "7"
 end
 
 @testset "display handler renders tool lines" begin
