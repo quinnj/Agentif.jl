@@ -37,7 +37,17 @@ function truncate_tail(content::String;
         pushfirst!(kept, lines[idx])
         bytes += line_bytes
     end
-    isempty(kept) && push!(kept, String(last(lines[total_lines], max_bytes)))
+    if isempty(kept)
+        line = lines[total_lines]
+        if max_bytes <= 0
+            push!(kept, "")
+        else
+            first_byte = max(1, ncodeunits(line) - max_bytes + 1)
+            start = thisind(line, first_byte)
+            start < first_byte && (start = nextind(line, start))
+            push!(kept, String(line[start:end]))
+        end
+    end
     return (content = join(kept, "\n"), truncated = true, output_lines = length(kept), total_lines = total_lines)
 end
 
@@ -134,7 +144,7 @@ end
 # Show the edited region (with numbered context lines) so the model can verify
 # the change without a follow-up read.
 function edited_region(new_content::String, replace_start::Int, new_text::String; context::Int = 3)
-    prefix = new_content[1:replace_start-1]
+    prefix = new_content[1:prevind(new_content, replace_start)]
     first_changed = count(==('\n'), prefix) + 1
     last_changed = first_changed + count(==('\n'), new_text)
     lines = split(new_content, "\n"; keepempty = true)

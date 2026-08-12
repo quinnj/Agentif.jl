@@ -90,7 +90,19 @@ end
         @test_throws ArgumentError edit.func("nope.txt", "a", "b")
         # identical replacement errors
         @test_throws ArgumentError edit.func("sub/new.txt", "line b", "line b")
+        # edited-region reporting must not byte-index before a match that follows UTF-8
+        write(joinpath(dir, "utf8.txt"), "cafétarget\n")
+        result = edit.func("utf8.txt", "target", "done")
+        @test read(joinpath(dir, "utf8.txt"), String) == "cafédone\n"
+        @test occursin("1 | cafédone", result)
     end
+end
+
+@testset "tail truncation byte limit" begin
+    result = Juco.truncate_tail("éé"; max_lines = 10, max_bytes = 3)
+    @test result.truncated
+    @test ncodeunits(result.content) <= 3
+    @test result.content == "é"
 end
 
 @testset "remember tool" begin
