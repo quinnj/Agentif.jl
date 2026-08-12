@@ -655,8 +655,8 @@ function openai_completions_event_callback(
                 detail isa AbstractDict || continue
                 text = get(detail, "text", nothing)
                 text isa AbstractString || continue
-                details_carried_text = true
                 text_str = String(text)
+                details_carried_text |= !isempty(text_str)
                 if startswith(text_str, reasoning_buffer)
                     if isempty(reasoning_buffer)
                         push!(new_text_parts, text_str)

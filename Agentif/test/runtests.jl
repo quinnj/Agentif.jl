@@ -3705,6 +3705,11 @@ end
                 reasoning_details = [Dict("type" => "reasoning.text", "text" => tok)]),
             finish_reason = nothing)])))
     end
+    # Details without usable text must not suppress the plain reasoning fallback.
+    push!(chunks, "data: " * JSON.json((; choices = [(; index = 0,
+        delta = (; reasoning = " fallback",
+            reasoning_details = [Dict("type" => "reasoning.text", "text" => "")]),
+        finish_reason = nothing)])))
     push!(chunks, "data: " * JSON.json((; choices = [(; index = 0,
         delta = (; content = "42"), finish_reason = nothing)])))
     push!(chunks, "data: " * JSON.json((; choices = [(; index = 0, delta = (;), finish_reason = "stop")])))
@@ -3733,8 +3738,42 @@ end
         end
         msg = state.messages[end]
         thinking = join((b.thinking for b in msg.content if b isa Agentif.ThinkingContent), "")
-        @test thinking == "Let me think"
-        @test join(reasoning_deltas, "") == "Let me think"
+        @test thinking == "Let me think fallback"
+        @test join(reasoning_deltas, "") == "Let me think fallback"
+        @test Agentif.message_text(msg) == "42"
+    finally
+        close(server)
+    end
+end
+
+@testset "openrouter non-streaming reasoning falls back from metadata-only details" begin
+    body = JSON.json((;
+        id = "chatcmpl-test", object = "chat.completion", created = 0,
+        model = "test-reasoning",
+        choices = [(; index = 0,
+            message = (; role = "assistant", content = "42", reasoning = "fallback",
+                reasoning_details = [Dict("type" => "reasoning.encrypted", "data" => "sig")]),
+            finish_reason = "stop")],
+        usage = (; prompt_tokens = 1, completion_tokens = 2, total_tokens = 3),
+    ))
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        return HTTP.Response(200, ["Content-Type" => "application/json"], body)
+    end
+    try
+        port = test_server_port(server)
+        model = Model(
+            id = "test-reasoning", name = "test-reasoning", api = "openai-completions",
+            provider = "openrouter", baseUrl = "http://127.0.0.1:$port", reasoning = true,
+            input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000, maxTokens = 4096,
+            compat = Dict{String, Any}("thinkingFormat" => "openrouter"),
+        )
+        agent = Agent(prompt = "p", model = model, apikey = "k")
+        state = stream(_ -> nothing, agent, AgentState(), "q", Abort(); stream = false)
+        msg = state.messages[end]
+        thinking = join((b.thinking for b in msg.content if b isa Agentif.ThinkingContent), "")
+        @test thinking == "fallback"
         @test Agentif.message_text(msg) == "42"
     finally
         close(server)

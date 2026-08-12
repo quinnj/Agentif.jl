@@ -752,7 +752,9 @@ function stream(
             # reasoning_details is canonical when present: providers (e.g.
             # OpenRouter) mirror the same text into the plain reasoning fields,
             # so appending both would duplicate the thinking content.
-            if choice.message.reasoning_details !== nothing
+            details_text = choice.message.reasoning_details === nothing ? "" :
+                openai_completions_reasoning_text(choice.message.reasoning_details)
+            if !isempty(details_text)
                 openai_completions_append_thinking_with_details!(assistant_message, choice.message.reasoning_details)
             else
                 reasoning_parts = String[]
