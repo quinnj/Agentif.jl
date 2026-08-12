@@ -33,6 +33,7 @@ LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}
 [compat]
 Agentif = "1"
 JSON = "1"
+LLMOAuth = "1"
 LLMProviders = "1"
 LLMTools = "1"
 LocalSearch = "0.1"
