@@ -27,10 +27,20 @@ end
 # ─── Persistent model selection ───
 
 function load_model_state(jdb::JucoDB)
-    mode = something(get_config(jdb, "model_mode"), "openrouter")
+    stored_mode = get_config(jdb, "model_mode")
+    stored_model = get_config(jdb, "model_id")
+    stored_reasoning = get_config(jdb, "reasoning")
+    mode = something(stored_mode, "openrouter")
     mode in MODEL_MODES || (mode = "openrouter")
-    model_id = something(get_config(jdb, "model_id"), MODE_DEFAULT_MODEL[mode])
-    reasoning = get_config(jdb, "reasoning")  # nothing = none
+    model_id = something(stored_model, MODE_DEFAULT_MODEL[mode])
+    getModel(mode_provider(mode), model_id) === nothing &&
+        (model_id = MODE_DEFAULT_MODEL[mode])
+    reasoning = stored_reasoning == "none" ? nothing : stored_reasoning
+    levels = reasoning_levels(mode, model_id)
+    reasoning === nothing || reasoning in levels || (reasoning = nothing)
+    if (mode, model_id, reasoning) != (stored_mode, stored_model, stored_reasoning)
+        save_model_state!(jdb, mode, model_id, reasoning)
+    end
     return mode, model_id, reasoning
 end
 
@@ -43,9 +53,10 @@ end
 
 # ─── Menus (TerminalMenus on a TTY, numbered fallback otherwise) ───
 
-function choose(io::IO, title::AbstractString, options::Vector{String}; default::Int = 1)
+function choose(io::IO, title::AbstractString, options::Vector{String}; default::Int = 1,
+        input::IO = stdin)
     isempty(options) && return nothing
-    if stdin isa Base.TTY && io === stdout
+    if input === stdin && input isa Base.TTY && io === stdout
         println(io, title)
         menu = TerminalMenus.RadioMenu(options; pagesize = min(12, length(options)))
         idx = TerminalMenus.request(menu; cursor = clamp(default, 1, length(options)))
@@ -56,31 +67,40 @@ function choose(io::IO, title::AbstractString, options::Vector{String}; default:
         println(io, "  $(i). $(o)")
     end
     print(io, "choice [$(default)]: ")
-    raw = strip(readline(stdin))
+    eof(input) && return nothing
+    raw = try
+        strip(readline(input))
+    catch e
+        e isa EOFError || rethrow()
+        return nothing
+    end
     isempty(raw) && return default
     n = tryparse(Int, raw)
     return (n === nothing || !(1 <= n <= length(options))) ? nothing : n
 end
 
 # The /model flow: mode -> model (with substring filter for huge lists) -> reasoning.
-function model_menu!(st, io::IO)
-    mode_i = choose(io, "Model mode:", MODEL_MODES; default = something(findfirst(==(st.mode), MODEL_MODES), 1))
+function model_menu!(st, io::IO; input::IO = stdin)
+    mode_i = choose(io, "Model mode:", MODEL_MODES;
+        default = something(findfirst(==(st.mode), MODEL_MODES), 1), input)
     mode_i === nothing && return println(io, dim(io, "cancelled"))
     mode = MODEL_MODES[mode_i]
     models = mode_models(mode)
     if length(models) > 30
         print(io, "filter (substring, empty for all): ")
-        pat = lowercase(strip(readline(stdin)))
+        eof(input) && return println(io, dim(io, "cancelled"))
+        pat = lowercase(strip(readline(input)))
         isempty(pat) || (models = filter(m -> occursin(pat, lowercase(m)), models))
         isempty(models) && return println(io, red(io, "no models match \"$(pat)\""))
     end
     default_model = something(findfirst(==(st.model_id), models), 1)
-    model_i = choose(io, "Model:", models; default = default_model)
+    model_i = choose(io, "Model:", models; default = default_model, input)
     model_i === nothing && return println(io, dim(io, "cancelled"))
     model_id = models[model_i]
     levels = reasoning_levels(mode, model_id)
     current_level = something(st.reasoning, "none")
-    level_i = choose(io, "Reasoning:", levels; default = something(findfirst(==(current_level), levels), 1))
+    level_i = choose(io, "Reasoning:", levels;
+        default = something(findfirst(==(current_level), levels), 1), input)
     level_i === nothing && return println(io, dim(io, "cancelled"))
     reasoning = levels[level_i] == "none" ? nothing : levels[level_i]
     st.mode, st.model_id, st.reasoning = mode, model_id, reasoning
@@ -97,11 +117,11 @@ session_age(updated_at::Real) = begin
 end
 
 # The /resume flow: pick a past session from a menu.
-function resume_menu!(st, io::IO)
+function resume_menu!(st, io::IO; input::IO = stdin)
     sessions = list_sessions(st.jdb; limit = 15)
     isempty(sessions) && return println(io, "No sessions to resume.")
     options = ["$(s.id)  ($(session_age(s.updated_at)))  $(first(s.title, 50))" for s in sessions]
-    i = choose(io, "Resume session:", options)
+    i = choose(io, "Resume session:", options; input)
     i === nothing && return println(io, dim(io, "cancelled"))
     st.session_id = sessions[i].id
     println(io, dim(io, "resumed $(st.session_id)"))

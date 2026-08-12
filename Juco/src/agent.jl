@@ -368,6 +368,15 @@ function locked_println(io::IO, io_lock::ReentrantLock, xs...)
     return nothing
 end
 
+function turn_error_summary(e)
+    first_line = first(split(sprint(showerror, e), '\n'))
+    if occursin("No stored Codex credentials", first_line) ||
+            occursin("Stored Codex credentials were rejected", first_line)
+        return "Codex login required: run `using LLMOAuth; LLMOAuth.codex_login()`"
+    end
+    return first_line
+end
+
 function wait_turn(turn::Task, abort::Agentif.Abort, io::IO;
         io_lock::ReentrantLock = ReentrantLock())
     while true
@@ -389,8 +398,7 @@ function wait_turn(turn::Task, abort::Agentif.Abort, io::IO;
             elseif e isa TaskFailedException
                 inner = root_task_exception(e)
                 inner isa InterruptException && return nothing
-                msg = sprint(showerror, inner)
-                locked_println(io, io_lock, red(io, "error: " * first(split(msg, '\n'))))
+                locked_println(io, io_lock, red(io, "error: " * turn_error_summary(inner)))
                 locked_println(io, io_lock, dim(io, "the session is intact — try again or rephrase"))
                 return nothing
             else

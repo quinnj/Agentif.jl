@@ -270,6 +270,25 @@ end
     @test Juco.reasoning_levels("openrouter", "not-a-model") == ["none"]
     @test occursin("ago", Juco.session_age(time() - 7200))
     @test Juco.session_age(time() - 10) == "just now"
+
+    mktempdir() do dir
+        jdb = Juco.opendb(joinpath(dir, "state.sqlite"))
+        Juco.set_config!(jdb, "model_mode", "removed-mode")
+        Juco.set_config!(jdb, "model_id", "removed-model")
+        Juco.set_config!(jdb, "reasoning", "extreme")
+        @test Juco.load_model_state(jdb) ==
+            ("openrouter", Juco.MODE_DEFAULT_MODEL["openrouter"], nothing)
+        @test Juco.get_config(jdb, "model_mode") == "openrouter"
+        @test Juco.get_config(jdb, "model_id") == Juco.MODE_DEFAULT_MODEL["openrouter"]
+        @test Juco.get_config(jdb, "reasoning") === nothing
+    end
+end
+
+@testset "non-TTY menu EOF cancels" begin
+    buf = IOBuffer()
+    @test Juco.choose(buf, "Pick:", ["one", "two"]; default = 2, input = IOBuffer("")) === nothing
+    @test Juco.choose(buf, "Pick:", ["one", "two"]; default = 2, input = IOBuffer("\n")) == 2
+    @test Juco.choose(buf, "Pick:", ["one", "two"]; input = IOBuffer("9\n")) === nothing
 end
 
 @testset "skills" begin
@@ -361,6 +380,10 @@ end
     output = String(take!(buf))
     @test occursin("error: root turn failure", output)
     @test !occursin("error: TaskFailedException", output)
+
+    no_login = @async error("No stored Codex credentials found")
+    @test Juco.wait_turn(no_login, Agentif.Abort(), buf) === nothing
+    @test occursin("LLMOAuth.codex_login()", String(take!(buf)))
 end
 
 @testset "terminal output shares one lock" begin
