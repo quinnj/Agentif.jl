@@ -2,6 +2,9 @@ using Test
 using JSON
 using Juco
 using Agentif
+using HTTP
+using LLMProviders
+using Sockets
 using SQLite
 
 include(joinpath(@__DIR__, "..", "eval", "env.jl"))
@@ -294,6 +297,29 @@ end
                 jdb, base_dir = missing, provider = "anthropic",
                 model_id = "claude-sonnet-4-5", apikey = "test")
             @test isempty(Juco.list_sessions(jdb))
+
+            server = HTTP.serve!("127.0.0.1", 0) do _
+                HTTP.Response(400, ["Content-Type" => "application/json"],
+                    JSON.json(Dict("error" => Dict("message" => "forced failure"))))
+            end
+            try
+                port = applicable(HTTP.port, server) && HTTP.port(server) != 0 ?
+                    HTTP.port(server) : Sockets.getsockname(server.listener.server)[2]
+                provider = "juco-failed-turn-test"
+                model_id = "failed-turn"
+                LLMProviders.registerModel!(LLMProviders.Model(;
+                    id = model_id, name = model_id, api = "openai-completions",
+                    provider, baseUrl = "http://127.0.0.1:$(port)", reasoning = false,
+                    input = ["text"], cost = Dict("input" => 0.0, "output" => 0.0,
+                        "cacheRead" => 0.0, "cacheWrite" => 0.0),
+                    contextWindow = 4096, maxTokens = 256,
+                ))
+                @test_throws Exception Juco.evaluate("hello";
+                    jdb, base_dir = dir, provider, model_id, apikey = "test")
+                @test isempty(Juco.list_sessions(jdb))
+            finally
+                close(server)
+            end
         end
     end
 end
