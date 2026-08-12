@@ -4,15 +4,14 @@
 #   julia --project=. Juco/eval/iterate.jl <label> [task ...]
 #
 # Transcripts + a results summary land in <transcript_root>/<label>/.
-using Dates
-
 include(joinpath(@__DIR__, "env.jl"))
 load_eval_env!()
 include(joinpath(@__DIR__, "run.jl"))
+include(joinpath(@__DIR__, "history.jl"))
 
 function iterate_main(args)
     isempty(args) && error("usage: iterate.jl <label> [task ...]")
-    label = args[1]
+    label = validate_eval_label(args[1])
     root = get(ENV, "JUCO_EVAL_DIR", joinpath(tempdir(), "juco-evals"))
     transcript_dir = joinpath(root, label)
     mkpath(transcript_dir)
@@ -29,25 +28,6 @@ function iterate_main(args)
     println("transcripts: ", transcript_dir)
     record_history(label, results)
     return results
-end
-
-# Append this run's aggregates to eval/HISTORY.md so the iteration record
-# lives in the repo, not in ephemeral terminal scrollback.
-function record_history(label::AbstractString, results)
-    passed = count(r -> r.passed, results)
-    calls = sum(r -> r.tool_calls, results; init = 0)
-    tin = sum(r -> r.tokens_in, results; init = 0)
-    tout = sum(r -> r.tokens_out, results; init = 0)
-    cached = sum(r -> get(r, :tokens_cached, 0), results; init = 0)
-    secs = round(sum(r -> r.seconds, results; init = 0.0); digits = 1)
-    path = joinpath(@__DIR__, "HISTORY.md")
-    fresh = !isfile(path)
-    open(path, "a") do io
-        fresh && println(io, "# Eval run history\n\n| when | label | pass | calls | tokens in (cached) | tokens out | s |\n|---|---|---|---|---|---|---|")
-        ts = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM")
-        println(io, "| $(ts) | $(label) | $(passed)/$(length(results)) | $(calls) | $(round(Int, tin / 1000))k ($(round(Int, cached / 1000))k) | $(round(Int, tout / 1000))k | $(secs) |")
-    end
-    return nothing
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

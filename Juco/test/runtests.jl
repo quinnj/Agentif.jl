@@ -9,6 +9,7 @@ using SQLite
 
 include(joinpath(@__DIR__, "..", "eval", "env.jl"))
 include(joinpath(@__DIR__, "..", "eval", "tasks.jl"))
+include(joinpath(@__DIR__, "..", "eval", "history.jl"))
 
 @testset "Juco" begin
 
@@ -491,6 +492,28 @@ end
         @test ENV["JUCO_MODEL"] == "deepseek/deepseek-v4-flash-0731"
         @test ENV["JUCO_REASONING"] == "medium"
         @test ENV["JUCO_OPENROUTER_ORDER"] == "siliconflow/fp8"
+    end
+end
+
+@testset "eval history labels and rows" begin
+    @test validate_eval_label("r2-final_a.1") == "r2-final_a.1"
+    for label in ("", "../outside", "/tmp/outside", "bad|row", "bad\nrow", "two words")
+        @test_throws ArgumentError validate_eval_label(label)
+    end
+    mktempdir() do dir
+        path = joinpath(dir, "HISTORY.md")
+        results = [
+            (; passed = true, tool_calls = 2, tokens_in = 1500, tokens_out = 700,
+                tokens_cached = 500, seconds = 1.25),
+            (; passed = false, tool_calls = 3, tokens_in = 500, tokens_out = 300,
+                tokens_cached = 0, seconds = 2.25),
+        ]
+        record_history("r2-test", results; path)
+        record_history("r2-test-2", results; path)
+        text = read(path, String)
+        @test count("# Eval run history", text) == 1
+        @test occursin("| r2-test | 1/2 | 5 | 2k (0k) | 1k | 3.5 |", text)
+        @test occursin("| r2-test-2 | 1/2 | 5 | 2k (0k) | 1k | 3.5 |", text)
     end
 end
 
