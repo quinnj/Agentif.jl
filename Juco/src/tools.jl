@@ -8,6 +8,34 @@
 const DEFAULT_BASH_TIMEOUT_S = 120
 const MAX_BASH_TIMEOUT_S = 600
 const MAX_BASH_LINE_CHARS = 2000
+const MAX_BASH_OUTPUT_BYTES = 16 * 1024
+const BASH_HEAD_LINES = 10
+
+# Large outputs are sampled instead of tail-truncated wholesale: keep the first
+# few lines (schema/first records) plus the tail (recent output, errors), with
+# an explicit skip marker teaching the model to slice next time. A truncated
+# result would otherwise ride along in the context of every later turn.
+function sample_output(output::String; max_bytes::Int = MAX_BASH_OUTPUT_BYTES, head_lines::Int = BASH_HEAD_LINES)
+    ncodeunits(output) <= max_bytes && return output, false
+    lines = split(output, '\n'; keepempty = true)
+    total_lines = length(lines)
+    # keep whole head lines while under a quarter of the budget
+    head_budget = max_bytes ÷ 4
+    kept = String[]
+    bytes = 0
+    for l in first(lines, head_lines)
+        lb = ncodeunits(l) + (isempty(kept) ? 0 : 1)
+        bytes + lb > head_budget && break
+        push!(kept, String(l))
+        bytes += lb
+    end
+    head = join(kept, "\n")
+    tail_budget = max(1024, max_bytes - ncodeunits(head))
+    tail = truncate_tail(output; max_lines = typemax(Int) ÷ 2, max_bytes = tail_budget)
+    skipped = total_lines - length(kept) - tail.output_lines
+    marker = "\n…[skipped $(max(skipped, 0)) of $(total_lines) lines ($(round(Int, ncodeunits(output) / 1024))KB total) — for large outputs, slice with rg/head/awk instead of dumping them]\n"
+    return head * marker * tail.content, true
+end
 
 # A single enormous line (a minified file, a dumped data structure) can eat the
 # whole 50KB output budget; cap lines the way grep output caps match lines.
@@ -92,7 +120,7 @@ Arguments:
 - command (String, required): The bash command to execute.
 - timeout (Int, optional): Seconds before the command is killed. Default 120, max 600.
 
-Output is truncated to the LAST 2000 lines or 50KB, whichever is hit first.
+Output over 16KB is sampled (first lines + tail, middle skipped) — slice large outputs with rg/head/awk instead of dumping whole files.
 
 Examples:
 - `bash("rg -n 'function parse' src/")` — search code
@@ -100,11 +128,7 @@ Examples:
         bash(command::String, timeout::Union{Nothing, Int} = nothing) = begin
             timeout_s = clamp(something(timeout, DEFAULT_BASH_TIMEOUT_S), 1, MAX_BASH_TIMEOUT_S)
             output, exitcode, timedout = run_bash(base, command, timeout_s)
-            truncation = truncate_tail(cap_line_lengths(output))
-            result = truncation.content
-            if truncation.truncated
-                result = "[Output truncated: showing last $(truncation.output_lines) of $(truncation.total_lines) lines]\n" * result
-            end
+            result, was_sampled = sample_output(cap_line_lengths(output))
             timedout && (result *= "\n[Command timed out after $(timeout_s)s and was killed]")
             !timedout && exitcode != 0 && (result *= "\n[exit code $(exitcode)]")
             return result

@@ -60,11 +60,14 @@ end
         @test occursin("[line truncated]", result)
         @test occursin("done", result)
         @test length(result) < 5000
-        # tail truncation keeps the END of output
-        result = bash.func("seq 1 3000", nothing)
-        @test occursin("[Output truncated: showing last 2000 of 3001 lines]", result)
-        @test occursin("3000", result)
-        @test !occursin("\n500\n", result)
+        # large outputs are sampled: head + skip marker + tail
+        result = bash.func("seq 1 5000", nothing)
+        @test occursin("…[skipped", result)
+        @test occursin("slice with rg/head/awk", result)
+        @test startswith(result, "1\n2\n")      # head preserved
+        @test occursin("\n5000", result)        # tail preserved
+        @test !occursin("\n1000\n", result)     # middle skipped
+        @test ncodeunits(result) < 20 * 1024
     end
 end
 
