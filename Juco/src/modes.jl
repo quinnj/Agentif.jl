@@ -55,13 +55,43 @@ end
 
 # ─── Menus (TerminalMenus on a TTY, numbered fallback otherwise) ───
 
+# TerminalMenus writes its initial frame without flushing. Some terminal
+# emulators therefore do not show the choices until the first key press.
+struct FlushingIO <: IO
+    io::IO
+end
+
+Base.isopen(io::FlushingIO) = isopen(io.io)
+Base.displaysize(io::FlushingIO) = displaysize(io.io)
+Base.get(io::FlushingIO, key, default) = get(io.io, key, default)
+Base.flush(io::FlushingIO) = flush(io.io)
+
+function Base.unsafe_write(io::FlushingIO, data::Ptr{UInt8}, n::UInt)
+    written = unsafe_write(io.io, data, n)
+    flush(io.io)
+    return written
+end
+
+function Base.write(io::FlushingIO, byte::UInt8)
+    written = write(io.io, byte)
+    flush(io.io)
+    return written
+end
+
+function flushing_terminal()
+    term = TerminalMenus.default_terminal()
+    return REPL.Terminals.TTYTerminal(
+        term.term_type, term.in_stream, FlushingIO(term.out_stream), term.err_stream)
+end
+
 function choose(io::IO, title::AbstractString, options::Vector{String}; default::Int = 1,
         input::IO = stdin)
     isempty(options) && return nothing
     if input === stdin && input isa Base.TTY && io === stdout
-        println(io, title)
         menu = TerminalMenus.RadioMenu(options; pagesize = min(12, length(options)))
-        idx = TerminalMenus.request(menu; cursor = clamp(default, 1, length(options)))
+        term = flushing_terminal()
+        idx = TerminalMenus.request(term, String(title), menu;
+            cursor = clamp(default, 1, length(options)))
         return idx == -1 ? nothing : idx
     end
     println(io, title)

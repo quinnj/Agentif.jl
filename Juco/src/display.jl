@@ -10,6 +10,42 @@ green(io::IO, s) = use_color(io) ? "\e[32m$(s)\e[0m" : String(s)
 yellow(io::IO, s) = use_color(io) ? "\e[33m$(s)\e[0m" : String(s)
 bold(io::IO, s) = use_color(io) ? "\e[1m$(s)\e[22m" : String(s)
 
+# Provider reasoning streams use arbitrary chunk and whitespace boundaries.
+# Reflow them as terminal prose while preserving real paragraph breaks.
+mutable struct ReasoningDisplayState
+    started::Bool
+    pending_space::Bool
+    pending_newlines::Int
+end
+
+ReasoningDisplayState() = ReasoningDisplayState(false, false, 0)
+
+function reset_reasoning!(state::ReasoningDisplayState)
+    state.started = false
+    state.pending_space = false
+    state.pending_newlines = 0
+    return nothing
+end
+
+function reflow_reasoning!(state::ReasoningDisplayState, delta::AbstractString)
+    buf = IOBuffer()
+    for char in delta
+        if isspace(char)
+            state.pending_space = true
+            char == '\n' && (state.pending_newlines += 1)
+            continue
+        end
+        if state.pending_space && state.started
+            state.pending_newlines >= 2 ? print(buf, "\n  ") : print(buf, ' ')
+        end
+        state.pending_space = false
+        state.pending_newlines = 0
+        state.started = true
+        print(buf, char)
+    end
+    return String(take!(buf))
+end
+
 # One-line preview of a bash result so the user can scan without expanding:
 # the first non-empty line of output.
 function result_preview(result::Agentif.ToolResultMessage)
@@ -141,6 +177,7 @@ function display_handler(io::IO; show_tools::Bool = true, show_reasoning::Bool =
         show_previews::Bool = true, io_lock::ReentrantLock = ReentrantLock())
     open_call_id = Ref{Union{Nothing, String}}(nothing)  # call whose ▸ line is still open
     reasoning_open = Ref(false)
+    reasoning_state = ReasoningDisplayState()
     waiting_open = Ref(false)  # "…" placeholder shown while the model is silent
     finish_open_line() = begin
         open_call_id[] === nothing || print(io, "\n")
@@ -149,6 +186,7 @@ function display_handler(io::IO; show_tools::Bool = true, show_reasoning::Bool =
     finish_reasoning() = begin
         reasoning_open[] && print(io, "\n\n")
         reasoning_open[] = false
+        reset_reasoning!(reasoning_state)
     end
     clear_waiting() = begin
         # erase the placeholder line so real output takes its place
@@ -203,9 +241,12 @@ function display_handler(io::IO; show_tools::Bool = true, show_reasoning::Bool =
             elseif event isa Agentif.MessageUpdateEvent && event.kind == :reasoning && show_reasoning
                 clear_waiting()
                 finish_open_line()
-                reasoning_open[] || print(io, dim(io, "· "))
-                reasoning_open[] = true
-                print(io, dim(io, replace(event.delta, "\n\n" => "\n", '\n' => "\n  ")))
+                rendered = reflow_reasoning!(reasoning_state, event.delta)
+                if !isempty(rendered)
+                    reasoning_open[] || print(io, dim(io, "· "))
+                    reasoning_open[] = true
+                    print(io, dim(io, rendered))
+                end
                 flush(io)
             elseif event isa Agentif.MessageUpdateEvent && event.kind == :text
                 # text is buffered by the channel and rendered at message end;

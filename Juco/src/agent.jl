@@ -227,23 +227,11 @@ function _evaluate(input::AbstractString;
         on_event === nothing || on_event(event)
         return nothing
     end
-    # Reasoning config shape differs per API: OpenRouter-style models take
-    # {"reasoning": {"effort": ...}}, codex takes a plain reasoning string, and
-    # native OpenAI reasoning models take reasoning_effort.
-    is_openrouter = agent.model.compat !== nothing &&
-        get(agent.model.compat, "thinkingFormat", "") == "openrouter"
-    eval_kw = if reasoning_effort === nothing
-        (;)
-    elseif is_openrouter
-        (; reasoning = Dict("effort" => reasoning_effort))
-    elseif agent.model.api == "openai-codex"
-        (; reasoning = reasoning_effort)
-    else
-        (; reasoning_effort)
-    end
+    eval_kw = reasoning_options(agent.model, reasoning_effort)
+    is_openrouter = agent.model.provider == "openrouter"
     is_openrouter && (eval_kw = merge(eval_kw, (; provider = openrouter_provider_prefs())))
     # codex manages its own sampling; other completions APIs take a temperature pin
-    temperature !== nothing && agent.model.api != "openai-codex" &&
+    temperature !== nothing && agent.model.provider != "openai-codex" &&
         (eval_kw = merge(eval_kw, (; temperature = Float64(temperature))))
     t0 = time()
     state = Agentif.evaluate(handler, agent, String(input);
@@ -258,6 +246,17 @@ function _evaluate(input::AbstractString;
     end
     return (; state, session_id = sid, tool_calls = tool_calls[],
         aborted = Agentif.isaborted(abort), ctx_pct)
+end
+
+# OpenRouter enables some reasoning models by default. An omitted setting does
+# not mean "none", so send the user's disabled selection explicitly.
+function reasoning_options(model, reasoning_effort::Union{Nothing, AbstractString})
+    if model.provider == "openrouter" && model.reasoning
+        return (; reasoning = Dict("effort" => something(reasoning_effort, "none")))
+    elseif reasoning_effort === nothing
+        return (;)
+    end
+    return (; reasoning_effort = String(reasoning_effort))
 end
 
 # Estimated share of the model's context window occupied by the conversation.
@@ -485,7 +484,11 @@ function wait_turn(turn::Task, abort::Agentif.Abort, io::IO;
     end
 end
 
-function run_turn(st::ReplState, input::String, io::IO; steering::Bool = stdin isa Base.TTY, kw...)
+function run_turn(st::ReplState, input::String, io::IO;
+        steering::Bool = stdin isa Base.TTY,
+        evaluator::Function = evaluate,
+        kw...,
+    )
     expanded, used = expand_skills(input, st.skills)
     isempty(used) || println(io, dim(io, "⚡ skills: " * join(used, ", ")))
     abort = Agentif.Abort()
@@ -506,7 +509,8 @@ function run_turn(st::ReplState, input::String, io::IO; steering::Bool = stdin i
             reserve_tokens = max(cw - 1_000, 1_000), keep_recent_tokens = 2_000))
     end
     t0 = time()
-    turn = @async evaluate(expanded; jdb = st.jdb, session_id = st.session_id,
+    turn = @async evaluator(expanded; jdb = st.jdb, session_id = st.session_id,
+        base_dir = st.base_dir,
         provider = mode_provider(st.mode), model_id = st.model_id,
         apikey = mode_apikey(st.mode), reasoning_effort = st.reasoning,
         io, show_usage = true, abort, steer, on_steer, io_lock, extra_kw..., kw...)

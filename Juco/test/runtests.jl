@@ -1,5 +1,6 @@
 using Test
 using JSON
+import REPL
 using Juco
 using Agentif
 using HTTP
@@ -240,6 +241,22 @@ end
     @test Juco.error_summary(bad_message) == "7"
 end
 
+@testset "reasoning display reflows provider whitespace" begin
+    state = Juco.ReasoningDisplayState()
+    rendered = join((
+        Juco.reflow_reasoning!(state, "The\n   tool\n"),
+        Juco.reflow_reasoning!(state, "   is\n   ready."),
+    ))
+    @test rendered == "The tool is ready."
+    Juco.reset_reasoning!(state)
+    @test Juco.reflow_reasoning!(state, "First paragraph.\n\nSecond paragraph.") ==
+        "First paragraph.\n  Second paragraph."
+end
+
+@testset "interactive terminal" begin
+    @test Juco.flushing_terminal() isa REPL.Terminals.TTYTerminal
+end
+
 @testset "display previews and diffs" begin
     result = Agentif.ToolResultMessage(call_id = "c", name = "bash",
         content = [Agentif.TextContent(text = "\n  first real line\nsecond")], is_error = false)
@@ -269,6 +286,23 @@ end
         Juco.note_turn_result!(st, (; state, ctx_pct = 37), model)
         @test st.last_answer == "the answer"
         @test st.last_ctx_pct == 37
+    end
+end
+
+@testset "repl turn uses configured working directory" begin
+    mktempdir() do dir
+        jdb = Juco.opendb(joinpath(dir, "t.sqlite"))
+        st = Juco.ReplState(jdb, "s"; base_dir = dir)
+        st.mode = "codex"
+        st.model_id = Juco.MODE_DEFAULT_MODEL["codex"]
+        captured_dir = Ref("")
+        evaluator = function (input; base_dir, kw...)
+            captured_dir[] = base_dir
+            return (; state = Agentif.AgentState(), ctx_pct = 0)
+        end
+        Juco.run_turn(st, "inspect the checkout", IOBuffer();
+            steering = false, evaluator)
+        @test captured_dir[] == abspath(dir)
     end
 end
 
@@ -693,6 +727,10 @@ end
     prompt = Juco.build_prompt(pwd(), :juco; memories = ["user likes short names"])
     @test occursin("user likes short names", prompt)
     @test occursin("Working directory: $(abspath(pwd()))", prompt)
+    @test occursin("current branch diff from its merge base", prompt)
+    @test occursin("Do not repeat a search", prompt)
+    @test occursin("Do not restate the task or narrate routine tool choices", prompt)
+    @test occursin("For read-only tasks, do not edit files, install tools", prompt)
     bare = Juco.build_prompt(pwd(), :bash)
     @test !occursin("Memories", bare)
     @test occursin("your only tool", bare)
@@ -710,6 +748,18 @@ end
         p = Juco.build_prompt(dir, :juco)
         @test occursin("more entries)", p)
     end
+end
+
+@testset "reasoning request options" begin
+    openrouter_model = Agentif.getModel("openrouter", "deepseek/deepseek-v4-flash-0731")
+    @test Juco.reasoning_options(openrouter_model, nothing).reasoning ==
+        Dict("effort" => "none")
+    @test Juco.reasoning_options(openrouter_model, "high").reasoning ==
+        Dict("effort" => "high")
+
+    codex_model = Agentif.getModel("openai-codex", Juco.MODE_DEFAULT_MODEL["codex"])
+    @test isempty(Juco.reasoning_options(codex_model, nothing))
+    @test Juco.reasoning_options(codex_model, "high").reasoning_effort == "high"
 end
 
 @testset "performance eval is bounded and discriminating" begin

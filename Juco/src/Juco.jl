@@ -15,6 +15,7 @@ module Juco
 using Dates
 using JSON
 using Markdown
+import REPL
 using REPL.TerminalMenus
 using Agentif
 using LLMTools

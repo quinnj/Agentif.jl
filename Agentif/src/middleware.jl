@@ -100,7 +100,10 @@ function evaluate_middleware(agent_handler::AgentHandler)
             if e isa CapturedException && e.ex isa AbortEvaluation
                 return result_state === nothing ? state : result_state
             end
-            @error "Agent evaluate failed" evaluate_id model = agent.model.id exception = (e, catch_backtrace())
+            if e isa InterruptException || (e isa CapturedException && e.ex isa InterruptException)
+                rethrow()
+            end
+            @debug "Agent evaluate failed" evaluate_id model = agent.model.id exception = (e, catch_backtrace())
             rethrow()
         finally
             if result_state !== nothing

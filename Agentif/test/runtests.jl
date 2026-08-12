@@ -88,6 +88,29 @@ function test_force_close_stream(http)
     error("Unable to find the test server stream transport")
 end
 
+@testset "evaluate interruption is not logged as a failure" begin
+    interrupted_handler = Agentif.evaluate_middleware(
+        (f, agent, state, input, abort; kw...) -> throw(InterruptException()))
+    logger = Test.TestLogger(; min_level = Logging.Error)
+    @test_throws InterruptException Logging.with_logger(logger) do
+        interrupted_handler(_ -> nothing, make_agent(), AgentState(), "stop", Abort())
+    end
+    @test isempty(logger.logs)
+end
+
+@testset "evaluate failures log only at debug level" begin
+    failed_handler = Agentif.evaluate_middleware(
+        (f, agent, state, input, abort; kw...) -> error("expected failure"))
+    logger = Test.TestLogger(; min_level = Logging.Debug)
+    @test_throws ErrorException Logging.with_logger(logger) do
+        failed_handler(_ -> nothing, make_agent(), AgentState(), "fail", Abort())
+    end
+    failure_logs = filter(log -> log.message == "Agent evaluate failed", logger.logs)
+    @test length(failure_logs) == 1
+    @test only(failure_logs).level == Logging.Debug
+    @test all(log -> log.level < Logging.Error, logger.logs)
+end
+
 function fake_jwt(payload::AbstractDict)
     encoded = Base64.base64encode(JSON.json(payload))
     encoded = replace(encoded, '+' => '-', '/' => '_')
