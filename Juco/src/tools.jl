@@ -11,16 +11,39 @@ const MAX_BASH_LINE_CHARS = 2000
 const MAX_BASH_OUTPUT_BYTES = 16 * 1024
 const BASH_HEAD_LINES = 10
 
+function byte_prefix(content::String, max_bytes::Int)
+    max_bytes <= 0 && return ""
+    ncodeunits(content) <= max_bytes && return content
+    io = IOBuffer()
+    bytes = 0
+    for char in content
+        char_bytes = ncodeunits(string(char))
+        bytes + char_bytes > max_bytes && break
+        print(io, char)
+        bytes += char_bytes
+    end
+    return String(take!(io))
+end
+
 # Large outputs are sampled instead of tail-truncated wholesale: keep the first
 # few lines (schema/first records) plus the tail (recent output, errors), with
 # an explicit skip marker teaching the model to slice next time. A truncated
 # result would otherwise ride along in the context of every later turn.
 function sample_output(output::String; max_bytes::Int = MAX_BASH_OUTPUT_BYTES, head_lines::Int = BASH_HEAD_LINES)
+    max_bytes >= 0 || throw(ArgumentError("max_bytes must be nonnegative"))
+    head_lines >= 0 || throw(ArgumentError("head_lines must be nonnegative"))
     ncodeunits(output) <= max_bytes && return output, false
     lines = split(output, '\n'; keepempty = true)
     total_lines = length(lines)
+    marker_for(skipped) = "\n…[skipped $(skipped) of $(total_lines) lines ($(round(Int, ncodeunits(output) / 1024))KB total) — for large outputs, slice with rg/head/awk instead of dumping them]\n"
+    # Reserve the largest possible marker first. The actual skipped count has
+    # no more digits, so the final result cannot exceed max_bytes.
+    marker_reserve = marker_for(total_lines)
+    if ncodeunits(marker_reserve) > max_bytes
+        return byte_prefix("…[sampled output]", max_bytes), true
+    end
     # keep whole head lines while under a quarter of the budget
-    head_budget = max_bytes ÷ 4
+    head_budget = min(max_bytes ÷ 4, max_bytes - ncodeunits(marker_reserve))
     kept = String[]
     bytes = 0
     for l in first(lines, head_lines)
@@ -30,10 +53,10 @@ function sample_output(output::String; max_bytes::Int = MAX_BASH_OUTPUT_BYTES, h
         bytes += lb
     end
     head = join(kept, "\n")
-    tail_budget = max(1024, max_bytes - ncodeunits(head))
+    tail_budget = max_bytes - ncodeunits(head) - ncodeunits(marker_reserve)
     tail = truncate_tail(output; max_lines = typemax(Int) ÷ 2, max_bytes = tail_budget)
     skipped = total_lines - length(kept) - tail.output_lines
-    marker = "\n…[skipped $(max(skipped, 0)) of $(total_lines) lines ($(round(Int, ncodeunits(output) / 1024))KB total) — for large outputs, slice with rg/head/awk instead of dumping them]\n"
+    marker = marker_for(max(skipped, 0))
     return head * marker * tail.content, true
 end
 
@@ -128,9 +151,10 @@ Examples:
         bash(command::String, timeout::Union{Nothing, Int} = nothing) = begin
             timeout_s = clamp(something(timeout, DEFAULT_BASH_TIMEOUT_S), 1, MAX_BASH_TIMEOUT_S)
             output, exitcode, timedout = run_bash(base, command, timeout_s)
-            result, was_sampled = sample_output(cap_line_lengths(output))
-            timedout && (result *= "\n[Command timed out after $(timeout_s)s and was killed]")
-            !timedout && exitcode != 0 && (result *= "\n[exit code $(exitcode)]")
+            output = cap_line_lengths(output)
+            timedout && (output *= "\n[Command timed out after $(timeout_s)s and was killed]")
+            !timedout && exitcode != 0 && (output *= "\n[exit code $(exitcode)]")
+            result, was_sampled = sample_output(output)
             return result
         end,
     )

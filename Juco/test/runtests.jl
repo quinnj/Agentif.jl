@@ -67,7 +67,16 @@ end
         @test startswith(result, "1\n2\n")      # head preserved
         @test occursin("\n5000", result)        # tail preserved
         @test !occursin("\n1000\n", result)     # middle skipped
-        @test ncodeunits(result) < 20 * 1024
+        @test ncodeunits(result) <= Juco.MAX_BASH_OUTPUT_BYTES
+        # the byte budget includes the marker and command-status suffix
+        result = bash.func("seq 1 5000; exit 3", nothing)
+        @test occursin("[exit code 3]", result)
+        @test ncodeunits(result) <= Juco.MAX_BASH_OUTPUT_BYTES
+        # sampling remains valid UTF-8 and within custom byte budgets
+        sampled, truncated = Juco.sample_output(repeat("🙂\n", 1000);
+            max_bytes = 1024, head_lines = 3)
+        @test truncated && isvalid(sampled)
+        @test ncodeunits(sampled) <= 1024
     end
 end
 
