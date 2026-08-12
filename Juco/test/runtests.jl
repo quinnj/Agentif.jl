@@ -407,6 +407,9 @@ end
     @test_throws ArgumentError Juco.parse_cli_args(["--db"])
     @test_throws ArgumentError Juco.parse_cli_args(["--prompt"])
     @test_throws ArgumentError Juco.parse_cli_args(["--preset", "unknown"])
+    escaped = Juco.shell_project_argument("/tmp/a b'c")
+    @test read(`sh -c "set -- $escaped; printf %s \"\$1\""`, String) ==
+        "--project=/tmp/a b'c"
 end
 
 @testset "skills" begin

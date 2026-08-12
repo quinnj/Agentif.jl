@@ -559,6 +559,9 @@ function print_sessions(db_path::AbstractString)
     end
 end
 
+shell_project_argument(project::AbstractString) =
+    Base.shell_escape_posixly("--project=$(project)")
+
 """
     Juco.install_cli(; dir = joinpath(homedir(), ".local", "bin"))
 
@@ -571,7 +574,7 @@ function install_cli(; dir::AbstractString = joinpath(homedir(), ".local", "bin"
     path = joinpath(dir, "juco")
     write(path, """
         #!/bin/sh
-        exec julia --project=$(project) --startup-file=no -e 'using Juco; Juco.main(ARGS)' -- "\$@"
+        exec julia $(shell_project_argument(project)) --startup-file=no -e 'using Juco; Juco.main(ARGS)' -- "\$@"
         """)
     chmod(path, 0o755)
     occursin(abspath(dir), get(ENV, "PATH", "")) ||
