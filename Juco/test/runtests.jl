@@ -286,6 +286,18 @@ end
     end
 end
 
+@testset "failed evaluation setup does not create a session" begin
+    mktempdir() do dir
+        Juco.with_jdb(joinpath(dir, "failed-setup.sqlite")) do jdb
+            missing = joinpath(dir, "missing")
+            @test_throws ArgumentError Juco.evaluate("hello";
+                jdb, base_dir = missing, provider = "anthropic",
+                model_id = "claude-sonnet-4-5", apikey = "test")
+            @test isempty(Juco.list_sessions(jdb))
+        end
+    end
+end
+
 @testset "eval environment" begin
     withenv("OPENROUTER_API_KEY" => nothing) do
         @test_throws ArgumentError load_eval_env!()

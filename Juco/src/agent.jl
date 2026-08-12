@@ -196,8 +196,8 @@ function _evaluate(input::AbstractString;
         kw...,
     )
     sid = session_id === nothing ? "juco-" * string(Agentif.UID8()) : String(session_id)
-    touch_session!(jdb, sid; title = first(String(input), 80), cwd = abspath(base_dir))
     agent = build_agent(; base_dir, jdb, kw...)
+    touch_session!(jdb, sid; title = first(String(input), 80), cwd = abspath(base_dir))
     ch = TerminalChannel(sid, io; io_lock)
     # tool executions run on concurrent tasks, so the counter must be atomic
     tool_calls = Threads.Atomic{Int}(0)
