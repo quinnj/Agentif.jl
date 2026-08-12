@@ -45,6 +45,7 @@ Guidelines:
 - Explore before editing; verify your changes (run tests or the code) before declaring success.
 - Keep edits surgical: change only what the task requires.
 - Julia: to extend an existing generic function (push!, pop!, peek, length, isempty, iterate, show, ...) for your own type, define a method on it — `Base.f(x::YourType) = ...` — never a new function or export of the same name.
+- Julia: locals and keyword arguments shadow functions — naming one `max`, `min`, `length`, or `first` breaks calls to that function in the same body (use a different name or qualify `Base.max`).
 - Be concise. When done, summarize what changed in a sentence or two.
 
 Working directory: $(abspath(base_dir))

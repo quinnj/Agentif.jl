@@ -3,6 +3,8 @@
 default_provider() = get(ENV, "JUCO_MODEL_PROVIDER", "anthropic")
 default_model() = get(ENV, "JUCO_MODEL", "claude-sonnet-4-5")
 default_reasoning() = let v = get(ENV, "JUCO_REASONING", ""); isempty(v) ? nothing : v end
+# Coding agents want low-variance sampling; JUCO_TEMPERATURE="" disables the pin.
+default_temperature() = tryparse(Float64, get(ENV, "JUCO_TEMPERATURE", "0.2"))
 const DEFAULT_MAX_TURNS = 50
 
 # OpenRouter routing preferences. Sorting by price keeps routing stable so
@@ -187,6 +189,7 @@ function _evaluate(input::AbstractString;
         show_usage::Bool = false,
         max_turns::Int = DEFAULT_MAX_TURNS,
         reasoning_effort::Union{Nothing, String} = default_reasoning(),
+        temperature::Union{Nothing, Float64} = default_temperature(),
         on_event::Union{Nothing, Function} = nothing,
         abort::Agentif.Abort = Agentif.Abort(),
         steer::Union{Nothing, Channel{String}} = nothing,
@@ -227,6 +230,9 @@ function _evaluate(input::AbstractString;
         (; reasoning_effort)
     end
     is_openrouter && (eval_kw = merge(eval_kw, (; provider = openrouter_provider_prefs())))
+    # codex manages its own sampling; other completions APIs take a temperature pin
+    temperature !== nothing && agent.model.api != "openai-codex" &&
+        (eval_kw = merge(eval_kw, (; temperature)))
     t0 = time()
     state = Agentif.evaluate(handler, agent, String(input);
         session_store = jdb.session_store, channel = ch, abort, level, eval_kw...)

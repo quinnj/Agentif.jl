@@ -199,9 +199,17 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
     transformed = transform_messages(raw_messages, model; normalize_tool_call_id = normalize_tool_call_id)
     last_role = nothing
 
+    # Reasoning replay is round-scoped for OpenRouter-style models: reasoning
+    # must be passed back only within the current tool round (after the latest
+    # user message). Earlier rounds' chain-of-thought is dead weight that grows
+    # every request — DeepSeek et al. explicitly discard it server-side.
+    round_start = something(findlast(m -> m isa UserMessage || m isa CompactionSummaryMessage, transformed), 0)
+    round_scoped_reasoning = compat.thinkingFormat == "openrouter"
+
     i = 1
     while i <= length(transformed)
         msg = transformed[i]
+        stale_reasoning = round_scoped_reasoning && i < round_start
         if compat.requiresAssistantAfterToolResult && last_role == "toolResult" && msg isa UserMessage
             push!(messages, OpenAICompletions.Message(; role = "assistant", content = "I have processed the tool results."))
         end
@@ -257,7 +265,8 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
                 end
             end
 
-            non_empty_thinking = [b for b in thinking_blocks if !isempty(strip(b.thinking))]
+            non_empty_thinking = stale_reasoning ? ThinkingContent[] :
+                [b for b in thinking_blocks if !isempty(strip(b.thinking))]
             if !isempty(non_empty_thinking)
                 if openai_completions_use_reasoning_split(model)
                     assistant_msg.reasoning_details = openai_completions_reasoning_details_from_blocks(non_empty_thinking)
@@ -282,16 +291,18 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
 
             if !isempty(tool_calls)
                 assistant_msg.tool_calls = OpenAICompletions.ToolCall[openai_completions_tool_call_from_content(tc) for tc in tool_calls]
-                reasoning_details = Any[]
-                for tc in tool_calls
-                    tc.thoughtSignature === nothing && continue
-                    isempty(tc.thoughtSignature) && continue
-                    try
-                        push!(reasoning_details, JSON.parse(tc.thoughtSignature))
-                    catch
+                if !stale_reasoning
+                    reasoning_details = Any[]
+                    for tc in tool_calls
+                        tc.thoughtSignature === nothing && continue
+                        isempty(tc.thoughtSignature) && continue
+                        try
+                            push!(reasoning_details, JSON.parse(tc.thoughtSignature))
+                        catch
+                        end
                     end
+                    isempty(reasoning_details) || (assistant_msg.reasoning_details = reasoning_details)
                 end
-                isempty(reasoning_details) || (assistant_msg.reasoning_details = reasoning_details)
             end
 
             content = assistant_msg.content

@@ -3779,3 +3779,35 @@ end
         close(server)
     end
 end
+
+@testset "openrouter reasoning replay is round-scoped" begin
+    model = Model(
+        id = "test-rr", name = "test-rr", api = "openai-completions",
+        provider = "openrouter", baseUrl = "http://localhost", reasoning = true,
+        input = ["text"],
+        cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+        contextWindow = 128000, maxTokens = 4096,
+        compat = Dict{String, Any}("thinkingFormat" => "openrouter"),
+    )
+    agent = Agent(prompt = "p", model = model, apikey = "k")
+    mk_assistant(text, thinking) = AssistantMessage(;
+        provider = "openrouter", api = "openai-completions", model = "test-rr",
+        content = Agentif.AssistantContentBlock[
+            Agentif.ThinkingContent(; thinking, thinkingSignature = "reasoning"),
+            Agentif.TextContent(; text),
+        ])
+    state = AgentState()
+    push!(state.messages, Agentif.UserMessage([Agentif.TextContent(; text = "round one")]))
+    push!(state.messages, mk_assistant("answer one", "old thinking"))
+    push!(state.messages, Agentif.UserMessage([Agentif.TextContent(; text = "round two")]))
+    push!(state.messages, mk_assistant("answer two", "current thinking"))
+
+    messages, _ = Agentif.openai_completions_build_messages(agent, state, [Agentif.ToolResultMessage(;
+        call_id = "c1", name = "bash", content = [Agentif.TextContent(; text = "ok")], is_error = false)], model)
+    assistants = [m for m in messages if m.role == "assistant"]
+    @test length(assistants) == 2
+    # prior-round reasoning dropped; current-round reasoning replayed
+    first_extra = assistants[1].extra
+    @test first_extra === nothing || !haskey(first_extra, "reasoning")
+    @test assistants[2].extra !== nothing && assistants[2].extra["reasoning"] == "current thinking"
+end
