@@ -98,6 +98,12 @@ end
         err = try edit.func("near.txt", "beta = 2", "beta = 3"); nothing catch e; e end
         @test err isa ArgumentError && occursin("Closest candidates", err.msg)
         @test occursin("beta = 1", err.msg)
+        # not-found where the replacement already exists: says so
+        err = try edit.func("near.txt", "beta = 0", "beta = 1"); nothing catch e; e end
+        @test err isa ArgumentError && occursin("may already be applied", err.msg)
+        # identical replacement explains that no edit is needed
+        err = try edit.func("near.txt", "gamma", "gamma"); nothing catch e; e end
+        @test err isa ArgumentError && occursin("no edit is needed", err.msg)
         # missing file errors
         @test_throws ArgumentError edit.func("nope.txt", "a", "b")
         # identical replacement errors
@@ -537,6 +543,9 @@ end
     bare = Juco.build_prompt(pwd(), :bash)
     @test !occursin("Memories", bare)
     @test occursin("your only tool", bare)
+    @test !occursin("Budget:", bare)
+    budgeted = Juco.build_prompt(pwd(), :juco; max_turns = 25)
+    @test occursin("Budget: up to 25 tool calls", budgeted)
     # directory snapshot: entries listed, dirs marked, big dirs capped
     mktempdir() do dir
         mkdir(joinpath(dir, "src"))

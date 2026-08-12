@@ -136,6 +136,18 @@ Examples:
     )
 end
 
+# If the intended replacement already exists in the file, say so — the most
+# common cause of a not-found oldText is an edit that was already applied.
+function already_applied_hint(content::String, newText::String)
+    anchor = ""
+    for line in eachsplit(newText, '\n')
+        s = strip(line)
+        isempty(s) || (anchor = String(s); break)
+    end
+    (isempty(anchor) || !occursin(anchor, content)) && return ""
+    return " Note: the replacement text already appears in the file — this edit may already be applied."
+end
+
 # When an exact match fails, point the model at the closest candidates (lines
 # containing the first line of its oldText) so it can re-anchor without a
 # read + guess round trip.
@@ -221,7 +233,8 @@ Errors if: oldText not found or not unique, file missing when editing, or file a
             content = Base.read(resolved, String)
             matches = overlapping_matches(oldText, content)
             isempty(matches) && throw(ArgumentError(
-                "could not find the exact text in $(path)." * nearest_match_hint(content, oldText)))
+                "could not find the exact text in $(path)." * already_applied_hint(content, newText) *
+                nearest_match_hint(content, oldText)))
             if length(matches) > 1
                 match_lines = [count(==('\n'), content[1:prevind(content, first(m))]) + 1 for m in matches]
                 throw(ArgumentError("found $(length(matches)) occurrences in $(path) (at lines $(join(match_lines, ", "))); include more surrounding context to make oldText unique"))
@@ -229,7 +242,7 @@ Errors if: oldText not found or not unique, file missing when editing, or file a
             idx = matches[1]
             replace_start = first(idx)
             new_content = content[1:prevind(content, replace_start)] * newText * content[nextind(content, last(idx)):end]
-            new_content == content && throw(ArgumentError("replacement produced identical content for $(path)"))
+            new_content == content && throw(ArgumentError("replacement produced identical content for $(path) — the file already reads this way; no edit is needed"))
             Base.write(resolved, new_content)
             return "Edited $(path), " * edited_region(new_content, replace_start, newText)
         end,

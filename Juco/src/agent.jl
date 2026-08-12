@@ -99,13 +99,14 @@ function build_agent(;
         model_id::String = default_model(),
         apikey::String = "",
         memory_limit::Int = 50,
+        max_turns::Union{Nothing, Int} = nothing,
     )
     model = getModel(provider, model_id)
     model === nothing && error("Unknown model: provider=$(repr(provider)) model_id=$(repr(model_id))")
     isempty(apikey) && (apikey = resolve_apikey(provider))
     mems = (jdb !== nothing && preset === :juco) ? memories(jdb; limit = memory_limit) : String[]
     return Agentif.Agent(
-        prompt = build_prompt(base_dir, preset; memories = mems),
+        prompt = build_prompt(base_dir, preset; memories = mems, max_turns),
         model = model,
         apikey = apikey,
         tools = toolset(preset, base_dir, jdb),
@@ -199,7 +200,7 @@ function _evaluate(input::AbstractString;
         kw...,
     )
     sid = session_id === nothing ? "juco-" * string(Agentif.UID8()) : String(session_id)
-    agent = build_agent(; base_dir, jdb, kw...)
+    agent = build_agent(; base_dir, jdb, max_turns, kw...)
     ch = TerminalChannel(sid, io; io_lock)
     # tool executions run on concurrent tasks, so the counter must be atomic
     tool_calls = Threads.Atomic{Int}(0)

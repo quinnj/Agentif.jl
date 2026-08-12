@@ -31,7 +31,8 @@ function dir_snapshot(base_dir::AbstractString; limit::Int = 50)
     return join(lines, "\n")
 end
 
-function build_prompt(base_dir::AbstractString, preset::Symbol; memories::Vector{String} = String[])
+function build_prompt(base_dir::AbstractString, preset::Symbol; memories::Vector{String} = String[],
+        max_turns::Union{Nothing, Int} = nothing)
     tool_lines = get(PRESET_TOOL_LINES, preset) do
         throw(ArgumentError("unknown toolset preset: $preset"))
     end
@@ -42,6 +43,7 @@ $tool_lines
 
 Guidelines:
 - When fixing a bug or failing test, REPRODUCE it first: run the failing command and read the actual error before reading or changing code.
+- Inspect large or unknown files with head/wc/rg before deciding what to extract — never dump whole files with cat.
 - Explore before editing; verify your changes (run tests or the code) before declaring success.
 - Keep edits surgical: change only what the task requires.
 - Julia: to extend an existing generic function (push!, pop!, peek, length, isempty, iterate, show, ...) for your own type, define a method on it — `Base.f(x::YourType) = ...` — never a new function or export of the same name.
@@ -51,6 +53,9 @@ Guidelines:
 Working directory: $(abspath(base_dir))
 Top-level contents (snapshot at session start):
 $(dir_snapshot(base_dir))"""
+    if max_turns !== nothing
+        prompt *= "\n\nBudget: up to $(max_turns) tool calls per user request — pace yourself; you'll get a warning when few remain."
+    end
     if !isempty(memories)
         memory_lines = join(("- " * m for m in memories), "\n")
         prompt *= """
