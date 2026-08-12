@@ -3737,10 +3737,13 @@ end
             end
         end
         msg = state.messages[end]
-        thinking = join((b.thinking for b in msg.content if b isa Agentif.ThinkingContent), "")
+        thinking_blocks = [b for b in msg.content if b isa Agentif.ThinkingContent]
+        thinking = join((b.thinking for b in thinking_blocks), "")
         @test thinking == "Let me think fallback"
         @test join(reasoning_deltas, "") == "Let me think fallback"
         @test Agentif.message_text(msg) == "42"
+        details = JSON.parse(only(thinking_blocks).thinkingSignature)
+        @test [get(d, "text", nothing) for d in details] == ["Let", " me", " think", ""]
     finally
         close(server)
     end
@@ -3772,9 +3775,12 @@ end
         agent = Agent(prompt = "p", model = model, apikey = "k")
         state = stream(_ -> nothing, agent, AgentState(), "q", Abort(); stream = false)
         msg = state.messages[end]
-        thinking = join((b.thinking for b in msg.content if b isa Agentif.ThinkingContent), "")
+        thinking_blocks = [b for b in msg.content if b isa Agentif.ThinkingContent]
+        thinking = join((b.thinking for b in thinking_blocks), "")
         @test thinking == "fallback"
         @test Agentif.message_text(msg) == "42"
+        @test JSON.parse(only(thinking_blocks).thinkingSignature) ==
+            [Dict("type" => "reasoning.encrypted", "data" => "sig")]
     finally
         close(server)
     end
@@ -3790,24 +3796,56 @@ end
         compat = Dict{String, Any}("thinkingFormat" => "openrouter"),
     )
     agent = Agent(prompt = "p", model = model, apikey = "k")
-    mk_assistant(text, thinking) = AssistantMessage(;
-        provider = "openrouter", api = "openai-completions", model = "test-rr",
-        content = Agentif.AssistantContentBlock[
-            Agentif.ThinkingContent(; thinking, thinkingSignature = "reasoning"),
-            Agentif.TextContent(; text),
-        ])
+    old_details = [Dict("type" => "reasoning.text", "text" => "old thinking")]
+    current_details = [Dict("type" => "reasoning.encrypted", "data" => "current-sig")]
     state = AgentState()
     push!(state.messages, Agentif.UserMessage([Agentif.TextContent(; text = "round one")]))
-    push!(state.messages, mk_assistant("answer one", "old thinking"))
+    push!(state.messages, AssistantMessage(;
+        provider = "other", api = "openai-completions", model = "other-model",
+        content = Agentif.AssistantContentBlock[
+            # Cross-model and unsigned thinking becomes text in transform_messages;
+            # round scoping must remove it before that conversion.
+            Agentif.ThinkingContent(; thinking = "old unsigned thinking"),
+            Agentif.TextContent(; text = "answer one"),
+            Agentif.ToolCallContent(; id = "old-call", name = "bash", arguments = Dict("command" => "true"),
+                thoughtSignature = JSON.json(only(old_details))),
+        ]))
+    push!(state.messages, Agentif.ToolResultMessage(;
+        call_id = "old-call", name = "bash", content = [Agentif.TextContent(; text = "ok")], is_error = false))
     push!(state.messages, Agentif.UserMessage([Agentif.TextContent(; text = "round two")]))
-    push!(state.messages, mk_assistant("answer two", "current thinking"))
+    push!(state.messages, AssistantMessage(;
+        provider = "openrouter", api = "openai-completions", model = "test-rr",
+        content = Agentif.AssistantContentBlock[
+            Agentif.ThinkingContent(; thinking = "current thinking",
+                thinkingSignature = JSON.json(current_details)),
+            Agentif.ToolCallContent(; id = "current-call", name = "bash",
+                arguments = Dict("command" => "true")),
+        ]))
 
     messages, _ = Agentif.openai_completions_build_messages(agent, state, [Agentif.ToolResultMessage(;
-        call_id = "c1", name = "bash", content = [Agentif.TextContent(; text = "ok")], is_error = false)], model)
+        call_id = "current-call", name = "bash", content = [Agentif.TextContent(; text = "ok")], is_error = false)], model)
     assistants = [m for m in messages if m.role == "assistant"]
     @test length(assistants) == 2
     # prior-round reasoning dropped; current-round reasoning replayed
-    first_extra = assistants[1].extra
-    @test first_extra === nothing || !haskey(first_extra, "reasoning")
-    @test assistants[2].extra !== nothing && assistants[2].extra["reasoning"] == "current thinking"
+    first_content = assistants[1].content
+    @test !occursin("old unsigned thinking", JSON.json(first_content))
+    @test assistants[1].reasoning_details === nothing
+    @test assistants[2].reasoning_details == current_details
+
+    compacted = AgentState(messages = Agentif.StoredAgentMessage[
+        Agentif.CompactionSummaryMessage(; summary = "summary", tokens_before = 100, compacted_at = time()),
+        AssistantMessage(;
+            provider = "openrouter", api = "openai-completions", model = "test-rr",
+            content = Agentif.AssistantContentBlock[
+                Agentif.ThinkingContent(; thinking = "after summary",
+                    thinkingSignature = JSON.json(current_details)),
+                Agentif.ToolCallContent(; id = "summary-call", name = "bash",
+                    arguments = Dict("command" => "true")),
+            ]),
+    ])
+    compacted_messages, _ = Agentif.openai_completions_build_messages(
+        agent, compacted, [Agentif.ToolResultMessage(;
+            call_id = "summary-call", name = "bash",
+            content = [Agentif.TextContent(; text = "ok")], is_error = false)], model)
+    @test only(m.reasoning_details for m in compacted_messages if m.role == "assistant") == current_details
 end

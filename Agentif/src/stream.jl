@@ -754,9 +754,10 @@ function stream(
             # so appending both would duplicate the thinking content.
             details_text = choice.message.reasoning_details === nothing ? "" :
                 openai_completions_reasoning_text(choice.message.reasoning_details)
-            if !isempty(details_text)
+            if choice.message.reasoning_details !== nothing
                 openai_completions_append_thinking_with_details!(assistant_message, choice.message.reasoning_details)
-            else
+            end
+            if isempty(details_text)
                 reasoning_parts = String[]
                 for field in (:reasoning_content, :reasoning, :reasoning_text)
                     value = getfield(choice.message, field)

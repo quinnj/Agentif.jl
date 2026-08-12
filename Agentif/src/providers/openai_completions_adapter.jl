@@ -89,9 +89,11 @@ function openai_completions_reasoning_details_from_signature(signature::Union{No
 end
 
 function openai_completions_reasoning_details_from_blocks(blocks::Vector{ThinkingContent})
-    signature = blocks[1].thinkingSignature
-    parsed = openai_completions_reasoning_details_from_signature(signature)
-    parsed !== nothing && return parsed
+    # Streaming updates keep the complete detail sequence on the latest block.
+    for block in Iterators.reverse(blocks)
+        parsed = openai_completions_reasoning_details_from_signature(block.thinkingSignature)
+        parsed !== nothing && return parsed
+    end
     text = join((b.thinking for b in blocks), "\n\n")
     return [Dict("text" => text)]
 end
@@ -117,7 +119,6 @@ end
 
 function openai_completions_append_thinking_with_details!(assistant_message::AssistantMessage, details)
     text = openai_completions_reasoning_text(details)
-    isempty(text) && return
     signature = JSON.json(details)
     if isempty(assistant_message.content) || !(assistant_message.content[end] isa ThinkingContent)
         push!(assistant_message.content, ThinkingContent(; thinking = text, thinkingSignature = signature))
@@ -127,6 +128,29 @@ function openai_completions_append_thinking_with_details!(assistant_message::Ass
         block.thinkingSignature = signature
     end
     return
+end
+
+function openai_completions_without_reasoning(msg::AssistantMessage)
+    content = AssistantContentBlock[]
+    for block in msg.content
+        if block isa ThinkingContent
+            continue
+        elseif block isa ToolCallContent
+            push!(content, ToolCallContent(;
+                id = block.id, name = block.name, arguments = block.arguments,
+                thoughtSignature = nothing))
+        else
+            push!(content, block)
+        end
+    end
+    return AssistantMessage(;
+        response_id = msg.response_id,
+        provider = msg.provider,
+        api = msg.api,
+        model = msg.model,
+        content,
+        tool_calls = msg.tool_calls,
+    )
 end
 
 function openai_completions_build_tools(
@@ -196,20 +220,29 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
         push!(messages, OpenAICompletions.Message(; role, content = system_prompt))
     end
 
-    transformed = transform_messages(raw_messages, model; normalize_tool_call_id = normalize_tool_call_id)
-    last_role = nothing
-
     # Reasoning replay is round-scoped for OpenRouter-style models: reasoning
     # must be passed back only within the current tool round (after the latest
     # user message). Earlier rounds' chain-of-thought is dead weight that grows
     # every request — DeepSeek et al. explicitly discard it server-side.
-    round_start = something(findlast(m -> m isa UserMessage || m isa CompactionSummaryMessage, transformed), 0)
     round_scoped_reasoning = compat.thinkingFormat == "openrouter"
+    if round_scoped_reasoning
+        round_start = something(findlast(
+            m -> m isa UserMessage || m isa CompactionSummaryMessage, raw_messages), 0)
+        for i in firstindex(raw_messages):(round_start - 1)
+            msg = raw_messages[i]
+            msg isa AssistantMessage || continue
+            # Remove stale thinking before transform_messages can downgrade
+            # unsigned or cross-model thinking into ordinary text.
+            raw_messages[i] = openai_completions_without_reasoning(msg)
+        end
+    end
+
+    transformed = transform_messages(raw_messages, model; normalize_tool_call_id = normalize_tool_call_id)
+    last_role = nothing
 
     i = 1
     while i <= length(transformed)
         msg = transformed[i]
-        stale_reasoning = round_scoped_reasoning && i < round_start
         if compat.requiresAssistantAfterToolResult && last_role == "toolResult" && msg isa UserMessage
             push!(messages, OpenAICompletions.Message(; role = "assistant", content = "I have processed the tool results."))
         end
@@ -265,10 +298,14 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
                 end
             end
 
-            non_empty_thinking = stale_reasoning ? ThinkingContent[] :
-                [b for b in thinking_blocks if !isempty(strip(b.thinking))]
+            non_empty_thinking = [b for b in thinking_blocks if
+                !isempty(strip(b.thinking)) ||
+                    openai_completions_reasoning_details_from_signature(b.thinkingSignature) !== nothing]
             if !isempty(non_empty_thinking)
-                if openai_completions_use_reasoning_split(model)
+                has_openrouter_details = round_scoped_reasoning && any(
+                    b -> openai_completions_reasoning_details_from_signature(b.thinkingSignature) !== nothing,
+                    non_empty_thinking)
+                if openai_completions_use_reasoning_split(model) || has_openrouter_details
                     assistant_msg.reasoning_details = openai_completions_reasoning_details_from_blocks(non_empty_thinking)
                 elseif compat.requiresThinkingAsText
                     thinking_text = join((b.thinking for b in non_empty_thinking), "\n\n")
@@ -291,18 +328,16 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
 
             if !isempty(tool_calls)
                 assistant_msg.tool_calls = OpenAICompletions.ToolCall[openai_completions_tool_call_from_content(tc) for tc in tool_calls]
-                if !stale_reasoning
-                    reasoning_details = Any[]
-                    for tc in tool_calls
-                        tc.thoughtSignature === nothing && continue
-                        isempty(tc.thoughtSignature) && continue
-                        try
-                            push!(reasoning_details, JSON.parse(tc.thoughtSignature))
-                        catch
-                        end
+                reasoning_details = Any[]
+                for tc in tool_calls
+                    tc.thoughtSignature === nothing && continue
+                    isempty(tc.thoughtSignature) && continue
+                    try
+                        push!(reasoning_details, JSON.parse(tc.thoughtSignature))
+                    catch
                     end
-                    isempty(reasoning_details) || (assistant_msg.reasoning_details = reasoning_details)
                 end
+                isempty(reasoning_details) || (assistant_msg.reasoning_details = reasoning_details)
             end
 
             content = assistant_msg.content
@@ -551,6 +586,7 @@ function openai_completions_event_callback(
         think_tag_state::Union{Nothing, ThinkTagStreamState} = nothing,
     ) where {F <: Function}
     reasoning_buffer = ""
+    reasoning_details_buffer = Any[]
     leading_whitespace = ""
     saw_text = false
     return function (stream, event)
@@ -661,6 +697,8 @@ function openai_completions_event_callback(
             end
             details = delta.reasoning_details
             details_vec = details isa AbstractVector ? details : Any[details]
+            append!(reasoning_details_buffer, details_vec)
+            details_signature = JSON.json(reasoning_details_buffer)
             new_text_parts = String[]
             for detail in details_vec
                 detail isa AbstractDict || continue
@@ -685,15 +723,20 @@ function openai_completions_event_callback(
             new_text = join(new_text_parts, "")
             if !isempty(new_text)
                 if isempty(assistant_message.content) || !(assistant_message.content[end] isa ThinkingContent)
-                    push!(assistant_message.content, ThinkingContent(; thinking = new_text, thinkingSignature = JSON.json(details_vec)))
+                    push!(assistant_message.content, ThinkingContent(; thinking = new_text, thinkingSignature = details_signature))
                 else
                     block = assistant_message.content[end]
                     block.thinking *= new_text
-                    block.thinkingSignature = JSON.json(details_vec)
+                    block.thinkingSignature = details_signature
                 end
                 f(MessageUpdateEvent(:assistant, assistant_message, :reasoning, new_text, nothing))
             elseif !isempty(assistant_message.content) && assistant_message.content[end] isa ThinkingContent
-                assistant_message.content[end].thinkingSignature = JSON.json(details_vec)
+                assistant_message.content[end].thinkingSignature = details_signature
+            else
+                # Encrypted and redacted details can carry no displayable text,
+                # but their exact structure is still required for tool replay.
+                push!(assistant_message.content,
+                    ThinkingContent(; thinking = "", thinkingSignature = details_signature))
             end
         end
         if !details_carried_text
