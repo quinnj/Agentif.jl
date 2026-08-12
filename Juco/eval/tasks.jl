@@ -354,4 +354,343 @@ const TASKS = [
     end,
 ),
 
+
+# ─── Round-2 tasks (added with the second iteration phase) ───
+
+
+(
+    name = "regression-guard",
+    setup = function (dir)
+        mkpath(joinpath(dir, "src"))
+        write(joinpath(dir, "src", "qty.jl"), """
+            # Shared quantity parser used across the codebase.
+            parse_qty(s) = parse(Int, strip(s))
+            """)
+        write(joinpath(dir, "src", "orders.jl"), """
+            include("qty.jl")
+            order_total(qtys) = sum(parse_qty, qtys)
+            """)
+        write(joinpath(dir, "src", "audit.jl"), """
+            include("qty.jl")
+            # Audit rejects malformed rows loudly.
+            audit_row(s) = try
+                parse_qty(s)
+                "ok"
+            catch
+                "reject"
+            end
+            """)
+        write(joinpath(dir, "test_orders.jl"), """
+            include("src/orders.jl")
+            using Test
+            # Order sheets use underscore thousands separators.
+            @test order_total(["1_000", "2_500", "7"]) == 3507
+            @test order_total(["10", "20"]) == 30
+            println("OK")
+            """)
+        write(joinpath(dir, "test_audit.jl"), """
+            include("src/audit.jl")
+            using Test
+            @test audit_row("42") == "ok"
+            @test audit_row("abc") == "reject"
+            @test audit_row("") == "reject"
+            @test audit_row("4.5") == "reject"
+            println("OK")
+            """)
+    end,
+    prompt = "test_orders.jl fails. Fix the code so BOTH test_orders.jl and test_audit.jl pass — do not modify either test file.",
+    check = dir -> _run_ok(dir, `julia --startup-file=no test_orders.jl`) &&
+        _run_ok(dir, `julia --startup-file=no test_audit.jl`),
+),
+
+(
+    name = "perf-fix",
+    setup = function (dir)
+        write(joinpath(dir, "render.jl"), """
+            # Renders n table rows into a single string.
+            function render_rows(n)
+                out = ""
+                for i in 1:n
+                    out = out * "row " * string(i) * ": " * string(i * i) * "\\n"
+                end
+                return out
+            end
+            """)
+        write(joinpath(dir, "test_render.jl"), """
+            include("render.jl")
+            using Test
+            small = render_rows(3)
+            @test small == "row 1: 1\\nrow 2: 4\\nrow 3: 9\\n"
+            t0 = time()
+            big = render_rows(200_000)
+            elapsed = time() - t0
+            @test endswith(big, "row 200000: 40000000000\\n")
+            @test count(==('\\n'), big) == 200_000
+            @test elapsed < 5.0  # the current implementation is quadratic and far slower
+            println("OK")
+            """)
+    end,
+    prompt = "test_render.jl times out its performance assertion. Make render_rows fast enough (same output) so the test passes.",
+    check = dir -> _run_ok(dir, `julia --startup-file=no test_render.jl`),
+),
+
+(
+    name = "unicode-edit",
+    setup = function (dir)
+        write(joinpath(dir, "menu.jl"), """
+            const MENU = [
+                ("café ☕", 3.50),
+                ("汉堡 🍔", 8.25),
+                ("寿司 🍣", 12.00),
+                ("crêpe 🥞", 6.75),
+            ]
+            price_of(name) = only(p for (n, p) in MENU if n == name)
+            """)
+        write(joinpath(dir, "test_menu.jl"), """
+            include("menu.jl")
+            using Test
+            @test price_of("汉堡 🍔") == 9.75
+            @test price_of("café ☕") == 3.50
+            @test price_of("寿司 🍣") == 12.00
+            println("OK")
+            """)
+    end,
+    prompt = "The burger price changed: update 汉堡 🍔 to 9.75 in menu.jl so test_menu.jl passes. Change nothing else.",
+    check = function (dir)
+        content = read(joinpath(dir, "menu.jl"), String)
+        occursin("(\"汉堡 🍔\", 9.75)", content) || return false
+        occursin("(\"café ☕\", 3.50)", content) || return false
+        return _run_ok(dir, `julia --startup-file=no test_menu.jl`)
+    end,
+),
+
+(
+    name = "json-log-mine",
+    setup = function (dir)
+        lines = String[]
+        for i in 1:5000
+            dur = i == 3141 ? 98765 : (i * 7) % 900 + 10
+            push!(lines, "{\"req\": \"req-$(lpad(i, 5, '0'))\", \"path\": \"/api/v$(i % 3)\", \"duration_ms\": $(dur), \"status\": $(i % 17 == 0 ? 500 : 200)}")
+        end
+        write(joinpath(dir, "requests.jsonl"), join(lines, "\n") * "\n")
+    end,
+    prompt = "requests.jsonl has one JSON object per line. Find the req id with the highest duration_ms and write EXACTLY that id (nothing else) to answer.txt.",
+    check = function (dir)
+        isfile(joinpath(dir, "answer.txt")) || return false
+        return strip(read(joinpath(dir, "answer.txt"), String)) == "req-03141"
+    end,
+),
+
+(
+    name = "cross-file-invariant",
+    setup = function (dir)
+        mkpath(joinpath(dir, "src"))
+        write(joinpath(dir, "src", "colors.jl"), """
+            const SUPPORTED_COLORS = ["red", "green", "blue"]
+            """)
+        write(joinpath(dir, "src", "render.jl"), """
+            include("colors.jl")
+            function ansi_code(color)
+                color == "red" && return 31
+                color == "green" && return 32
+                color == "blue" && return 34
+                error("unsupported color: \$color")
+            end
+            """)
+        write(joinpath(dir, "docs.md"), """
+            # Supported colors
+
+            | color | ansi |
+            |-------|------|
+            | red   | 31   |
+            | green | 32   |
+            | blue  | 34   |
+            """)
+        write(joinpath(dir, "test_colors.jl"), """
+            include("src/render.jl")
+            using Test
+            @test "purple" in SUPPORTED_COLORS
+            @test ansi_code("purple") == 35
+            for c in SUPPORTED_COLORS
+                @test ansi_code(c) isa Int
+            end
+            # docs table must list every supported color with its code
+            doc = read("docs.md", String)
+            for c in SUPPORTED_COLORS
+                @test occursin(Regex("\\\\|\\\\s*" * c * "\\\\s*\\\\|\\\\s*" * string(ansi_code(c)) * "\\\\s*\\\\|"), doc)
+            end
+            println("OK")
+            """)
+    end,
+    prompt = "Add support for the color purple (ansi code 35): it must be registered, renderable, and documented, consistently across the project, so test_colors.jl passes.",
+    check = dir -> _run_ok(dir, `julia --startup-file=no test_colors.jl`),
+),
+
+(
+    name = "flaky-test",
+    setup = function (dir)
+        write(joinpath(dir, "inventory.jl"), """
+            # Returns items formatted as "name=count", one per line.
+            function inventory_report(items::Dict{String, Int})
+                lines = String[]
+                for (k, v) in items
+                    push!(lines, "\$(k)=\$(v)")
+                end
+                return join(lines, "\\n")
+            end
+            """)
+        write(joinpath(dir, "test_inventory.jl"), """
+            include("inventory.jl")
+            using Test
+            items = Dict("zinc" => 3, "apple" => 5, "mango" => 2, "kiwi" => 9, "fig" => 1,
+                         "pear" => 4, "plum" => 6, "date" => 7, "lime" => 8, "yam" => 10)
+            @test inventory_report(items) == "apple=5\\ndate=7\\nfig=1\\nkiwi=9\\nlime=8\\nmango=2\\npear=4\\nplum=6\\nyam=10\\nzinc=3"
+            println("OK")
+            """)
+    end,
+    prompt = "test_inventory.jl fails (or passes only by luck) because the report order is nondeterministic. Make inventory_report deterministic so the test always passes. Do not modify the test.",
+    check = function (dir)
+        for _ in 1:5
+            _run_ok(dir, `julia --startup-file=no test_inventory.jl`) || return false
+        end
+        return true
+    end,
+),
+
+(
+    name = "dep-wiring",
+    setup = function (dir)
+        mkpath(joinpath(dir, "Stamp", "src"))
+        write(joinpath(dir, "Stamp", "Project.toml"), """
+            name = "Stamp"
+            uuid = "7f2b1e60-1f7c-4c2e-9d7b-3a1a2b3c4d5e"
+            version = "0.1.0"
+            """)
+        write(joinpath(dir, "Stamp", "src", "Stamp.jl"), """
+            module Stamp
+            using Dates
+            stamp(msg) = "[\$(Dates.format(Dates.DateTime(2026, 1, 2, 3, 4, 5), "yyyy-mm-dd HH:MM:SS"))] \$msg"
+            export stamp
+            end
+            """)
+        write(joinpath(dir, "test_stamp.jl"), """
+            using Pkg
+            Pkg.activate("Stamp"; io = devnull)
+            using Stamp
+            using Test
+            @test stamp("hello") == "[2026-01-02 03:04:05] hello"
+            println("OK")
+            """)
+    end,
+    prompt = "test_stamp.jl fails because the Stamp package doesn't load. Diagnose and fix the package so the test passes.",
+    check = dir -> _run_ok(dir, `julia --startup-file=no test_stamp.jl`),
+),
+
+(
+    name = "api-doc-sync",
+    setup = function (dir)
+        write(joinpath(dir, "fmt.jl"), """
+            \"\"\"
+                shorten(s; max = 10, ellipsis = "…")
+
+            Truncate `s` to at most `max` characters. When truncation happens, the
+            result ends with `ellipsis` (still within the `max` budget).
+            \"\"\"
+            shorten(s) = length(s) <= 10 ? s : first(s, 10)
+
+            \"\"\"
+                pad_id(n; width = 6)
+
+            Zero-pad an integer id to `width` digits.
+            \"\"\"
+            pad_id(n) = lpad(n, 6, '0')
+            """)
+        write(joinpath(dir, "test_fmt.jl"), """
+            include("fmt.jl")
+            using Test
+            @test shorten("hello") == "hello"
+            @test shorten("hello world, long"; max = 8) == "hello w…"
+            @test shorten("hello world, long") == "hello wor…"
+            @test shorten("abcdef"; max = 6, ellipsis = "...") == "abcdef"
+            @test shorten("abcdefgh"; max = 6, ellipsis = "...") == "abc..."
+            @test pad_id(42) == "000042"
+            @test pad_id(42; width = 3) == "042"
+            println("OK")
+            """)
+    end,
+    prompt = "The docstrings in fmt.jl promise keyword arguments the functions don't actually accept, and test_fmt.jl exercises the documented behavior. Implement the functions to match their docs so the test passes.",
+    check = dir -> _run_ok(dir, `julia --startup-file=no test_fmt.jl`),
+),
+
+(
+    name = "deep-trace",
+    setup = function (dir)
+        mkpath(joinpath(dir, "src"))
+        write(joinpath(dir, "src", "a_entry.jl"), """
+            include("b_config.jl")
+            include("c_loader.jl")
+            include("d_transform.jl")
+            include("e_output.jl")
+            process(data) = emit(transform(load(data, default_config())))
+            """)
+        write(joinpath(dir, "src", "b_config.jl"), """
+            # scale must default to 1.0 (identity); someone fat-fingered it.
+            default_config() = (scale = 0.0, offset = 0)
+            """)
+        write(joinpath(dir, "src", "c_loader.jl"), """
+            load(data, cfg) = [(x, cfg) for x in data]
+            """)
+        write(joinpath(dir, "src", "d_transform.jl"), """
+            transform(rows) = [x * cfg.scale + cfg.offset for (x, cfg) in rows]
+            """)
+        write(joinpath(dir, "src", "e_output.jl"), """
+            emit(xs) = sum(xs) / length(xs)
+            """)
+        write(joinpath(dir, "test_pipeline.jl"), """
+            include("src/a_entry.jl")
+            using Test
+            @test process([1, 2, 3]) == 2.0
+            @test process([10]) == 10.0
+            println("OK")
+            """)
+    end,
+    prompt = "test_pipeline.jl fails: process returns the wrong values. Track the bug through the pipeline in src/ and fix it. Do not modify the test.",
+    check = dir -> _run_ok(dir, `julia --startup-file=no test_pipeline.jl`),
+),
+
+(
+    name = "big-file-precision",
+    setup = function (dir)
+        chunks = String[]
+        for i in 1:100
+            push!(chunks, """
+                # Validator $(i): checks range [$(i), $(i + 100)].
+                function validate_$(i)(x)
+                    x < $(i) && return false
+                    x > $(i + 100) && return false
+                    return true
+                end
+                """)
+        end
+        write(joinpath(dir, "validators.jl"), join(chunks, "\n"))
+        write(joinpath(dir, "test_validators.jl"), """
+            include("validators.jl")
+            using Test
+            # validator 57 must now accept exactly [57, 250]
+            @test validate_57(57) && validate_57(250) && !validate_57(251) && !validate_57(56)
+            # spot-check that neighbours are untouched
+            @test validate_56(156) && !validate_56(157)
+            @test validate_58(158) && !validate_58(159)
+            println("OK")
+            """)
+    end,
+    prompt = "In validators.jl (100 near-identical validators), widen validate_57's upper bound from 157 to 250 (and its comment) without touching any other validator, so test_validators.jl passes.",
+    check = function (dir)
+        content = read(joinpath(dir, "validators.jl"), String)
+        count("x > 250 && return false", content) == 1 || return false
+        occursin("x > 157", content) && return false
+        return _run_ok(dir, `julia --startup-file=no test_validators.jl`)
+    end,
+),
+
 ]
