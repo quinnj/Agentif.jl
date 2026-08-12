@@ -8,21 +8,39 @@ jobs:
   doc-preview-cleanup:
     runs-on: ubuntu-latest
     steps:
+      - name: Check for gh-pages branch
+        id: pages
+        run: |
+          if git ls-remote --exit-code --heads "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/gh-pages >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout gh-pages branch
-        uses: actions/checkout@v2
+        if: steps.pages.outputs.exists == 'true'
+        uses: actions/checkout@v4
         with:
           ref: gh-pages
 
       - name: Delete preview and history
+        id: cleanup
+        if: steps.pages.outputs.exists == 'true'
         run: |
-            git config user.name "Documenter.jl"
-            git config user.email "documenter@juliadocs.github.io"
-            git rm -rf "previews/PR$PRNUM"
+          git config user.name "Documenter.jl"
+          git config user.email "documenter@juliadocs.github.io"
+          git rm -rf --ignore-unmatch "previews/PR$PRNUM"
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
             git commit -m "delete preview"
-            git branch gh-pages-new $(echo "delete history" | git commit-tree HEAD^{tree})
+            git branch gh-pages-new "$(echo "delete history" | git commit-tree HEAD^{tree})"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
         env:
-            PRNUM: ${{ github.event.number }}
+          PRNUM: ${{ github.event.number }}
 
       - name: Push changes
+        if: steps.cleanup.outputs.changed == 'true'
         run: |
-            git push --force origin gh-pages-new:gh-pages
+          git push --force origin gh-pages-new:gh-pages
