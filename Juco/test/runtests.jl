@@ -340,6 +340,42 @@ end
     end
 end
 
+@testset "steering queue drain is serialized" begin
+    steer = Channel{String}(2)
+    put!(steer, "only once")
+    lk = ReentrantLock()
+    tasks = [Threads.@spawn Juco.drain_steering!(steer, lk) for _ in 1:2]
+    @test timedwait(() -> all(istaskdone, tasks), 2.0) == :ok
+    drained = reduce(vcat, fetch.(tasks))
+    @test drained == ["only once"]
+end
+
+@testset "turn task failure handling" begin
+    buf = IOBuffer()
+    interrupted = @async throw(InterruptException())
+    @test Juco.wait_turn(interrupted, Agentif.Abort(), buf) === nothing
+
+    inner = @async error("root turn failure")
+    nested = @async fetch(inner)
+    @test Juco.wait_turn(nested, Agentif.Abort(), buf) === nothing
+    output = String(take!(buf))
+    @test occursin("error: root turn failure", output)
+    @test !occursin("error: TaskFailedException", output)
+end
+
+@testset "terminal output shares one lock" begin
+    buf = IOBuffer()
+    lk = ReentrantLock()
+    channel = Juco.TerminalChannel("s", buf; io_lock = lk)
+    @test channel.io_lock === lk
+    handler = Juco.display_handler(buf; io_lock = lk)
+    tc = Agentif.PendingToolCall(call_id = "c", name = "bash", arguments = "{\"command\":\"true\"}")
+    handler(Agentif.ToolExecutionStartEvent(tc))
+    Agentif.append_to_stream(channel, "done")
+    Agentif.finish_streaming(channel)
+    @test occursin("done", String(take!(buf)))
+end
+
 @testset "prompt" begin
     prompt = Juco.build_prompt(pwd(), :juco; memories = ["user likes short names"])
     @test occursin("user likes short names", prompt)

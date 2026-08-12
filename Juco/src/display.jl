@@ -95,8 +95,8 @@ Event handler that renders agent activity to `io`: tool calls as compact
 one-liners completed in place with ✓/✗ + duration, and (optionally) streamed
 reasoning as dim text.
 """
-function display_handler(io::IO; show_tools::Bool = true, show_reasoning::Bool = true)
-    lk = ReentrantLock()
+function display_handler(io::IO; show_tools::Bool = true, show_reasoning::Bool = true,
+        io_lock::ReentrantLock = ReentrantLock())
     open_call_id = Ref{Union{Nothing, String}}(nothing)  # call whose ▸ line is still open
     reasoning_open = Ref(false)
     finish_open_line() = begin
@@ -108,7 +108,7 @@ function display_handler(io::IO; show_tools::Bool = true, show_reasoning::Bool =
         reasoning_open[] = false
     end
     return function (event)
-        lock(lk) do
+        lock(io_lock) do
             if event isa Agentif.ToolExecutionStartEvent && show_tools
                 finish_reasoning()
                 finish_open_line()

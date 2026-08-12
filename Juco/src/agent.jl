@@ -49,34 +49,42 @@ struct TerminalChannel <: Agentif.AbstractChannel
     io::IO
     buf::IOBuffer
     markdown::Bool
+    io_lock::ReentrantLock
 end
 
-TerminalChannel(session_id::String, io::IO; markdown::Bool = true) =
-    TerminalChannel(session_id, io, IOBuffer(), markdown)
+TerminalChannel(session_id::String, io::IO; markdown::Bool = true,
+        io_lock::ReentrantLock = ReentrantLock()) =
+    TerminalChannel(session_id, io, IOBuffer(), markdown, io_lock)
 
 Agentif.channel_id(ch::TerminalChannel) = ch.session_id
 Agentif.start_streaming(::TerminalChannel) = nothing
-Agentif.append_to_stream(ch::TerminalChannel, delta) = write(ch.buf, delta)
+Agentif.append_to_stream(ch::TerminalChannel, delta) = lock(ch.io_lock) do
+    write(ch.buf, delta)
+end
 
 function render_text(ch::TerminalChannel)
-    text = strip(String(take!(ch.buf)))
-    isempty(text) && return
-    if ch.markdown && use_color(ch.io)
-        try
-            show(IOContext(ch.io, :color => true), MIME("text/plain"), Markdown.parse(String(text)))
-            println(ch.io)
-        catch
+    lock(ch.io_lock) do
+        text = strip(String(take!(ch.buf)))
+        isempty(text) && return
+        if ch.markdown && use_color(ch.io)
+            try
+                show(IOContext(ch.io, :color => true), MIME("text/plain"), Markdown.parse(String(text)))
+                println(ch.io)
+            catch
+                println(ch.io, text)
+            end
+        else
             println(ch.io, text)
         end
-    else
-        println(ch.io, text)
+        flush(ch.io)
     end
-    flush(ch.io)
     return
 end
 
 Agentif.finish_streaming(ch::TerminalChannel) = render_text(ch)
-Agentif.send_message(ch::TerminalChannel, msg) = println(ch.io, msg)
+Agentif.send_message(ch::TerminalChannel, msg) = lock(ch.io_lock) do
+    println(ch.io, msg)
+end
 Agentif.close_channel(ch::TerminalChannel) = render_text(ch)  # flush any tail text
 
 # ─── Agent construction ───
@@ -111,15 +119,13 @@ end
 const BUDGET_WARN_MARGIN = 5
 
 function instrument_tool(tool::Agentif.AgentTool{F, T}, counter::Threads.Atomic{Int}, max_turns::Int,
-        steer::Union{Nothing, Channel{String}}, on_steer::Union{Nothing, Function}) where {F, T}
+        steer::Union{Nothing, Channel{String}}, on_steer::Union{Nothing, Function},
+        steer_lock::ReentrantLock = ReentrantLock()) where {F, T}
     wrapped = function (args...)
         result = tool.func(args...)
         result isa String || return result
         if steer !== nothing
-            texts = String[]
-            while isready(steer)
-                push!(texts, take!(steer))
-            end
+            texts = drain_steering!(steer, steer_lock)
             if !isempty(texts)
                 on_steer === nothing || foreach(on_steer, texts)
                 result *= "\n\n[the user interjected with new instructions — take them into account now]:\n" *
@@ -135,6 +141,16 @@ function instrument_tool(tool::Agentif.AgentTool{F, T}, counter::Threads.Atomic{
     end
     return Agentif.AgentTool{typeof(wrapped), T}(;
         name = tool.name, description = tool.description, strict = tool.strict, func = wrapped)
+end
+
+function drain_steering!(steer::Channel{String}, steer_lock::ReentrantLock)
+    return lock(steer_lock) do
+        texts = String[]
+        while isready(steer)
+            push!(texts, take!(steer))
+        end
+        texts
+    end
 end
 
 # kept for API/tests compatibility: budget-only instrumentation
@@ -165,18 +181,20 @@ function evaluate(input::AbstractString;
         abort::Agentif.Abort = Agentif.Abort(),
         steer::Union{Nothing, Channel{String}} = nothing,
         on_steer::Union{Nothing, Function} = nothing,
+        io_lock::ReentrantLock = ReentrantLock(),
         level = nothing,
         kw...,
     )
     sid = session_id === nothing ? "juco-" * string(Agentif.UID8()) : String(session_id)
     touch_session!(jdb, sid; title = first(String(input), 80), cwd = abspath(base_dir))
     agent = build_agent(; base_dir, jdb, kw...)
-    ch = TerminalChannel(sid, io)
+    ch = TerminalChannel(sid, io; io_lock)
     # tool executions run on concurrent tasks, so the counter must be atomic
     tool_calls = Threads.Atomic{Int}(0)
+    steer_lock = ReentrantLock()
     agent = Agentif.with_tools(agent,
-        Agentif.AgentTool[instrument_tool(t, tool_calls, max_turns, steer, on_steer) for t in agent.tools])
-    disp = show_tools ? display_handler(io; show_reasoning) : nothing
+        Agentif.AgentTool[instrument_tool(t, tool_calls, max_turns, steer, on_steer, steer_lock) for t in agent.tools])
+    disp = show_tools ? display_handler(io; show_reasoning, io_lock) : nothing
     handler = function (event)
         if event isa Agentif.ToolExecutionStartEvent
             n = Threads.atomic_add!(tool_calls, 1) + 1
@@ -205,7 +223,9 @@ function evaluate(input::AbstractString;
         session_store = jdb.session_store, channel = ch, abort, level, eval_kw...)
     if show_usage
         ctx_pct = context_percent(agent, state)
-        println(io, dim(io, usage_line(state.usage, agent.model, tool_calls[], time() - t0; ctx_pct)))
+        lock(io_lock) do
+            println(io, dim(io, usage_line(state.usage, agent.model, tool_calls[], time() - t0; ctx_pct)))
+        end
     end
     return (; state, session_id = sid, tool_calls = tool_calls[], aborted = Agentif.isaborted(abort))
 end
@@ -331,17 +351,67 @@ end
 # While the turn runs, a pump task reads stdin lines into the steering channel:
 # each line is shown as queued immediately, then echoed again (via on_steer)
 # at the moment a completed tool call actually delivers it to the model.
+function root_task_exception(e)
+    while e isa TaskFailedException
+        inner = e.task.exception
+        inner === e && break
+        e = inner
+    end
+    return e
+end
+
+function locked_println(io::IO, io_lock::ReentrantLock, xs...)
+    lock(io_lock) do
+        println(io, xs...)
+        flush(io)
+    end
+    return nothing
+end
+
+function wait_turn(turn::Task, abort::Agentif.Abort, io::IO;
+        io_lock::ReentrantLock = ReentrantLock())
+    while true
+        try
+            return fetch(turn)
+        catch e
+            if e isa InterruptException
+                Agentif.abort!(abort)
+                locked_println(io, io_lock,
+                    "\n^C interrupting — waiting for the turn to stop (ctrl-c again to detach)")
+                status = try
+                    timedwait(() -> istaskdone(turn), 10.0; pollint = 0.1)
+                catch wait_error
+                    wait_error isa InterruptException || rethrow()
+                    locked_println(io, io_lock, "^C detached from the running turn")
+                    return nothing
+                end
+                status === :ok || return nothing
+            elseif e isa TaskFailedException
+                inner = root_task_exception(e)
+                inner isa InterruptException && return nothing
+                msg = sprint(showerror, inner)
+                locked_println(io, io_lock, red(io, "error: " * first(split(msg, '\n'))))
+                locked_println(io, io_lock, dim(io, "the session is intact — try again or rephrase"))
+                return nothing
+            else
+                rethrow()
+            end
+        end
+    end
+end
+
 function run_turn(st::ReplState, input::String, io::IO; steering::Bool = stdin isa Base.TTY, kw...)
     expanded, used = expand_skills(input, st.skills)
     isempty(used) || println(io, dim(io, "⚡ skills: " * join(used, ", ")))
     abort = Agentif.Abort()
+    io_lock = ReentrantLock()
     steer = steering ? Channel{String}(32) : nothing
     on_steer = steer === nothing ? nothing :
-        text -> println(io, steer_active_line(io, text))
+        text -> locked_println(io, io_lock, steer_active_line(io, text))
     turn = @async evaluate(expanded; jdb = st.jdb, session_id = st.session_id,
         provider = mode_provider(st.mode), model_id = st.model_id,
         apikey = mode_apikey(st.mode), reasoning_effort = st.reasoning,
-        io, show_usage = true, abort, steer, on_steer, kw...)
+        io, show_usage = true, abort, steer, on_steer, io_lock, kw...)
     pump = steer === nothing ? nothing : @async begin
         try
             while !istaskdone(turn)
@@ -350,36 +420,28 @@ function run_turn(st::ReplState, input::String, io::IO; steering::Bool = stdin i
                 s = strip(raw)
                 isempty(s) && continue
                 put!(steer, String(s))
-                println(io, steer_queued_line(io, s))
+                locked_println(io, io_lock, steer_queued_line(io, s))
             end
         catch
             # interrupted at turn end, or stdin closed — either way we're done
         end
     end
     try
-        while true
-            try
-                return fetch(turn)
-            catch e
-                if e isa InterruptException
-                    Agentif.abort!(abort)
-                    println(io, dim(io, "\n^C interrupting — waiting for the turn to stop (ctrl-c again to detach)"))
-                    timedwait(() -> istaskdone(turn), 10.0; pollint = 0.1) === :ok || return nothing
-                elseif e isa TaskFailedException
-                    inner = e.task.exception
-                    inner isa InterruptException && continue
-                    msg = sprint(showerror, inner)
-                    println(io, red(io, "error: " * first(split(msg, '\n'))))
-                    println(io, dim(io, "the session is intact — try again or rephrase"))
-                    return nothing
-                else
-                    rethrow()
+        return wait_turn(turn, abort, io; io_lock)
+    finally
+        steer === nothing || !isopen(steer) || close(steer)
+        if pump !== nothing
+            if !istaskdone(pump)
+                try
+                    schedule(pump, InterruptException(); error = true)
+                catch
                 end
             end
+            try
+                wait(pump)
+            catch
+            end
         end
-    finally
-        # unblock the pump's readline without consuming the next prompt input
-        pump === nothing || istaskdone(pump) || schedule(pump, InterruptException(); error = true)
     end
 end
 
