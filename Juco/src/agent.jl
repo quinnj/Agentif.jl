@@ -257,6 +257,14 @@ end
 
 # ─── REPL / CLI ───
 
+const REPL_TIPS = [
+    "type \$ then tab in juco> mode to inject a skill into your prompt",
+    "keep typing while I work — your message steers me at the next tool boundary",
+    "/model picks the mode, model, and reasoning level; the choice persists",
+    "/copy puts my last answer on the clipboard; /compact folds old context",
+    "end a line with \\ to keep typing on the next line",
+]
+
 const REPL_HELP = """
 /help                 show this help
 /new                  start a new session
@@ -265,6 +273,8 @@ const REPL_HELP = """
 /model [mode] [id]    choose model mode, model, and reasoning (menus when no args)
 /skills               list \$skills discovered from ~/.agent/skills and ./.agent/skills
 /memories             list saved memories
+/copy                 copy the last answer to the clipboard
+/compact              fold older context into a summary on the next message
 /quit                 exit (also: exit, quit, ctrl-d)
 Use \$skill-name in a prompt to inject a skill (tab-completes in juco> mode).
 Typing while the model works queues a steering message for the next tool boundary.
@@ -282,12 +292,15 @@ mutable struct ReplState
     skills::Vector{Skill}
     base_dir::String
     quit::Bool
+    force_compact::Bool
+    last_answer::String
+    last_ctx_pct::Union{Nothing, Int}
 end
 
 function ReplState(jdb::JucoDB, session_id::String; base_dir::AbstractString = pwd())
     mode, model_id, reasoning = load_model_state(jdb)
     return ReplState(jdb, session_id, mode, model_id, reasoning,
-        discover_skills(base_dir), String(abspath(base_dir)), false)
+        discover_skills(base_dir), String(abspath(base_dir)), false, false, "", nothing)
 end
 
 model_label(st::ReplState) =
@@ -345,6 +358,22 @@ function handle_command(st::ReplState, input::AbstractString, io::IO)
         mems = memories(st.jdb)
         isempty(mems) && return println(io, "No memories.")
         foreach(m -> println(io, "- ", m), mems)
+    elseif cmd == "/copy"
+        isempty(st.last_answer) && return println(io, "Nothing to copy yet.")
+        clip = Sys.isapple() ? `pbcopy` : Sys.iswindows() ? `clip` : `xclip -selection clipboard`
+        ok = try
+            open(clip, "w") do p
+                write(p, st.last_answer)
+            end
+            true
+        catch
+            false
+        end
+        println(io, ok ? dim(io, "copied the last answer ($(length(st.last_answer)) chars)") :
+            red(io, "clipboard tool unavailable ($(clip.exec[1]))"))
+    elseif cmd == "/compact"
+        st.force_compact = true
+        println(io, dim(io, "⇣ compaction armed — older context folds into a summary on your next message"))
     elseif cmd == "/quit"
         st.quit = true
     else
@@ -354,9 +383,11 @@ function handle_command(st::ReplState, input::AbstractString, io::IO)
 end
 
 # Read one logical input: trailing backslash continues on the next line.
-# Returns nothing on EOF.
-function read_input(io::IO)
-    print(io, bold(io, "juco> "))
+# Returns nothing on EOF. When context usage is high, the prompt says so
+# (e.g. `juco 72%>`), pointing at /compact before quality degrades.
+function read_input(io::IO; ctx_pct::Union{Nothing, Int} = nothing)
+    label = ctx_pct !== nothing && ctx_pct >= 60 ? "juco $(ctx_pct)%> " : "juco> "
+    print(io, bold(io, label))
     raw = readline(stdin; keep = true)
     isempty(raw) && return nothing
     input = String(strip(raw))
@@ -439,12 +470,25 @@ function run_turn(st::ReplState, input::String, io::IO; steering::Bool = stdin i
     abort = Agentif.Abort()
     io_lock = ReentrantLock()
     steer = steering ? Channel{String}(32) : nothing
+    steered = Threads.Atomic{Int}(0)
     on_steer = steer === nothing ? nothing :
-        text -> locked_println(io, io_lock, steer_active_line(io, text))
+        text -> begin
+            Threads.atomic_add!(steered, 1)
+            locked_println(io, io_lock, steer_active_line(io, text))
+        end
+    model = getModel(mode_provider(st.mode), st.model_id)
+    extra_kw = (;)
+    if st.force_compact
+        st.force_compact = false
+        cw = model === nothing ? 128_000 : model.contextWindow
+        extra_kw = (; compaction_config = Agentif.CompactionConfig(;
+            reserve_tokens = max(cw - 1_000, 1_000), keep_recent_tokens = 2_000))
+    end
+    t0 = time()
     turn = @async evaluate(expanded; jdb = st.jdb, session_id = st.session_id,
         provider = mode_provider(st.mode), model_id = st.model_id,
         apikey = mode_apikey(st.mode), reasoning_effort = st.reasoning,
-        io, show_usage = true, abort, steer, on_steer, io_lock, kw...)
+        io, show_usage = true, abort, steer, on_steer, io_lock, extra_kw..., kw...)
     pump = steer === nothing ? nothing : @async begin
         try
             while !istaskdone(turn)
@@ -460,7 +504,14 @@ function run_turn(st::ReplState, input::String, io::IO; steering::Bool = stdin i
         end
     end
     try
-        return wait_turn(turn, abort, io; io_lock)
+        result = wait_turn(turn, abort, io; io_lock)
+        if result !== nothing
+            note_turn_result!(st, result, model)
+            steered[] > 0 && println(io, dim(io, "↳ $(steered[]) steering message$(steered[] == 1 ? "" : "s") delivered"))
+        end
+        # ring the bell after long turns so a tabbed-away user notices
+        time() - t0 > 30 && stdin isa Base.TTY && (print(io, "\a"); flush(io))
+        return result
     finally
         steer === nothing || !isopen(steer) || close(steer)
         if pump !== nothing
@@ -476,6 +527,18 @@ function run_turn(st::ReplState, input::String, io::IO; steering::Bool = stdin i
             end
         end
     end
+end
+
+# Record what the REPL wants to know about a finished turn: the final answer
+# text (/copy) and the estimated context share (prompt indicator).
+function note_turn_result!(st::ReplState, result, model)
+    msg = Agentif.last_assistant_message(result.state)
+    msg === nothing || (st.last_answer = Agentif.message_text(msg))
+    if model !== nothing && model.contextWindow > 0
+        est = Agentif.estimate_context_tokens(result.state.messages)
+        st.last_ctx_pct = clamp(round(Int, 100 * est / model.contextWindow), 0, 100)
+    end
+    return nothing
 end
 
 function repl(;
@@ -504,11 +567,12 @@ function _repl(jdb::JucoDB;
     println(io, bold(io, "juco"), dim(io, " · $(model_label(st)) · session $(session_id)"))
     skills_note = isempty(st.skills) ? "" : " · $(length(st.skills)) skill$(length(st.skills) == 1 ? "" : "s")"
     println(io, dim(io, "db $(abspath(db_path))$(skills_note) · /help for commands · exit to quit"))
+    println(io, dim(io, "tip: " * REPL_TIPS[1 + mod(Dates.dayofyear(Dates.today()), length(REPL_TIPS))]))
     isa(stdin, Base.TTY) && Base.exit_on_sigint(false)
     try
         while !st.quit
             input = try
-                read_input(io)
+                read_input(io; ctx_pct = st.last_ctx_pct)
             catch e
                 e isa InterruptException ? "" : rethrow()
             end

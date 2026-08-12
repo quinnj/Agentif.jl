@@ -219,6 +219,38 @@ end
     @test Juco.error_summary(bad_message) == "7"
 end
 
+@testset "display previews and diffs" begin
+    result = Agentif.ToolResultMessage(call_id = "c", name = "bash",
+        content = [Agentif.TextContent(text = "\n  first real line\nsecond")], is_error = false)
+    @test Juco.result_preview(result) == "first real line"
+    long = Agentif.ToolResultMessage(call_id = "c", name = "bash",
+        content = [Agentif.TextContent(text = "x"^200)], is_error = false)
+    @test endswith(Juco.result_preview(long), "…")
+    removed, added = Juco.edit_diff_lines(JSON.json(Dict(
+        "path" => "a.jl",
+        "oldText" => "keep\nold line\nkeep2",
+        "newText" => "keep\nnew line one\nnew line two\nkeep2")))
+    @test removed == ["old line"]
+    @test added == ["new line one", "new line two"]
+    r2, a2 = Juco.edit_diff_lines("not json")
+    @test isempty(r2) && isempty(a2)
+end
+
+@testset "turn result notes" begin
+    mktempdir() do dir
+        jdb = Juco.opendb(joinpath(dir, "t.sqlite"))
+        st = Juco.ReplState(jdb, "s"; base_dir = dir)
+        state = Agentif.AgentState()
+        push!(state.messages, Agentif.AssistantMessage(;
+            provider = "openrouter", api = "openai-completions", model = "m",
+            content = Agentif.AssistantContentBlock[Agentif.TextContent(; text = "the answer")]))
+        model = Agentif.getModel("openrouter", "deepseek/deepseek-v4-flash-0731")
+        Juco.note_turn_result!(st, (; state), model)
+        @test st.last_answer == "the answer"
+        @test st.last_ctx_pct isa Int
+    end
+end
+
 @testset "display handler renders tool lines" begin
     buf = IOBuffer()
     handler = Juco.display_handler(buf)
