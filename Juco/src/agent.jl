@@ -562,14 +562,20 @@ end
 shell_project_argument(project::AbstractString) =
     Base.shell_escape_posixly("--project=$(project)")
 
+function active_project_dir()
+    project = Base.active_project()
+    project === nothing && error("no active Julia project; start Julia with --project before installing the launcher")
+    return dirname(project)
+end
+
 """
     Juco.install_cli(; dir = joinpath(homedir(), ".local", "bin"))
 
 Write a `juco` launcher script to `dir` so the agent can be started from any
-shell. The script runs this monorepo's environment.
+shell. The script runs the active Julia environment that loaded Juco.
 """
 function install_cli(; dir::AbstractString = joinpath(homedir(), ".local", "bin"))
-    project = dirname(pkgdir(Juco))
+    project = active_project_dir()
     mkpath(dir)
     path = joinpath(dir, "juco")
     write(path, """

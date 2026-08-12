@@ -416,6 +416,7 @@ end
     escaped = Juco.shell_project_argument("/tmp/a b'c")
     @test read(`sh -c "set -- $escaped; printf %s \"\$1\""`, String) ==
         "--project=/tmp/a b'c"
+    @test Juco.active_project_dir() == dirname(Base.active_project())
 end
 
 @testset "skills" begin
