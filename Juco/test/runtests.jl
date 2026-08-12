@@ -417,6 +417,64 @@ end
     end
 end
 
+@testset "temperature pin on direct completion models" begin
+    withenv("JUCO_TEMPERATURE" => nothing) do
+        @test Juco.default_temperature() == 0.2
+    end
+    withenv("JUCO_TEMPERATURE" => "") do
+        @test Juco.default_temperature() === nothing
+    end
+    withenv("JUCO_TEMPERATURE" => "not-a-number") do
+        @test_throws ArgumentError Juco.default_temperature()
+    end
+    bodies = Any[]
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        push!(bodies, JSON.parse(String(req.body)))
+        sse = join([
+            "data: {\"id\":\"temp-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}",
+            "data: {\"id\":\"temp-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}",
+            "data: [DONE]",
+        ], "\n\n") * "\n\n"
+        HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+    end
+    try
+        port = applicable(HTTP.port, server) && HTTP.port(server) != 0 ?
+            HTTP.port(server) : Sockets.getsockname(server.listener.server)[2]
+        provider = "juco-temperature-test"
+        model_id = "direct-completions"
+        LLMProviders.registerModel!(LLMProviders.Model(;
+            id = model_id, name = model_id, api = "openai-completions",
+            provider, baseUrl = "http://127.0.0.1:$(port)", reasoning = false,
+            input = ["text"], cost = Dict("input" => 0.0, "output" => 0.0,
+                "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 4096, maxTokens = 256,
+        ))
+        mktempdir() do dir
+            Juco.with_jdb(joinpath(dir, "temperature.sqlite")) do jdb
+                direct = try
+                    Juco.evaluate("hello"; jdb, base_dir = dir, provider, model_id,
+                        apikey = "test", temperature = 0.5, show_tools = false,
+                        io = IOBuffer())
+                catch e
+                    e
+                end
+                integer = try
+                    Juco.evaluate("hello"; jdb, base_dir = dir, provider, model_id,
+                        apikey = "test", temperature = 0, show_tools = false,
+                        io = IOBuffer())
+                catch e
+                    e
+                end
+                @test !(direct isa Exception)
+                @test !(integer isa Exception)
+                @test [body["temperature"] for body in bodies] == [0.5, 0.0]
+            end
+        end
+    finally
+        close(server)
+    end
+end
+
 @testset "eval environment" begin
     withenv("OPENROUTER_API_KEY" => nothing) do
         @test_throws ArgumentError load_eval_env!()

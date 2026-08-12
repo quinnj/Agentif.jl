@@ -4,7 +4,13 @@ default_provider() = get(ENV, "JUCO_MODEL_PROVIDER", "anthropic")
 default_model() = get(ENV, "JUCO_MODEL", "claude-sonnet-4-5")
 default_reasoning() = let v = get(ENV, "JUCO_REASONING", ""); isempty(v) ? nothing : v end
 # Coding agents want low-variance sampling; JUCO_TEMPERATURE="" disables the pin.
-default_temperature() = tryparse(Float64, get(ENV, "JUCO_TEMPERATURE", "0.2"))
+function default_temperature()
+    raw = get(ENV, "JUCO_TEMPERATURE", "0.2")
+    isempty(raw) && return nothing
+    value = tryparse(Float64, raw)
+    value === nothing && throw(ArgumentError("JUCO_TEMPERATURE must be a number or empty"))
+    return value
+end
 const DEFAULT_MAX_TURNS = 50
 
 # OpenRouter routing preferences. Sorting by price keeps routing stable so
@@ -190,7 +196,7 @@ function _evaluate(input::AbstractString;
         show_usage::Bool = false,
         max_turns::Int = DEFAULT_MAX_TURNS,
         reasoning_effort::Union{Nothing, String} = default_reasoning(),
-        temperature::Union{Nothing, Float64} = default_temperature(),
+        temperature::Union{Nothing, Real} = default_temperature(),
         on_event::Union{Nothing, Function} = nothing,
         abort::Agentif.Abort = Agentif.Abort(),
         steer::Union{Nothing, Channel{String}} = nothing,
@@ -208,19 +214,24 @@ function _evaluate(input::AbstractString;
     agent = Agentif.with_tools(agent,
         Agentif.AgentTool[instrument_tool(t, tool_calls, max_turns, steer, on_steer, steer_lock) for t in agent.tools])
     disp = show_tools ? display_handler(io; show_reasoning, io_lock) : nothing
+    fatal_error = Ref{Union{Nothing, Exception}}(nothing)
     handler = function (event)
         if event isa Agentif.ToolExecutionStartEvent
             n = Threads.atomic_add!(tool_calls, 1) + 1
             n > max_turns && Agentif.abort!(abort)
         end
-        disp === nothing || disp(event)
+        fatal = event isa Agentif.AgentErrorEvent &&
+            !startswith(sprint(showerror, event.error), "SSE stream interrupted:")
+        fatal && (fatal_error[] = event.error)
+        (disp === nothing || fatal) || disp(event)
         on_event === nothing || on_event(event)
         return nothing
     end
     # Reasoning config shape differs per API: OpenRouter-style models take
     # {"reasoning": {"effort": ...}}, codex takes a plain reasoning string, and
     # native OpenAI reasoning models take reasoning_effort.
-    is_openrouter = get(agent.model.compat, "thinkingFormat", "") == "openrouter"
+    is_openrouter = agent.model.compat !== nothing &&
+        get(agent.model.compat, "thinkingFormat", "") == "openrouter"
     eval_kw = if reasoning_effort === nothing
         (;)
     elseif is_openrouter
@@ -233,10 +244,11 @@ function _evaluate(input::AbstractString;
     is_openrouter && (eval_kw = merge(eval_kw, (; provider = openrouter_provider_prefs())))
     # codex manages its own sampling; other completions APIs take a temperature pin
     temperature !== nothing && agent.model.api != "openai-codex" &&
-        (eval_kw = merge(eval_kw, (; temperature)))
+        (eval_kw = merge(eval_kw, (; temperature = Float64(temperature))))
     t0 = time()
     state = Agentif.evaluate(handler, agent, String(input);
         session_store = jdb.session_store, channel = ch, abort, level, eval_kw...)
+    fatal_error[] === nothing || throw(fatal_error[])
     touch_session!(jdb, sid; title = first(String(input), 80), cwd = abspath(base_dir))
     ctx_pct = context_percent(agent, state)
     if show_usage
