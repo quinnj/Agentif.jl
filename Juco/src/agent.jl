@@ -102,15 +102,32 @@ function build_agent(;
     )
 end
 
-# Warn the model inside tool results when the tool-call budget runs low, so it
-# wraps up instead of being cut off mid-flight (SWE-agent's cost-limit pattern).
+# Tool instrumentation: appended to each tool result as needed —
+#   - budget notice: warn the model when the tool-call budget runs low, so it
+#     wraps up instead of being cut off mid-flight (SWE-agent's pattern)
+#   - steering: user messages typed while the model works are delivered with
+#     the next completed tool result (`on_steer` fires at delivery, so the UI
+#     can show exactly when a queued message became active)
 const BUDGET_WARN_MARGIN = 5
 
-function with_budget_notice(tool::Agentif.AgentTool{F, T}, counter::Threads.Atomic{Int}, max_turns::Int) where {F, T}
+function instrument_tool(tool::Agentif.AgentTool{F, T}, counter::Threads.Atomic{Int}, max_turns::Int,
+        steer::Union{Nothing, Channel{String}}, on_steer::Union{Nothing, Function}) where {F, T}
     wrapped = function (args...)
         result = tool.func(args...)
+        result isa String || return result
+        if steer !== nothing
+            texts = String[]
+            while isready(steer)
+                push!(texts, take!(steer))
+            end
+            if !isempty(texts)
+                on_steer === nothing || foreach(on_steer, texts)
+                result *= "\n\n[the user interjected with new instructions — take them into account now]:\n" *
+                    join(texts, "\n")
+            end
+        end
         used = counter[]
-        if result isa String && used >= max_turns - BUDGET_WARN_MARGIN
+        if used >= max_turns - BUDGET_WARN_MARGIN
             remaining = max(0, max_turns - used)
             result *= "\n\n[harness: only $(remaining) tool calls remain — wrap up now: make your final change and verify]"
         end
@@ -119,6 +136,10 @@ function with_budget_notice(tool::Agentif.AgentTool{F, T}, counter::Threads.Atom
     return Agentif.AgentTool{typeof(wrapped), T}(;
         name = tool.name, description = tool.description, strict = tool.strict, func = wrapped)
 end
+
+# kept for API/tests compatibility: budget-only instrumentation
+with_budget_notice(tool::Agentif.AgentTool, counter::Threads.Atomic{Int}, max_turns::Int) =
+    instrument_tool(tool, counter, max_turns, nothing, nothing)
 
 # ─── One-shot evaluation (used by the REPL per turn, and by the eval harness) ───
 
@@ -142,6 +163,8 @@ function evaluate(input::AbstractString;
         reasoning_effort::Union{Nothing, String} = default_reasoning(),
         on_event::Union{Nothing, Function} = nothing,
         abort::Agentif.Abort = Agentif.Abort(),
+        steer::Union{Nothing, Channel{String}} = nothing,
+        on_steer::Union{Nothing, Function} = nothing,
         level = nothing,
         kw...,
     )
@@ -152,7 +175,7 @@ function evaluate(input::AbstractString;
     # tool executions run on concurrent tasks, so the counter must be atomic
     tool_calls = Threads.Atomic{Int}(0)
     agent = Agentif.with_tools(agent,
-        Agentif.AgentTool[with_budget_notice(t, tool_calls, max_turns) for t in agent.tools])
+        Agentif.AgentTool[instrument_tool(t, tool_calls, max_turns, steer, on_steer) for t in agent.tools])
     disp = show_tools ? display_handler(io; show_reasoning) : nothing
     handler = function (event)
         if event isa Agentif.ToolExecutionStartEvent
@@ -163,13 +186,16 @@ function evaluate(input::AbstractString;
         on_event === nothing || on_event(event)
         return nothing
     end
-    # OpenRouter-style models take {"reasoning": {"effort": ...}}; native OpenAI
-    # reasoning models take reasoning_effort. Send the shape the model expects.
+    # Reasoning config shape differs per API: OpenRouter-style models take
+    # {"reasoning": {"effort": ...}}, codex takes a plain reasoning string, and
+    # native OpenAI reasoning models take reasoning_effort.
     is_openrouter = get(agent.model.compat, "thinkingFormat", "") == "openrouter"
     eval_kw = if reasoning_effort === nothing
         (;)
     elseif is_openrouter
         (; reasoning = Dict("effort" => reasoning_effort))
+    elseif agent.model.api == "openai-codex"
+        (; reasoning = reasoning_effort)
     else
         (; reasoning_effort)
     end
@@ -177,8 +203,19 @@ function evaluate(input::AbstractString;
     t0 = time()
     state = Agentif.evaluate(handler, agent, String(input);
         session_store = jdb.session_store, channel = ch, abort, level, eval_kw...)
-    show_usage && println(io, dim(io, usage_line(state.usage, agent.model, tool_calls[], time() - t0)))
+    if show_usage
+        ctx_pct = context_percent(agent, state)
+        println(io, dim(io, usage_line(state.usage, agent.model, tool_calls[], time() - t0; ctx_pct)))
+    end
     return (; state, session_id = sid, tool_calls = tool_calls[], aborted = Agentif.isaborted(abort))
+end
+
+# Estimated share of the model's context window occupied by the conversation.
+function context_percent(agent::Agentif.Agent, state::Agentif.AgentState)
+    cw = agent.model.contextWindow
+    cw > 0 || return nothing
+    est = Agentif.estimate_context_tokens(state.messages) + cld(ncodeunits(agent.prompt), 4)
+    return clamp(round(Int, 100 * est / cw), 0, 100)
 end
 
 # ─── REPL / CLI ───
@@ -187,21 +224,37 @@ const REPL_HELP = """
 /help                 show this help
 /new                  start a new session
 /sessions             list recent sessions
-/resume [id]          resume a session (most recent if no id)
-/model [prov] [id]    show or switch the model
+/resume [id]          pick a past session to resume (menu when no id)
+/model [mode] [id]    choose model mode, model, and reasoning (menus when no args)
+/skills               list \$skills discovered from ~/.agent/skills and ./.agent/skills
 /memories             list saved memories
 /quit                 exit (also: exit, quit, ctrl-d)
+Use \$skill-name in a prompt to inject a skill (tab-completes in juco> mode).
+Typing while the model works queues a steering message for the next tool boundary.
 End a line with \\ to continue typing on the next line.
 Ctrl-C during a response interrupts that response, not the REPL."""
 
-# Mutable REPL state threaded through slash commands.
+# Mutable REPL state threaded through slash commands. Model selection is
+# persistent (sqlite config); skills are re-discovered each launch.
 mutable struct ReplState
     jdb::JucoDB
     session_id::String
-    provider::String
+    mode::String
     model_id::String
+    reasoning::Union{Nothing, String}
+    skills::Vector{Skill}
+    base_dir::String
     quit::Bool
 end
+
+function ReplState(jdb::JucoDB, session_id::String; base_dir::AbstractString = pwd())
+    mode, model_id, reasoning = load_model_state(jdb)
+    return ReplState(jdb, session_id, mode, model_id, reasoning,
+        discover_skills(base_dir), String(abspath(base_dir)), false)
+end
+
+model_label(st::ReplState) =
+    "$(st.mode) · $(st.model_id)" * (st.reasoning === nothing ? "" : " · $(st.reasoning)")
 
 function handle_command(st::ReplState, input::AbstractString, io::IO)
     parts = split(strip(input))
@@ -220,18 +273,28 @@ function handle_command(st::ReplState, input::AbstractString, io::IO)
             println(io, marker, s.id, dim(io, "  $(ts)  $(first(s.title, 60))"))
         end
     elseif cmd == "/resume"
-        target = length(parts) >= 2 ? String(parts[2]) : latest_session(st.jdb)
-        target === nothing && return println(io, "No sessions to resume.")
-        st.session_id = target
-        println(io, dim(io, "resumed $(st.session_id)"))
+        if length(parts) >= 2
+            st.session_id = String(parts[2])
+            println(io, dim(io, "resumed $(st.session_id)"))
+        else
+            resume_menu!(st, io)
+        end
     elseif cmd == "/model"
         if length(parts) == 1
-            println(io, "$(st.provider)/$(st.model_id)")
+            model_menu!(st, io)
         else
-            prov, mid = length(parts) >= 3 ? (String(parts[2]), String(parts[3])) : (st.provider, String(parts[2]))
-            getModel(prov, mid) === nothing && return println(io, red(io, "unknown model: $(prov)/$(mid)"))
-            st.provider, st.model_id = prov, mid
-            println(io, dim(io, "model set to $(prov)/$(mid)"))
+            mode, mid = length(parts) >= 3 ? (String(parts[2]), String(parts[3])) : (st.mode, String(parts[2]))
+            mode in MODEL_MODES || return println(io, red(io, "unknown mode: $(mode) (expected $(join(MODEL_MODES, " or ")))"))
+            getModel(mode_provider(mode), mid) === nothing && return println(io, red(io, "unknown model: $(mode)/$(mid)"))
+            st.mode, st.model_id = mode, mid
+            st.reasoning in reasoning_levels(mode, mid) || (st.reasoning = nothing)
+            save_model_state!(st.jdb, st.mode, st.model_id, st.reasoning)
+            println(io, dim(io, "model set: $(model_label(st))"))
+        end
+    elseif cmd == "/skills"
+        isempty(st.skills) && return println(io, "No skills found in $(join(skill_dirs(st.base_dir), " or ")).")
+        for s in st.skills
+            println(io, "\$", s.name, dim(io, isempty(s.description) ? "" : "  — $(s.description)"))
         end
     elseif cmd == "/memories"
         mems = memories(st.jdb)
@@ -264,37 +327,66 @@ end
 
 # Run one turn on a worker task so ctrl-c aborts the TURN (via Abort), not the
 # REPL. A second ctrl-c while aborting force-detaches.
-function run_turn(st::ReplState, input::String, io::IO; kw...)
+#
+# While the turn runs, a pump task reads stdin lines into the steering channel:
+# each line is shown as queued immediately, then echoed again (via on_steer)
+# at the moment a completed tool call actually delivers it to the model.
+function run_turn(st::ReplState, input::String, io::IO; steering::Bool = stdin isa Base.TTY, kw...)
+    expanded, used = expand_skills(input, st.skills)
+    isempty(used) || println(io, dim(io, "⚡ skills: " * join(used, ", ")))
     abort = Agentif.Abort()
-    turn = @async evaluate(input; jdb = st.jdb, session_id = st.session_id,
-        provider = st.provider, model_id = st.model_id, io, show_usage = true, abort, kw...)
-    while true
+    steer = steering ? Channel{String}(32) : nothing
+    on_steer = steer === nothing ? nothing :
+        text -> println(io, steer_active_line(io, text))
+    turn = @async evaluate(expanded; jdb = st.jdb, session_id = st.session_id,
+        provider = mode_provider(st.mode), model_id = st.model_id,
+        apikey = mode_apikey(st.mode), reasoning_effort = st.reasoning,
+        io, show_usage = true, abort, steer, on_steer, kw...)
+    pump = steer === nothing ? nothing : @async begin
         try
-            return fetch(turn)
-        catch e
-            if e isa InterruptException
-                Agentif.abort!(abort)
-                println(io, dim(io, "\n^C interrupting — waiting for the turn to stop (ctrl-c again to detach)"))
-                timedwait(() -> istaskdone(turn), 10.0; pollint = 0.1) === :ok || return nothing
-            elseif e isa TaskFailedException
-                inner = e.task.exception
-                inner isa InterruptException && continue
-                msg = sprint(showerror, inner)
-                println(io, red(io, "error: " * first(split(msg, '\n'))))
-                println(io, dim(io, "the session is intact — try again or rephrase"))
-                return nothing
-            else
-                rethrow()
+            while !istaskdone(turn)
+                raw = readline(stdin; keep = true)
+                isempty(raw) && break  # EOF
+                s = strip(raw)
+                isempty(s) && continue
+                put!(steer, String(s))
+                println(io, steer_queued_line(io, s))
+            end
+        catch
+            # interrupted at turn end, or stdin closed — either way we're done
+        end
+    end
+    try
+        while true
+            try
+                return fetch(turn)
+            catch e
+                if e isa InterruptException
+                    Agentif.abort!(abort)
+                    println(io, dim(io, "\n^C interrupting — waiting for the turn to stop (ctrl-c again to detach)"))
+                    timedwait(() -> istaskdone(turn), 10.0; pollint = 0.1) === :ok || return nothing
+                elseif e isa TaskFailedException
+                    inner = e.task.exception
+                    inner isa InterruptException && continue
+                    msg = sprint(showerror, inner)
+                    println(io, red(io, "error: " * first(split(msg, '\n'))))
+                    println(io, dim(io, "the session is intact — try again or rephrase"))
+                    return nothing
+                else
+                    rethrow()
+                end
             end
         end
+    finally
+        # unblock the pump's readline without consuming the next prompt input
+        pump === nothing || istaskdone(pump) || schedule(pump, InterruptException(); error = true)
     end
 end
 
 function repl(;
         db_path::AbstractString = DEFAULT_DB_PATH,
         continue_last::Bool = false,
-        provider::String = default_provider(),
-        model_id::String = default_model(),
+        base_dir::AbstractString = pwd(),
         io::IO = stdout,
         kw...,
     )
@@ -302,9 +394,10 @@ function repl(;
     session_id = continue_last ? latest_session(jdb) : nothing
     continue_last && session_id === nothing && println(io, "No previous session found; starting a new one.")
     session_id === nothing && (session_id = "juco-" * string(Agentif.UID8()))
-    st = ReplState(jdb, session_id, provider, model_id, false)
-    println(io, bold(io, "juco"), dim(io, " · $(provider)/$(model_id) · session $(session_id)"))
-    println(io, dim(io, "db $(abspath(db_path)) · /help for commands · exit to quit"))
+    st = ReplState(jdb, session_id; base_dir)
+    println(io, bold(io, "juco"), dim(io, " · $(model_label(st)) · session $(session_id)"))
+    skills_note = isempty(st.skills) ? "" : " · $(length(st.skills)) skill$(length(st.skills) == 1 ? "" : "s")"
+    println(io, dim(io, "db $(abspath(db_path))$(skills_note) · /help for commands · exit to quit"))
     isa(stdin, Base.TTY) && Base.exit_on_sigint(false)
     try
         while !st.quit
@@ -342,8 +435,8 @@ Requires ReplMaker: `using Juco, ReplMaker; Juco.repl_mode!()`.
 """
 function repl_mode! end
 
-mode_state(db_path::AbstractString = DEFAULT_DB_PATH) =
-    ReplState(opendb(db_path), "juco-" * string(Agentif.UID8()), default_provider(), default_model(), false)
+mode_state(db_path::AbstractString = DEFAULT_DB_PATH; base_dir::AbstractString = pwd()) =
+    ReplState(opendb(db_path), "juco-" * string(Agentif.UID8()); base_dir)
 
 function mode_eval(st::ReplState, input::AbstractString; kw...)
     s = String(strip(input))
@@ -399,10 +492,12 @@ Flags:
   -p, --prompt <text>       one-shot prompt
   --db <path>               sqlite db path (default: ~/.juco/juco.sqlite)
   --dir <path>              working directory for tools (default: pwd)
-  --provider <name>         model provider (default: \$JUCO_MODEL_PROVIDER or anthropic)
-  --model <id>              model id (default: \$JUCO_MODEL or claude-sonnet-4-5)
+  --provider <name>         one-shot only: model provider override
+  --model <id>              one-shot only: model id override
   --preset <name>           toolset preset: juco | pi | bash (default: juco)
   -h, --help                show this help
+
+The interactive session uses the persisted model selection (see /model).
 """
 
 function main(args::Vector{String} = ARGS)
@@ -444,7 +539,10 @@ function main(args::Vector{String} = ARGS)
         session_id = continue_last ? latest_session(jdb) : nothing
         evaluate(prompt; jdb, session_id, base_dir, provider, model_id, preset)
     else
-        repl(; db_path, continue_last, base_dir, provider, model_id, preset)
+        repl(; db_path, continue_last, base_dir, preset)
     end
     return nothing
 end
+
+# Entry point for `julia -m Juco` and the Pkg app shim (`pkg> app add Juco`).
+(@main)(args) = (main(collect(String, args)); Cint(0))

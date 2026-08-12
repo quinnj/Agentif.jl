@@ -205,24 +205,126 @@ end
 @testset "repl slash commands" begin
     mktempdir() do dir
         jdb = Juco.opendb(joinpath(dir, "t.sqlite"))
-        st = Juco.ReplState(jdb, "s-original", "anthropic", "claude-sonnet-4-5", false)
+        st = Juco.ReplState(jdb, "s-original"; base_dir = dir)
+        @test st.mode == "openrouter"
+        @test st.model_id == Juco.MODE_DEFAULT_MODEL["openrouter"]
         buf = IOBuffer()
         Juco.handle_command(st, "/new", buf)
         @test st.session_id != "s-original"
-        Juco.handle_command(st, "/model", buf)
-        @test occursin("anthropic/claude-sonnet-4-5", String(take!(buf)))
         Juco.handle_command(st, "/model nonsense-model-id", buf)
         @test occursin("unknown model", String(take!(buf)))
-        @test st.model_id == "claude-sonnet-4-5"
-        Juco.handle_command(st, "/model anthropic claude-haiku-4-5", buf)
-        @test st.model_id == "claude-haiku-4-5"
+        Juco.handle_command(st, "/model codex gpt-5.3-codex", buf)
+        @test st.mode == "codex" && st.model_id == "gpt-5.3-codex"
+        # selection persists: a fresh state reloads it from the db
+        st2 = Juco.ReplState(jdb, "other"; base_dir = dir)
+        @test st2.mode == "codex" && st2.model_id == "gpt-5.3-codex"
+        Juco.handle_command(st, "/model bogus-mode some-model", buf)
+        @test occursin("unknown mode", String(take!(buf)))
         Juco.remember!(jdb, "a memory")
         Juco.handle_command(st, "/memories", buf)
         @test occursin("a memory", String(take!(buf)))
+        Juco.handle_command(st, "/skills", buf)
+        @test occursin("No skills found", String(take!(buf)))
         Juco.handle_command(st, "/quit", buf)
         @test st.quit
         Juco.handle_command(st, "/bogus", buf)
         @test occursin("unknown command", String(take!(buf)))
+    end
+end
+
+@testset "config store" begin
+    mktempdir() do dir
+        jdb = Juco.opendb(joinpath(dir, "t.sqlite"))
+        @test Juco.get_config(jdb, "k") === nothing
+        @test Juco.get_config(jdb, "k", "fallback") == "fallback"
+        Juco.set_config!(jdb, "k", "v1")
+        @test Juco.get_config(jdb, "k") == "v1"
+        Juco.set_config!(jdb, "k", "v2")
+        @test Juco.get_config(jdb, "k") == "v2"
+        Juco.set_config!(jdb, "k", nothing)
+        @test Juco.get_config(jdb, "k") === nothing
+    end
+end
+
+@testset "model modes" begin
+    @test Juco.mode_provider("openrouter") == "openrouter"
+    @test Juco.mode_provider("codex") == "openai-codex"
+    @test Juco.mode_apikey("codex") == "OAUTH"
+    @test "gpt-5.3-codex" in Juco.mode_models("codex")
+    @test Juco.reasoning_levels("codex", "gpt-5.3-codex") ==
+        ["none", "minimal", "low", "medium", "high", "xhigh"]
+    @test Juco.reasoning_levels("openrouter", "deepseek/deepseek-v4-flash-0731") ==
+        ["none", "low", "medium", "high"]
+    @test Juco.reasoning_levels("openrouter", "not-a-model") == ["none"]
+    @test occursin("ago", Juco.session_age(time() - 7200))
+    @test Juco.session_age(time() - 10) == "just now"
+end
+
+@testset "skills" begin
+    mktempdir() do dir
+        skdir = joinpath(dir, ".agent", "skills")
+        mkpath(joinpath(skdir, "review"))
+        write(joinpath(skdir, "review", "SKILL.md"), """
+            ---
+            description: Careful code review checklist
+            ---
+            # Review
+            Look for bugs first.
+            """)
+        mkpath(joinpath(skdir, "tdd"))
+        write(joinpath(skdir, "tdd", "SKILL.md"), "Write the failing test first.\n")
+        skills = Juco.discover_skills(dir)
+        # may include user-global ~/.agent/skills too; ours must be present
+        names = [s.name for s in skills]
+        @test "review" in names && "tdd" in names
+        review = skills[findfirst(==("review"), names)]
+        @test review.description == "Careful code review checklist"
+        tdd = skills[findfirst(==("tdd"), names)]
+        @test tdd.description == "Write the failing test first."
+
+        ours = [s for s in skills if s.name in ("review", "tdd")]
+        # completion: after "$re" completes to review
+        names2, range, should = Juco.skill_completions("please \$re", ncodeunits("please \$re"), ours)
+        @test names2 == ["review"] && should
+        @test (first(range), last(range)) == (9, 10)
+        # bare "$" offers everything
+        names3, _, _ = Juco.skill_completions("\$", 1, ours)
+        @test sort(names3) == ["review", "tdd"]
+        # no $ context: no completions
+        names4, _, should4 = Juco.skill_completions("hello", 5, ours)
+        @test isempty(names4) && !should4
+
+        # expansion appends blocks once per used skill
+        expanded, used = Juco.expand_skills("apply \$tdd and \$review and \$tdd again", ours)
+        @test used == ["tdd", "review"]
+        @test occursin("<skill name=\"tdd\">", expanded)
+        @test occursin("Write the failing test first.", expanded)
+        @test count("<skill name=\"tdd\">", expanded) == 1
+        # unknown tokens untouched, no blocks
+        expanded2, used2 = Juco.expand_skills("cost is \$100", ours)
+        @test isempty(used2) && expanded2 == "cost is \$100"
+    end
+end
+
+@testset "steering instrumentation" begin
+    mktempdir() do dir
+        bash = Juco.create_bash_tool(dir)
+        counter = Threads.Atomic{Int}(0)
+        steer = Channel{String}(4)
+        delivered = String[]
+        tool = Juco.instrument_tool(bash, counter, 50, steer, t -> push!(delivered, t))
+        # nothing queued: result unchanged
+        @test !occursin("interjected", tool.func("echo hi", nothing))
+        # queued messages are appended to the next result and reported delivered
+        put!(steer, "also update the docs")
+        put!(steer, "and run the linter")
+        result = tool.func("echo hi", nothing)
+        @test occursin("user interjected", result)
+        @test occursin("also update the docs", result)
+        @test occursin("and run the linter", result)
+        @test delivered == ["also update the docs", "and run the linter"]
+        # drained: next call is clean again
+        @test !occursin("interjected", tool.func("echo hi", nothing))
     end
 end
 

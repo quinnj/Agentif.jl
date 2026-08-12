@@ -15,16 +15,20 @@ module Juco
 using Dates
 using JSON
 using Markdown
+using REPL.TerminalMenus
 using Agentif
 using LLMTools
 using LLMProviders
+using LLMOAuth
 using SQLite
 using LocalSearch
 
 include("db.jl")
 include("tools.jl")
 include("prompt.jl")
+include("skills.jl")
 include("display.jl")
+include("modes.jl")
 include("agent.jl")
 
 export repl

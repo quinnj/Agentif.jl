@@ -61,8 +61,10 @@ end
 
 format_tokens(n::Integer) = n < 1000 ? string(n) : "$(round(n / 1000; digits = 1))k"
 
-# One dim line after a turn: elapsed, tool calls, tokens (with cache share), cost.
-function usage_line(usage::Agentif.Usage, model, tool_calls::Int, elapsed_s::Real)
+# One dim line after a turn: elapsed, tool calls, tokens (with cache share),
+# cost, and estimated context-window usage.
+function usage_line(usage::Agentif.Usage, model, tool_calls::Int, elapsed_s::Real;
+        ctx_pct::Union{Nothing, Int} = nothing)
     tokens_in = usage.input + usage.cacheRead + usage.cacheWrite
     cached = tokens_in > 0 && usage.cacheRead > 0 ? " ($(round(Int, 100 * usage.cacheRead / tokens_in))% cached)" : ""
     cost = try
@@ -73,8 +75,18 @@ function usage_line(usage::Agentif.Usage, model, tool_calls::Int, elapsed_s::Rea
         ""
     end
     tools = tool_calls > 0 ? " · $(tool_calls) tool$(tool_calls == 1 ? "" : "s")" : ""
-    return "⏱ $(round(elapsed_s; digits = 1))s$(tools) · $(format_tokens(tokens_in)) in$(cached) / $(format_tokens(usage.output)) out$(cost)"
+    ctx = ctx_pct === nothing ? "" :
+        " · ctx $(ctx_pct)%" * (ctx_pct >= 80 ? " (compaction soon)" : "")
+    return "⏱ $(round(elapsed_s; digits = 1))s$(tools) · $(format_tokens(tokens_in)) in$(cached) / $(format_tokens(usage.output)) out$(cost)$(ctx)"
 end
+
+# Steering visuals: a message is shown queued the moment the user presses
+# enter, then again — promoted — at the moment a completed tool call actually
+# delivers it to the model (codex-style).
+steer_preview(text) = (t = replace(String(text), '\n' => " "); length(t) > 60 ? first(t, 60) * "…" : t)
+steer_queued_line(io::IO, text) = dim(io, "↳ queued (steers at next tool boundary): \"$(steer_preview(text))\"")
+steer_active_line(io::IO, text) =
+    (use_color(io) ? "\e[36m" : "") * "↳ steering now: \"$(steer_preview(text))\"" * (use_color(io) ? "\e[0m" : "")
 
 """
     display_handler(io; show_tools = true, show_reasoning = true) -> Function
@@ -127,6 +139,10 @@ function display_handler(io::IO; show_tools::Bool = true, show_reasoning::Bool =
                 # close any open reasoning/tool line before that happens
                 finish_reasoning()
                 finish_open_line()
+            elseif event isa Agentif.MessageEndEvent && event.message isa Agentif.CompactionSummaryMessage
+                finish_reasoning()
+                finish_open_line()
+                println(io, dim(io, "⇣ context compacted — earlier conversation folded into a summary"))
             elseif event isa Agentif.AgentErrorEvent
                 finish_reasoning()
                 finish_open_line()

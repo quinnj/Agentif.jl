@@ -32,7 +32,34 @@ function opendb(path::AbstractString = DEFAULT_DB_PATH)
             updated_at REAL NOT NULL
         )
     """)
+    SQLite.execute(db, """
+        CREATE TABLE IF NOT EXISTS juco_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
     return JucoDB(db, session_store)
+end
+
+# ─── Config (persistent key/value state, e.g. the selected model) ───
+
+function get_config(jdb::JucoDB, key::AbstractString, default = nothing)
+    rows = SQLite.DBInterface.execute(jdb.db,
+        "SELECT value FROM juco_config WHERE key = ?", (String(key),))
+    row = iterate(rows)
+    row === nothing && return default
+    return String(row[1].value)
+end
+
+function set_config!(jdb::JucoDB, key::AbstractString, value::Union{Nothing, AbstractString})
+    if value === nothing
+        SQLite.execute(jdb.db, "DELETE FROM juco_config WHERE key = ?", (String(key),))
+    else
+        SQLite.execute(jdb.db,
+            "INSERT OR REPLACE INTO juco_config (key, value) VALUES (?, ?)",
+            (String(key), String(value)))
+    end
+    return nothing
 end
 
 # ─── Memories ───

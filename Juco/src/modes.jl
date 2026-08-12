@@ -1,0 +1,109 @@
+# Model modes: named provider configurations the user switches between with
+# /model. Selection (mode, model, reasoning) is persistent REPL state stored in
+# the sqlite config table — not environment variables.
+
+const MODEL_MODES = ["openrouter", "codex"]
+
+mode_provider(mode::AbstractString) = mode == "codex" ? "openai-codex" : "openrouter"
+
+# codex authenticates via the LLMOAuth ChatGPT flow (apikey sentinel "OAUTH")
+mode_apikey(mode::AbstractString) = mode == "codex" ? "OAUTH" : resolve_apikey("openrouter")
+
+const MODE_DEFAULT_MODEL = Dict(
+    "openrouter" => "deepseek/deepseek-v4-flash-0731",
+    "codex" => "gpt-5.3-codex",
+)
+
+mode_models(mode::AbstractString) =
+    sort!([m.id for m in getModels(mode_provider(mode))])
+
+function reasoning_levels(mode::AbstractString, model_id::AbstractString)
+    m = getModel(mode_provider(mode), model_id)
+    (m === nothing || !m.reasoning) && return ["none"]
+    mode == "codex" && return ["none", "minimal", "low", "medium", "high", "xhigh"]
+    return ["none", "low", "medium", "high"]
+end
+
+# ─── Persistent model selection ───
+
+function load_model_state(jdb::JucoDB)
+    mode = something(get_config(jdb, "model_mode"), "openrouter")
+    mode in MODEL_MODES || (mode = "openrouter")
+    model_id = something(get_config(jdb, "model_id"), MODE_DEFAULT_MODEL[mode])
+    reasoning = get_config(jdb, "reasoning")  # nothing = none
+    return mode, model_id, reasoning
+end
+
+function save_model_state!(jdb::JucoDB, mode::AbstractString, model_id::AbstractString, reasoning::Union{Nothing, AbstractString})
+    set_config!(jdb, "model_mode", mode)
+    set_config!(jdb, "model_id", model_id)
+    set_config!(jdb, "reasoning", reasoning)
+    return nothing
+end
+
+# ─── Menus (TerminalMenus on a TTY, numbered fallback otherwise) ───
+
+function choose(io::IO, title::AbstractString, options::Vector{String}; default::Int = 1)
+    isempty(options) && return nothing
+    if stdin isa Base.TTY && io === stdout
+        println(io, title)
+        menu = TerminalMenus.RadioMenu(options; pagesize = min(12, length(options)))
+        idx = TerminalMenus.request(menu; cursor = clamp(default, 1, length(options)))
+        return idx == -1 ? nothing : idx
+    end
+    println(io, title)
+    for (i, o) in enumerate(options)
+        println(io, "  $(i). $(o)")
+    end
+    print(io, "choice [$(default)]: ")
+    raw = strip(readline(stdin))
+    isempty(raw) && return default
+    n = tryparse(Int, raw)
+    return (n === nothing || !(1 <= n <= length(options))) ? nothing : n
+end
+
+# The /model flow: mode -> model (with substring filter for huge lists) -> reasoning.
+function model_menu!(st, io::IO)
+    mode_i = choose(io, "Model mode:", MODEL_MODES; default = something(findfirst(==(st.mode), MODEL_MODES), 1))
+    mode_i === nothing && return println(io, dim(io, "cancelled"))
+    mode = MODEL_MODES[mode_i]
+    models = mode_models(mode)
+    if length(models) > 30
+        print(io, "filter (substring, empty for all): ")
+        pat = lowercase(strip(readline(stdin)))
+        isempty(pat) || (models = filter(m -> occursin(pat, lowercase(m)), models))
+        isempty(models) && return println(io, red(io, "no models match \"$(pat)\""))
+    end
+    default_model = something(findfirst(==(st.model_id), models), 1)
+    model_i = choose(io, "Model:", models; default = default_model)
+    model_i === nothing && return println(io, dim(io, "cancelled"))
+    model_id = models[model_i]
+    levels = reasoning_levels(mode, model_id)
+    current_level = something(st.reasoning, "none")
+    level_i = choose(io, "Reasoning:", levels; default = something(findfirst(==(current_level), levels), 1))
+    level_i === nothing && return println(io, dim(io, "cancelled"))
+    reasoning = levels[level_i] == "none" ? nothing : levels[level_i]
+    st.mode, st.model_id, st.reasoning = mode, model_id, reasoning
+    save_model_state!(st.jdb, mode, model_id, reasoning)
+    println(io, dim(io, "model set: $(mode) · $(model_id) · reasoning $(something(reasoning, "none"))"))
+    return nothing
+end
+
+session_age(updated_at::Real) = begin
+    s = time() - updated_at
+    s < 90 ? "just now" :
+    s < 3600 ? "$(round(Int, s / 60))m ago" :
+    s < 86400 ? "$(round(Int, s / 3600))h ago" : "$(round(Int, s / 86400))d ago"
+end
+
+# The /resume flow: pick a past session from a menu.
+function resume_menu!(st, io::IO)
+    sessions = list_sessions(st.jdb; limit = 15)
+    isempty(sessions) && return println(io, "No sessions to resume.")
+    options = ["$(s.id)  ($(session_age(s.updated_at)))  $(first(s.title, 50))" for s in sessions]
+    i = choose(io, "Resume session:", options)
+    i === nothing && return println(io, dim(io, "cancelled"))
+    st.session_id = sessions[i].id
+    println(io, dim(io, "resumed $(st.session_id)"))
+    return nothing
+end
