@@ -218,6 +218,10 @@ function display_handler(io::IO; show_tools::Bool = true, show_reasoning::Bool =
                 finish_reasoning()
                 finish_open_line()
                 println(io, dim(io, "⇣ context compacted — earlier conversation folded into a summary"))
+            elseif event isa Agentif.TurnEndEvent
+                clear_waiting()
+                finish_reasoning()
+                finish_open_line()
             elseif event isa Agentif.AgentErrorEvent
                 clear_waiting()
                 finish_reasoning()

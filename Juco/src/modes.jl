@@ -125,7 +125,7 @@ function resume_menu!(st, io::IO; input::IO = stdin)
     options = ["$(s.id)  ($(session_age(s.updated_at)))  $(first(s.title, 50))" for s in sessions]
     i = choose(io, "Resume session:", options; input)
     i === nothing && return println(io, dim(io, "cancelled"))
-    st.session_id = sessions[i].id
+    switch_session!(st, sessions[i].id)
     println(io, dim(io, "resumed $(st.session_id)"))
     return nothing
 end

@@ -265,9 +265,9 @@ end
             provider = "openrouter", api = "openai-completions", model = "m",
             content = Agentif.AssistantContentBlock[Agentif.TextContent(; text = "the answer")]))
         model = Agentif.getModel("openrouter", "deepseek/deepseek-v4-flash-0731")
-        Juco.note_turn_result!(st, (; state), model)
+        Juco.note_turn_result!(st, (; state, ctx_pct = 37), model)
         @test st.last_answer == "the answer"
-        @test st.last_ctx_pct isa Int
+        @test st.last_ctx_pct == 37
     end
 end
 
@@ -288,6 +288,16 @@ end
         content = [Agentif.TextContent(text = "{\"message\": \"boom happened\"}")], is_error = true)
     handler(Agentif.ToolExecutionEndEvent(1, tc, errres, 10))
     @test occursin("✗ boom happened", String(take!(buf)))
+
+    color_buf = IOBuffer()
+    color_io = IOContext(color_buf, :color => true)
+    color_handler = Juco.display_handler(color_io)
+    turn_id = Agentif.UID8()
+    color_handler(Agentif.TurnStartEvent(turn_id))
+    color_handler(Agentif.TurnEndEvent(turn_id, nothing, nothing))
+    placeholder = String(take!(color_buf))
+    @test occursin("… thinking", placeholder)
+    @test occursin("\e[2K\r", placeholder)
 end
 
 @testset "repl slash commands" begin
@@ -297,8 +307,18 @@ end
         @test st.mode == "openrouter"
         @test st.model_id == Juco.MODE_DEFAULT_MODEL["openrouter"]
         buf = IOBuffer()
+        st.last_answer = "old answer"
+        st.last_ctx_pct = 88
+        st.force_compact = true
         Juco.handle_command(st, "/new", buf)
         @test st.session_id != "s-original"
+        @test isempty(st.last_answer) && st.last_ctx_pct === nothing && !st.force_compact
+        st.last_answer = "other answer"
+        st.last_ctx_pct = 75
+        st.force_compact = true
+        Juco.handle_command(st, "/resume resumed-id", buf)
+        @test st.session_id == "resumed-id"
+        @test isempty(st.last_answer) && st.last_ctx_pct === nothing && !st.force_compact
         Juco.handle_command(st, "/model nonsense-model-id", buf)
         @test occursin("unknown model", String(take!(buf)))
         Juco.handle_command(st, "/model codex gpt-5.3-codex", buf)

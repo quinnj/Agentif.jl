@@ -163,7 +163,7 @@ with_budget_notice(tool::Agentif.AgentTool, counter::Threads.Atomic{Int}, max_tu
 # ─── One-shot evaluation (used by the REPL per turn, and by the eval harness) ───
 
 """
-    Juco.evaluate(input; kw...) -> (; state, session_id, tool_calls, aborted)
+    Juco.evaluate(input; kw...) -> (; state, session_id, tool_calls, aborted, ctx_pct)
 
 Run one agent turn. Session history is persisted to (and reloaded from) the
 SQLite db under `session_id`, so repeated calls with the same `session_id`
@@ -238,13 +238,14 @@ function _evaluate(input::AbstractString;
     state = Agentif.evaluate(handler, agent, String(input);
         session_store = jdb.session_store, channel = ch, abort, level, eval_kw...)
     touch_session!(jdb, sid; title = first(String(input), 80), cwd = abspath(base_dir))
+    ctx_pct = context_percent(agent, state)
     if show_usage
-        ctx_pct = context_percent(agent, state)
         lock(io_lock) do
             println(io, dim(io, usage_line(state.usage, agent.model, tool_calls[], time() - t0; ctx_pct)))
         end
     end
-    return (; state, session_id = sid, tool_calls = tool_calls[], aborted = Agentif.isaborted(abort))
+    return (; state, session_id = sid, tool_calls = tool_calls[],
+        aborted = Agentif.isaborted(abort), ctx_pct)
 end
 
 # Estimated share of the model's context window occupied by the conversation.
@@ -306,13 +307,21 @@ end
 model_label(st::ReplState) =
     "$(st.mode) · $(st.model_id)" * (st.reasoning === nothing ? "" : " · $(st.reasoning)")
 
+function switch_session!(st::ReplState, session_id::AbstractString)
+    st.session_id = String(session_id)
+    st.force_compact = false
+    st.last_answer = ""
+    st.last_ctx_pct = nothing
+    return nothing
+end
+
 function handle_command(st::ReplState, input::AbstractString, io::IO)
     parts = split(strip(input))
     cmd = parts[1]
     if cmd == "/help"
         println(io, REPL_HELP)
     elseif cmd == "/new"
-        st.session_id = "juco-" * string(Agentif.UID8())
+        switch_session!(st, "juco-" * string(Agentif.UID8()))
         println(io, dim(io, "new session $(st.session_id)"))
     elseif cmd == "/sessions"
         sessions = list_sessions(st.jdb)
@@ -324,7 +333,7 @@ function handle_command(st::ReplState, input::AbstractString, io::IO)
         end
     elseif cmd == "/resume"
         if length(parts) >= 2
-            st.session_id = String(parts[2])
+            switch_session!(st, parts[2])
             println(io, dim(io, "resumed $(st.session_id)"))
         else
             resume_menu!(st, io)
@@ -507,10 +516,16 @@ function run_turn(st::ReplState, input::String, io::IO; steering::Bool = stdin i
         result = wait_turn(turn, abort, io; io_lock)
         if result !== nothing
             note_turn_result!(st, result, model)
-            steered[] > 0 && println(io, dim(io, "↳ $(steered[]) steering message$(steered[] == 1 ? "" : "s") delivered"))
+            steered[] > 0 && locked_println(io, io_lock,
+                dim(io, "↳ $(steered[]) steering message$(steered[] == 1 ? "" : "s") delivered"))
         end
         # ring the bell after long turns so a tabbed-away user notices
-        time() - t0 > 30 && stdin isa Base.TTY && (print(io, "\a"); flush(io))
+        if time() - t0 > 30 && stdin isa Base.TTY
+            lock(io_lock) do
+                print(io, "\a")
+                flush(io)
+            end
+        end
         return result
     finally
         steer === nothing || !isopen(steer) || close(steer)
@@ -534,7 +549,9 @@ end
 function note_turn_result!(st::ReplState, result, model)
     msg = Agentif.last_assistant_message(result.state)
     msg === nothing || (st.last_answer = Agentif.message_text(msg))
-    if model !== nothing && model.contextWindow > 0
+    if hasproperty(result, :ctx_pct)
+        st.last_ctx_pct = result.ctx_pct
+    elseif model !== nothing && model.contextWindow > 0
         est = Agentif.estimate_context_tokens(result.state.messages)
         st.last_ctx_pct = clamp(round(Int, 100 * est / model.contextWindow), 0, 100)
     end
