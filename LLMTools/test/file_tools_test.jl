@@ -37,6 +37,17 @@ end
             @test updated == "hello\njulia"
         end
 
+        @testset "dangling symlink containment" begin
+            mktempdir() do outside
+                target = joinpath(outside, "created.txt")
+                symlink(target, joinpath(tmpdir, "escape.txt"))
+                @test islink(joinpath(tmpdir, "escape.txt"))
+                @test !ispath(joinpath(tmpdir, "escape.txt"))
+                @test_throws ArgumentError write_file("escape.txt", "outside")
+                @test !isfile(target)
+            end
+        end
+
         @testset "ls/find/grep" begin
             mkpath(joinpath(tmpdir, "notes"))
             write_file("notes/todo.txt", "buy milk")

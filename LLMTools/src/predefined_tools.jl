@@ -118,6 +118,7 @@ function canonical_path(p::AbstractString)
     tail = String[]
     q = normpath(abspath(p))
     while !ispath(q)
+        islink(q) && throw(ArgumentError("path traverses a dangling symlink: $p"))
         d = dirname(q)
         d == q && break
         pushfirst!(tail, basename(q))
