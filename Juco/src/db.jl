@@ -41,6 +41,17 @@ function opendb(path::AbstractString = DEFAULT_DB_PATH)
     return JucoDB(db, session_store)
 end
 
+Base.close(jdb::JucoDB) = close(jdb.db)
+
+function with_jdb(f::Function, path::AbstractString = DEFAULT_DB_PATH)
+    jdb = opendb(path)
+    try
+        return f(jdb)
+    finally
+        close(jdb)
+    end
+end
+
 # ─── Config (persistent key/value state, e.g. the selected model) ───
 
 function get_config(jdb::JucoDB, key::AbstractString, default = nothing)

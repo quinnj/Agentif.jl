@@ -167,9 +167,19 @@ SQLite db under `session_id`, so repeated calls with the same `session_id`
 continue the conversation.
 """
 function evaluate(input::AbstractString;
-        base_dir::AbstractString = pwd(),
         db_path::AbstractString = DEFAULT_DB_PATH,
-        jdb::JucoDB = opendb(db_path),
+        jdb::Union{Nothing, JucoDB} = nothing,
+        kw...,
+    )
+    jdb === nothing && return with_jdb(db_path) do owned_jdb
+        _evaluate(input; jdb = owned_jdb, kw...)
+    end
+    return _evaluate(input; jdb, kw...)
+end
+
+function _evaluate(input::AbstractString;
+        base_dir::AbstractString = pwd(),
+        jdb::JucoDB,
         session_id::Union{Nothing, AbstractString} = nothing,
         io::IO = stdout,
         show_tools::Bool = true,
@@ -460,7 +470,18 @@ function repl(;
         io::IO = stdout,
         kw...,
     )
-    jdb = opendb(db_path)
+    return with_jdb(db_path) do jdb
+        _repl(jdb; db_path, continue_last, base_dir, io, kw...)
+    end
+end
+
+function _repl(jdb::JucoDB;
+        db_path::AbstractString,
+        continue_last::Bool,
+        base_dir::AbstractString,
+        io::IO,
+        kw...,
+    )
     session_id = continue_last ? latest_session(jdb) : nothing
     continue_last && session_id === nothing && println(io, "No previous session found; starting a new one.")
     session_id === nothing && (session_id = "juco-" * string(Agentif.UID8()))
@@ -520,12 +541,13 @@ function mode_eval(st::ReplState, input::AbstractString; kw...)
 end
 
 function print_sessions(db_path::AbstractString)
-    jdb = opendb(db_path)
-    sessions = list_sessions(jdb)
-    isempty(sessions) && return println("No sessions.")
-    for s in sessions
-        ts = Dates.format(Dates.unix2datetime(s.updated_at), "yyyy-mm-dd HH:MM")
-        println("$(s.id)  $(ts)  $(s.cwd)  $(s.title)")
+    return with_jdb(db_path) do jdb
+        sessions = list_sessions(jdb)
+        isempty(sessions) && return println("No sessions.")
+        for s in sessions
+            ts = Dates.format(Dates.unix2datetime(s.updated_at), "yyyy-mm-dd HH:MM")
+            println("$(s.id)  $(ts)  $(s.cwd)  $(s.title)")
+        end
     end
 end
 
@@ -625,9 +647,10 @@ function main(args::Vector{String} = ARGS)
     opts.list && return print_sessions(opts.db_path)
     if opts.prompt !== nothing
         (; db_path, base_dir, provider, model_id, preset, continue_last, prompt) = opts
-        jdb = opendb(db_path)
-        session_id = continue_last ? latest_session(jdb) : nothing
-        evaluate(prompt; jdb, session_id, base_dir, provider, model_id, preset)
+        with_jdb(db_path) do jdb
+            session_id = continue_last ? latest_session(jdb) : nothing
+            evaluate(prompt; jdb, session_id, base_dir, provider, model_id, preset)
+        end
     else
         repl(; db_path = opts.db_path, continue_last = opts.continue_last,
             base_dir = opts.base_dir, preset = opts.preset)

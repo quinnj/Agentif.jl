@@ -54,15 +54,18 @@ function run_one(task, preset::Symbol; verbose::Bool = false, max_turns::Int = 2
         transcript_dir::Union{Nothing, String} = nothing, kw...)
     mktempdir() do dir
         task.setup(dir)
-        jdb = Juco.opendb(joinpath(mktempdir(), "eval.sqlite"))
         io = verbose ? stdout : devnull
         tio = transcript_dir === nothing ? nothing :
             open(joinpath(transcript_dir, "$(preset)-$(task.name).txt"), "w")
         t0 = time()
         result = try
-            Juco.evaluate(task.prompt;
-                base_dir = dir, jdb, preset, io, show_tools = verbose, max_turns,
-                on_event = tio === nothing ? nothing : transcript_recorder(tio), kw...)
+            mktempdir() do db_dir
+                Juco.with_jdb(joinpath(db_dir, "eval.sqlite")) do jdb
+                    Juco.evaluate(task.prompt;
+                        base_dir = dir, jdb, preset, io, show_tools = verbose, max_turns,
+                        on_event = tio === nothing ? nothing : transcript_recorder(tio), kw...)
+                end
+            end
         catch e
             verbose && showerror(stderr, e, catch_backtrace())
             tio === nothing || println(tio, "--- runner exception ---\n", sprint(showerror, e))

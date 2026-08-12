@@ -263,6 +263,24 @@ end
     end
 end
 
+@testset "database lifecycle" begin
+    mktempdir() do dir
+        normal_db = Ref{Juco.JucoDB}()
+        @test Juco.with_jdb(joinpath(dir, "normal.sqlite")) do jdb
+            normal_db[] = jdb
+            :done
+        end === :done
+        @test !isopen(normal_db[].db)
+
+        failed_db = Ref{Juco.JucoDB}()
+        @test_throws ErrorException Juco.with_jdb(joinpath(dir, "failed.sqlite")) do jdb
+            failed_db[] = jdb
+            error("stop")
+        end
+        @test !isopen(failed_db[].db)
+    end
+end
+
 @testset "model modes" begin
     @test Juco.mode_provider("openrouter") == "openrouter"
     @test Juco.mode_provider("codex") == "openai-codex"
