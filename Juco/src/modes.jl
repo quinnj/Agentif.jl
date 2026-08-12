@@ -45,9 +45,11 @@ function load_model_state(jdb::JucoDB)
 end
 
 function save_model_state!(jdb::JucoDB, mode::AbstractString, model_id::AbstractString, reasoning::Union{Nothing, AbstractString})
-    set_config!(jdb, "model_mode", mode)
-    set_config!(jdb, "model_id", model_id)
-    set_config!(jdb, "reasoning", reasoning)
+    SQLite.DBInterface.transaction(jdb.db) do
+        set_config!(jdb, "model_mode", mode)
+        set_config!(jdb, "model_id", model_id)
+        set_config!(jdb, "reasoning", reasoning)
+    end
     return nothing
 end
 

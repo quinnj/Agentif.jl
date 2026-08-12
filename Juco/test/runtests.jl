@@ -287,6 +287,24 @@ end
         @test Juco.get_config(jdb, "model_id") == Juco.MODE_DEFAULT_MODEL["openrouter"]
         @test Juco.get_config(jdb, "reasoning") === nothing
     end
+
+    mktempdir() do dir
+        jdb = Juco.opendb(joinpath(dir, "atomic-state.sqlite"))
+        Juco.save_model_state!(jdb, "openrouter", Juco.MODE_DEFAULT_MODEL["openrouter"], nothing)
+        SQLite.execute(jdb.db, """
+            CREATE TRIGGER reject_reasoning
+            BEFORE INSERT ON juco_config
+            WHEN NEW.key = 'reasoning'
+            BEGIN
+                SELECT RAISE(ABORT, 'reject reasoning');
+            END
+        """)
+        @test_throws SQLite.SQLiteException Juco.save_model_state!(
+            jdb, "codex", Juco.MODE_DEFAULT_MODEL["codex"], "high")
+        @test Juco.get_config(jdb, "model_mode") == "openrouter"
+        @test Juco.get_config(jdb, "model_id") == Juco.MODE_DEFAULT_MODEL["openrouter"]
+        @test Juco.get_config(jdb, "reasoning") === nothing
+    end
 end
 
 @testset "non-TTY menu EOF cancels" begin
