@@ -291,6 +291,15 @@ end
     @test Juco.choose(buf, "Pick:", ["one", "two"]; input = IOBuffer("9\n")) === nothing
 end
 
+@testset "CLI argument parsing" begin
+    parsed = Juco.parse_cli_args(["--list", "--db", "/tmp/juco-test.sqlite"])
+    @test parsed.list
+    @test parsed.db_path == "/tmp/juco-test.sqlite"
+    @test_throws ArgumentError Juco.parse_cli_args(["--db"])
+    @test_throws ArgumentError Juco.parse_cli_args(["--prompt"])
+    @test_throws ArgumentError Juco.parse_cli_args(["--preset", "unknown"])
+end
+
 @testset "skills" begin
     mktempdir() do dir
         skdir = joinpath(dir, ".agent", "skills")

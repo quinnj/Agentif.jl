@@ -570,7 +570,7 @@ Flags:
 The interactive session uses the persisted model selection (see /model).
 """
 
-function main(args::Vector{String} = ARGS)
+function parse_cli_args(args::Vector{String})
     db_path = DEFAULT_DB_PATH
     base_dir = pwd()
     provider = default_provider()
@@ -578,38 +578,59 @@ function main(args::Vector{String} = ARGS)
     preset = :juco
     continue_last = false
     prompt = nothing
+    list = false
+    help = false
     i = 1
     while i <= length(args)
         a = args[i]
         if a in ("-h", "--help")
-            return print(CLI_HELP)
+            help = true
+            break
         elseif a in ("-c", "--continue")
             continue_last = true
         elseif a in ("-l", "--list")
-            return print_sessions(db_path)
+            list = true
         elseif a in ("-p", "--prompt")
+            i < length(args) || throw(ArgumentError("$a requires a value"))
             i += 1; prompt = args[i]
         elseif a == "--db"
+            i < length(args) || throw(ArgumentError("$a requires a value"))
             i += 1; db_path = args[i]
         elseif a == "--dir"
+            i < length(args) || throw(ArgumentError("$a requires a value"))
             i += 1; base_dir = args[i]
         elseif a == "--provider"
+            i < length(args) || throw(ArgumentError("$a requires a value"))
             i += 1; provider = args[i]
         elseif a == "--model"
+            i < length(args) || throw(ArgumentError("$a requires a value"))
             i += 1; model_id = args[i]
         elseif a == "--preset"
+            i < length(args) || throw(ArgumentError("$a requires a value"))
             i += 1; preset = Symbol(args[i])
         else
-            error("Unknown flag: $a (see juco --help)")
+            throw(ArgumentError("Unknown flag: $a (see juco --help)"))
         end
         i += 1
     end
-    if prompt !== nothing
+    preset in (:juco, :pi, :bash) ||
+        throw(ArgumentError("unknown preset: $preset (expected juco, pi, or bash)"))
+    list && prompt !== nothing && throw(ArgumentError("--list and --prompt cannot be used together"))
+    return (; db_path, base_dir, provider, model_id, preset, continue_last, prompt, list, help)
+end
+
+function main(args::Vector{String} = ARGS)
+    opts = parse_cli_args(args)
+    opts.help && return print(CLI_HELP)
+    opts.list && return print_sessions(opts.db_path)
+    if opts.prompt !== nothing
+        (; db_path, base_dir, provider, model_id, preset, continue_last, prompt) = opts
         jdb = opendb(db_path)
         session_id = continue_last ? latest_session(jdb) : nothing
         evaluate(prompt; jdb, session_id, base_dir, provider, model_id, preset)
     else
-        repl(; db_path, continue_last, base_dir, preset)
+        repl(; db_path = opts.db_path, continue_last = opts.continue_last,
+            base_dir = opts.base_dir, preset = opts.preset)
     end
     return nothing
 end
