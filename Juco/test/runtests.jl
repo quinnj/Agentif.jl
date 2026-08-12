@@ -84,6 +84,9 @@ end
         write(joinpath(dir, "dup.txt"), "x\nx\n")
         err = try edit.func("dup.txt", "x", "y"); nothing catch e; e end
         @test err isa ArgumentError && occursin("at lines 1, 2", err.msg)
+        # overlapping occurrences are also ambiguous
+        write(joinpath(dir, "overlap.txt"), "aaa")
+        @test_throws ArgumentError edit.func("overlap.txt", "aa", "b")
         # not-found errors include nearest-match candidates
         write(joinpath(dir, "near.txt"), "alpha\nbeta = 1\ngamma\n")
         err = try edit.func("near.txt", "beta = 2", "beta = 3"); nothing catch e; e end

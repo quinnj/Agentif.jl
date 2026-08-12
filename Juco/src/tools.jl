@@ -154,6 +154,18 @@ function edited_region(new_content::String, replace_start::Int, new_text::String
     return "lines $(lo)-$(hi) now:\n" * join(numbered, "\n")
 end
 
+function overlapping_matches(needle::String, haystack::String)
+    matches = UnitRange{Int}[]
+    from = firstindex(haystack)
+    while from <= lastindex(haystack)
+        match = findnext(needle, haystack, from)
+        match === nothing && break
+        push!(matches, match)
+        from = nextind(haystack, first(match))
+    end
+    return matches
+end
+
 function create_edit_tool(base_dir::AbstractString)
     base = LLMTools.ensure_base_dir(base_dir)
     return Agentif.@tool(
@@ -183,7 +195,7 @@ Errors if: oldText not found or not unique, file missing when editing, or file a
             end
             isfile(resolved) || throw(ArgumentError("file not found: $(path) (to create it, pass oldText = \"\")"))
             content = Base.read(resolved, String)
-            matches = findall(oldText, content)
+            matches = overlapping_matches(oldText, content)
             isempty(matches) && throw(ArgumentError(
                 "could not find the exact text in $(path)." * nearest_match_hint(content, oldText)))
             if length(matches) > 1
