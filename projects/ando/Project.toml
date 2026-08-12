@@ -1,12 +1,15 @@
 [deps]
+GitHub = "bc5e4493-9b4d-5f90-b8aa-2b2bcaad7a26"
 LLMOAuth = "f3f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2d"
 Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
 Claw = "46916a23-5c37-4b23-b62b-45b422578c04"
 
 [sources]
+GitHub = {url = "https://github.com/JuliaWeb/GitHub.jl.git"}
 LLMOAuth = {path = "../../LLMOAuth"}
 Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}
 Claw = {path = "../../Claw"}
 
 [compat]
+GitHub = "5"
 julia = "1.10"
