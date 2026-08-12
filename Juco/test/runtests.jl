@@ -4,6 +4,8 @@ using Juco
 using Agentif
 using SQLite
 
+include(joinpath(@__DIR__, "..", "eval", "env.jl"))
+
 @testset "Juco" begin
 
 @testset "db: memories and sessions" begin
@@ -278,6 +280,25 @@ end
             error("stop")
         end
         @test !isopen(failed_db[].db)
+    end
+end
+
+@testset "eval environment" begin
+    withenv("OPENROUTER_API_KEY" => nothing) do
+        @test_throws ArgumentError load_eval_env!()
+    end
+    withenv(
+            "OPENROUTER_API_KEY" => "test-key",
+            "JUCO_MODEL_PROVIDER" => nothing,
+            "JUCO_MODEL" => nothing,
+            "JUCO_REASONING" => nothing,
+            "JUCO_OPENROUTER_ORDER" => nothing,
+        ) do
+        @test load_eval_env!() === nothing
+        @test ENV["JUCO_MODEL_PROVIDER"] == "openrouter"
+        @test ENV["JUCO_MODEL"] == "deepseek/deepseek-v4-flash-0731"
+        @test ENV["JUCO_REASONING"] == "medium"
+        @test ENV["JUCO_OPENROUTER_ORDER"] == "siliconflow/fp8"
     end
 end
 

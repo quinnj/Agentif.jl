@@ -5,7 +5,7 @@
 #   julia --project=. Juco/eval/run.jl --preset juco         # one preset
 #   julia --project=. Juco/eval/run.jl --task fix-bug -v     # one task, verbose
 #
-# Model selection: JUCO_PROVIDER / JUCO_MODEL / JUCO_API_KEY (or provider key env).
+# Model selection: JUCO_MODEL_PROVIDER / JUCO_MODEL / JUCO_API_KEY (or provider key env).
 #
 # Each run gets a fresh temp working directory and a fresh temp sqlite db, so
 # runs are independent (no memory/session bleed between tasks).
