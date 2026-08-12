@@ -8,6 +8,7 @@ using Sockets
 using SQLite
 
 include(joinpath(@__DIR__, "..", "eval", "env.jl"))
+include(joinpath(@__DIR__, "..", "eval", "tasks.jl"))
 
 @testset "Juco" begin
 
@@ -597,6 +598,28 @@ end
         for i in 1:60; write(joinpath(dir, "f$(lpad(i, 2, '0')).txt"), ""); end
         p = Juco.build_prompt(dir, :juco)
         @test occursin("more entries)", p)
+    end
+end
+
+@testset "performance eval is bounded and discriminating" begin
+    task = only(t for t in TASKS if t.name == "perf-fix")
+    mktempdir() do dir
+        task.setup(dir)
+        test_source = read(joinpath(dir, "test_render.jl"), String)
+        bounded = occursin("20_000", test_source)
+        @test bounded
+        bounded || return
+        @test !task.check(dir)
+        write(joinpath(dir, "render.jl"), """
+            function render_rows(n)
+                io = IOBuffer()
+                for i in 1:n
+                    println(io, "row ", i, ": ", i * i)
+                end
+                return String(take!(io))
+            end
+            """)
+        @test task.check(dir)
     end
 end
 

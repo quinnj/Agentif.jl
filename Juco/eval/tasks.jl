@@ -421,16 +421,19 @@ const TASKS = [
             using Test
             small = render_rows(3)
             @test small == "row 1: 1\\nrow 2: 4\\nrow 3: 9\\n"
+            big_ref = Ref{String}()
             t0 = time()
-            big = render_rows(200_000)
+            allocated = @allocated big_ref[] = render_rows(20_000)
             elapsed = time() - t0
-            @test endswith(big, "row 200000: 40000000000\\n")
-            @test count(==('\\n'), big) == 200_000
-            @test elapsed < 5.0  # the current implementation is quadratic and far slower
+            big = big_ref[]
+            @test endswith(big, "row 20000: 400000000\\n")
+            @test count(==('\\n'), big) == 20_000
+            @test allocated < 100_000_000  # quadratic concatenation allocates several GB
+            @test elapsed < 5.0
             println("OK")
             """)
     end,
-    prompt = "test_render.jl times out its performance assertion. Make render_rows fast enough (same output) so the test passes.",
+    prompt = "test_render.jl fails its performance assertion. Make render_rows efficient enough (same output) so the test passes.",
     check = dir -> _run_ok(dir, `julia --startup-file=no test_render.jl`),
 ),
 
