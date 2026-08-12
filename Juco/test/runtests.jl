@@ -2,6 +2,7 @@ using Test
 using JSON
 using Juco
 using Agentif
+using SQLite
 
 @testset "Juco" begin
 
@@ -255,6 +256,10 @@ end
         @test Juco.get_config(jdb, "k") == "v2"
         Juco.set_config!(jdb, "k", nothing)
         @test Juco.get_config(jdb, "k") === nothing
+        Juco.set_config!(jdb, "k", "final")
+        @test Juco.get_config(jdb, "k") == "final"
+        # A partial one-row SELECT must release its statement and schema lock.
+        @test_nowarn SQLite.execute(jdb.db, "DROP TABLE juco_config")
     end
 end
 
