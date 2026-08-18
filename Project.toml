@@ -23,26 +23,68 @@ Slack = "4d517630-ce0d-4555-8fa7-416d9f8f5684"
 Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
 Tempus = "e6262be2-5787-4bdc-bc3f-4b5a3442fa30"
 
-[sources]
-Agentif = {path = "Agentif"}
-Claw = {path = "Claw"}
-ConcurrentUtilities = {rev = "main", url = "https://github.com/JuliaServices/ConcurrentUtilities.jl.git"}
-Encid = {url = "https://github.com/JuliaServices/Encid.jl.git"}
-HTTP = {rev = "master", url = "https://github.com/JuliaWeb/HTTP.jl.git"}
-JSONSchema = {rev = "4076c12e69f8191b611580744c42579f95e92974", url = "https://github.com/JuliaIO/JSONSchema.jl.git"}
-Juco = {path = "Juco"}
-LLMOAuth = {path = "LLMOAuth"}
-LLMProviders = {path = "LLMProviders"}
-LLMTools = {path = "LLMTools"}
-LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}
-MSTeams = {url = "https://github.com/quinnj/MSTeams.jl.git"}
-Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}
-OAuth = {rev = "main", url = "https://github.com/JuliaServices/OAuth.jl.git"}
-PtySessions = {url = "https://github.com/JuliaServices/PtySessions.jl.git"}
-Signal = {url = "https://github.com/quinnj/Signal.jl.git"}
-Slack = {url = "https://github.com/quinnj/Slack.jl.git"}
-Telegram = {url = "https://github.com/quinnj/Telegram.jl.git"}
-Tempus = {rev = "main", url = "https://github.com/JuliaServices/Tempus.jl.git"}
+[sources.Agentif]
+path = "Agentif"
+
+[sources.Claw]
+path = "Claw"
+
+[sources.ConcurrentUtilities]
+rev = "main"
+url = "https://github.com/JuliaServices/ConcurrentUtilities.jl.git"
+
+[sources.Encid]
+url = "https://github.com/JuliaServices/Encid.jl.git"
+
+[sources.HTTP]
+rev = "master"
+url = "https://github.com/JuliaWeb/HTTP.jl.git"
+
+[sources.JSONSchema]
+rev = "4076c12e69f8191b611580744c42579f95e92974"
+url = "https://github.com/JuliaIO/JSONSchema.jl.git"
+
+[sources.Juco]
+path = "Juco"
+
+[sources.LLMOAuth]
+path = "LLMOAuth"
+
+[sources.LLMProviders]
+path = "LLMProviders"
+
+[sources.LLMTools]
+path = "LLMTools"
+
+[sources.LocalSearch]
+url = "https://github.com/quinnj/LocalSearch.jl.git"
+
+[sources.MSTeams]
+url = "https://github.com/quinnj/MSTeams.jl.git"
+
+[sources.Mattermost]
+url = "https://github.com/quinnj/Mattermost.jl.git"
+
+[sources.OAuth]
+rev = "main"
+url = "https://github.com/JuliaServices/OAuth.jl.git"
+
+[sources.PtySessions]
+url = "https://github.com/JuliaServices/PtySessions.jl.git"
+
+[sources.Signal]
+url = "https://github.com/quinnj/Signal.jl.git"
+
+[sources.Slack]
+url = "https://github.com/quinnj/Slack.jl.git"
+
+[sources.Telegram]
+url = "https://github.com/quinnj/Telegram.jl.git"
+
+[sources.Tempus]
+rev = "main"
+url = "https://github.com/JuliaServices/Tempus.jl.git"
 
 [compat]
+ReplMaker = "0.2"
 julia = "1.11"
