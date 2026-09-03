@@ -181,55 +181,41 @@ function parse_frontmatter(content::AbstractString)
     lines = split(content, "\n"; keepempty = true)
     isempty(lines) && throw(ArgumentError("missing frontmatter"))
     strip(lines[1]) == "---" || throw(ArgumentError("missing frontmatter start delimiter"))
-    end_idx = nothing
-    for i in 2:length(lines)
-        if strip(lines[i]) == "---"
-            end_idx = i
-            break
-        end
-    end
+    end_idx = findnext(line -> strip(line) == "---", lines, 2)
     end_idx === nothing && throw(ArgumentError("missing frontmatter end delimiter"))
-    front_lines = lines[2:(end_idx - 1)]
-    return parse_frontmatter_lines(front_lines)
+    return parse_frontmatter_lines(lines[2:(end_idx - 1)])
 end
 
 function parse_frontmatter_lines(lines::AbstractVector{<:AbstractString})
-    fields = Dict{String, Any}()
-    metadata = Dict{String, String}()
-    i = 1
-    while i <= length(lines)
-        line = lines[i]
-        stripped = strip(line)
-        if isempty(stripped) || startswith(stripped, "#")
-            i += 1
-            continue
-        end
-        if stripped == "metadata:"
-            i += 1
-            while i <= length(lines)
-                meta_line = lines[i]
-                isempty(strip(meta_line)) && (i += 1; continue)
-                indent = length(meta_line) - length(lstrip(meta_line))
-                indent < 2 && break
-                meta_str = strip(meta_line)
-                m = match(r"^([A-Za-z0-9_.-]+)\s*:\s*(.*)$", meta_str)
-                if m !== nothing
-                    metadata[m.captures[1]] = unquote(m.captures[2])
-                end
-                i += 1
-            end
-            continue
-        end
-        m = match(r"^([A-Za-z0-9_-]+)\s*:\s*(.*)$", stripped)
-        if m !== nothing
-            fields[m.captures[1]] = unquote(m.captures[2])
-        end
-        i += 1
+    document = try
+        YAML.load(join(lines, "\n"))
+    catch e
+        message = first(sprint(showerror, e), 200)
+        throw(ArgumentError("invalid YAML frontmatter: $message"))
     end
-    if !isempty(metadata)
-        fields["metadata"] = metadata
+    document === nothing && return Dict{String, Any}()
+    document isa AbstractDict || throw(ArgumentError("frontmatter must be a mapping"))
+
+    fields = Dict{String, Any}()
+    for (key, value) in document
+        string_key = string(key)
+        fields[string_key] = if string_key == "metadata" && value isa AbstractDict
+            Dict{String, String}(
+                string(metadata_key) => flatten_yaml(metadata_value) for
+                (metadata_key, metadata_value) in value
+            )
+        else
+            flatten_yaml(value)
+        end
     end
     return fields
+end
+
+function flatten_yaml(value)
+    value === nothing && return ""
+    value isa AbstractString && return rstrip(String(value), ['\r', '\n'])
+    value isa AbstractVector && return join((flatten_yaml(item) for item in value), ", ")
+    return string(value)
 end
 
 function unquote(value::AbstractString)

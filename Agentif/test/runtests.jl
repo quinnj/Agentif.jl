@@ -1924,6 +1924,60 @@ end
     end
 end
 
+@testset "skill frontmatter uses YAML semantics" begin
+    doc = """
+    ---
+    name: demo
+    description: >
+      first line
+      second line
+
+      new paragraph
+    metadata:
+      author: someone
+      created: 2026-08-21
+    ---
+
+    body text
+    """
+    fields = Agentif.parse_frontmatter(doc)
+    @test fields["name"] == "demo"
+    @test fields["description"] == "first line second line\nnew paragraph"
+    @test fields["metadata"] == Dict("author" => "someone", "created" => "2026-08-21")
+
+    description(doc) = Agentif.parse_frontmatter(doc)["description"]
+    @test description("---\nname: a\ndescription: just text\n---\n") == "just text"
+    @test description("---\nname: a\ndescription: \"quoted\"\n---\n") == "quoted"
+    @test description("---\nname: a\ndescription: |\n  one\n  two\n---\n") == "one\ntwo"
+    @test description("---\nname: a\ndescription: >-\n  one\n  two\n\n---\n") == "one two"
+    @test description("---\nname: a\ndescription: >\n  weird: value here\n---\n") == "weird: value here"
+    @test description("---\r\nname: a\r\ndescription: >\r\n  one\r\n  two\r\n---\r\n") == "one two"
+    @test description("---\n# a note\nname: a\ndescription: text\n---\n") == "text"
+
+    @test description("---\nname: a\ndescription: 2026\n---\n") == "2026"
+    @test description("---\nname: a\ndescription: [one, two]\n---\n") == "one, two"
+    @test Agentif.flatten_yaml(nothing) == ""
+
+    @test_throws ArgumentError Agentif.parse_frontmatter("---\nname: a\ndescription: > bad\n---\n")
+    @test_throws ArgumentError Agentif.parse_frontmatter("name: a\n")
+    @test_throws ArgumentError Agentif.parse_frontmatter("---\nname: a\n")
+    @test_throws ArgumentError Agentif.parse_frontmatter("---\n- a list\n---\n")
+    @test Agentif.parse_frontmatter("---\n---\n") == Dict{String, Any}()
+
+    dir = mktempdir()
+    mkpath(joinpath(dir, "demo-skill"))
+    write(
+        joinpath(dir, "demo-skill", "SKILL.md"),
+        "---\nname: demo-skill\ndescription: >\n" *
+        "  Do the thing, and the other thing.\n" *
+        "  Invoke when the thing needs doing.\n---\n\nbody\n",
+    )
+    found = Agentif.discover_skills([dir])
+    @test length(found) == 1
+    @test only(found).description ==
+          "Do the thing, and the other thing. Invoke when the thing needs doing."
+end
+
 @testset "skill metadata unquoting is UTF-8 safe" begin
     @test Agentif.unquote("\"café\"") == "café"
     @test Agentif.unquote("'😀'") == "😀"

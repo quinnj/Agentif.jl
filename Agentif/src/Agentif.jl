@@ -1,6 +1,6 @@
 module Agentif
 
-using Base64, Dates, HTTP, InteractiveUtils, JSON, JSONSchema, Logging, LoggingExtras, PtySessions, ScopedValues, StructUtils
+using Base64, Dates, HTTP, InteractiveUtils, JSON, JSONSchema, Logging, LoggingExtras, PtySessions, ScopedValues, StructUtils, YAML
 using Encid: UID8
 using LLMProviders
 using LLMProviders: Model, getModel, getProviders, getModels, calculateCost, registerModel!, discover_models!
