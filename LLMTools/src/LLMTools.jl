@@ -3,6 +3,7 @@ module LLMTools
 using Agentif
 using Agentif: Agent, AgentTool, AssistantMessage, message_text, evaluate
 using HTTP, JSON, PtySessions, UUIDs
+using GitIgnore: IgnoreMatcher, walkfiltered
 using ConcurrentUtilities: Workers, Worker, remote_eval, remote_fetch
 using ScopedValues: ScopedValue, @with
 

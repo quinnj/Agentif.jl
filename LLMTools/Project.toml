@@ -5,6 +5,7 @@ version = "1.0.0"
 [deps]
 Agentif = "b1e21dde-9d8e-492f-89d0-ee48af23bfc5"
 ConcurrentUtilities = "f0e56b4a-5159-44fe-b623-3e5288b988bb"
+GitIgnore = "a0010394-fc0d-43eb-a3e0-33caa976912f"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 PtySessions = "581b29ee-4021-4243-bea3-a8421693f905"
@@ -21,12 +22,13 @@ PtySessions = {url = "https://github.com/quinnj/PtySessions.jl.git"}
 [compat]
 Agentif = "1"
 ConcurrentUtilities = "2"
+GitIgnore = "0.1"
 HTTP = "2"
 JSON = "1.3"
 PtySessions = "0.1"
 ScopedValues = "1.3"
 UUIDs = "1"
-julia = "1.10"
+julia = "1.11"
 
 [extras]
 LLMProviders = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"

@@ -10,6 +10,9 @@ Current tool areas include:
 - web fetch and search
 - Subagent helpers
 
+The `ls`, `find`, and `grep` tools omit `.git` and honor applicable
+`.gitignore` rules. Other dotfiles remain visible.
+
 Semantic/code-search experiments are no longer exposed from `LLMTools`; that work moved to `LocalSearch.jl`.
 
 ## Repo-Root Workflow

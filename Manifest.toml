@@ -157,6 +157,11 @@ git-tree-sha1 = "33de1bc5665494f0a9669fd6027e28180709d874"
 uuid = "bc5e4493-9b4d-5f90-b8aa-2b2bcaad7a26"
 version = "5.13.0"
 
+[[deps.GitIgnore]]
+git-tree-sha1 = "55daea4f28753322302c1ccf03990cf6e9502264"
+uuid = "a0010394-fc0d-43eb-a3e0-33caa976912f"
+version = "0.1.1"
+
 [[deps.HTTP]]
 deps = ["Base64", "CodecZlib", "Dates", "EnumX", "PrecompileTools", "Random", "Reseau", "SHA", "URIs", "UUIDs", "Zlib_jll"]
 git-tree-sha1 = "0a58fbbdee93d132a2fb1159b7f5e1b5c2465e71"
@@ -253,7 +258,7 @@ uuid = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
 version = "1.0.0"
 
 [[deps.LLMTools]]
-deps = ["Agentif", "ConcurrentUtilities", "HTTP", "JSON", "PtySessions", "ScopedValues", "Sockets", "UUIDs"]
+deps = ["Agentif", "ConcurrentUtilities", "GitIgnore", "HTTP", "JSON", "PtySessions", "ScopedValues", "Sockets", "UUIDs"]
 path = "LLMTools"
 uuid = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
 version = "1.0.0"

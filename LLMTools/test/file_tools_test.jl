@@ -67,6 +67,86 @@ end
             grep_regex = grep_files("^buy", ".", "**/*.txt", false, false, 0, 20)
             @test occursin("notes/todo.txt:1: buy milk", grep_regex)
         end
+
+        @testset "ls/find/grep honor git ignore rules" begin
+            write_file(".gitignore", "*.log\nbuild/\n")
+            write_file(".env", "needle visible dotfile")
+            write_file("visible.txt", "needle visible")
+            write_file("ignored.log", "needle ignored")
+            write_file("build/output.txt", "needle ignored")
+            write_file("nested/.gitignore", "ignored.txt\n!keep.log\n")
+            write_file("nested/ignored.txt", "needle ignored")
+            write_file("nested/keep.log", "needle visible")
+            write_file("nested/visible.md", "needle visible")
+            write_file(".git/objects/blob", "needle ignored")
+
+            listing = ls_dir(".", 50)
+            @test occursin(".env", listing)
+            @test occursin(".gitignore", listing)
+            @test occursin("visible.txt", listing)
+            @test !occursin(".git/", listing)
+            @test !occursin("ignored.log", listing)
+            @test !occursin("build/", listing)
+
+            nested_listing = ls_dir("nested", 50)
+            @test occursin("keep.log", nested_listing)
+            @test occursin("visible.md", nested_listing)
+            @test !occursin("ignored.txt", nested_listing)
+
+            found = find_files("**", nothing, 50)
+            @test occursin(".env", found)
+            @test occursin("visible.txt", found)
+            @test occursin("nested/keep.log", found)
+            @test !occursin(".git/", found)
+            @test !occursin("ignored.log", found)
+            @test !occursin("build/", found)
+            @test !occursin("nested/ignored.txt", found)
+
+            matches = grep_files("needle", ".", nothing, false, true, 0, 50)
+            @test occursin(".env:1: needle visible dotfile", matches)
+            @test occursin("visible.txt:1: needle visible", matches)
+            @test occursin("nested/keep.log:1: needle visible", matches)
+            @test occursin("nested/visible.md:1: needle visible", matches)
+            @test !occursin(".git/", matches)
+            @test !occursin("ignored.log", matches)
+            @test !occursin("build/", matches)
+            @test !occursin("nested/ignored.txt", matches)
+
+            explicit_listing = ls_dir("build", 50)
+            @test occursin("output.txt", explicit_listing)
+
+            explicitly_found = find_files("**", "build", 50)
+            @test occursin("output.txt", explicitly_found)
+
+            explicit_match = grep_files("needle", "ignored.log", nothing, false, true, 0, 50)
+            @test occursin("ignored.log:1: needle ignored", explicit_match)
+        end
+    end
+end
+
+@testset "File tools honor repository rules above base" begin
+    mktempdir() do repo
+        mkpath(joinpath(repo, ".git"))
+        mkpath(joinpath(repo, "src"))
+        write(joinpath(repo, ".gitignore"), "src/*.log\n")
+        write(joinpath(repo, "src", "ignored.log"), "needle ignored")
+        write(joinpath(repo, "src", "visible.txt"), "needle visible")
+
+        funcs = file_funcs(joinpath(repo, "src"))
+        listing = funcs["ls"](".", 20)
+        @test occursin("visible.txt", listing)
+        @test !occursin("ignored.log", listing)
+
+        found = funcs["find"]("**", nothing, 20)
+        @test occursin("visible.txt", found)
+        @test !occursin("ignored.log", found)
+
+        matches = funcs["grep"]("needle", ".", nothing, false, true, 0, 20)
+        @test occursin("visible.txt:1: needle visible", matches)
+        @test !occursin("ignored.log", matches)
+
+        explicit_match = funcs["grep"]("needle", "ignored.log", nothing, false, true, 0, 20)
+        @test occursin("ignored.log:1: needle ignored", explicit_match)
     end
 end
 
