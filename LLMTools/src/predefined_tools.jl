@@ -154,6 +154,19 @@ function resolve_search_path(base_dir::AbstractString, path::Union{Nothing, Stri
     return resolve_relative_path(base_dir, local_path)
 end
 
+function ignore_root(base_dir::AbstractString)
+    base = abspath(base_dir)
+    current = base
+    while true
+        ispath(joinpath(current, ".git")) && return current
+        parent = dirname(current)
+        parent == current && return base
+        current = parent
+    end
+end
+
+ignore_matcher(base_dir::AbstractString) = IgnoreMatcher(ignore_root(base_dir))
+
 function normalize_relpath(path::AbstractString)
     return replace(path, '\\' => '/')
 end
@@ -333,7 +346,7 @@ Arguments:
 - path (String or nothing, required): Directory path relative to the working directory, or nothing to list the working directory itself.
 - limit (Int, optional): Maximum number of entries to return. Defaults to 500.
 
-Entries are sorted alphabetically (case-insensitive). Directories have a trailing `/` suffix. Dotfiles are included. Output is truncated to 500 entries or 50KB, whichever is hit first.
+Entries are sorted alphabetically (case-insensitive). Directories have a trailing `/` suffix. `.git` and entries excluded by applicable `.gitignore` rules are omitted. Other dotfiles are included. Output is truncated to 500 entries or 50KB, whichever is hit first.
 
 Examples:
 - `ls(nothing)` — list the working directory
@@ -341,7 +354,13 @@ Examples:
         ls(path::Union{Nothing, String}, limit::Union{Nothing, Int} = nothing) = begin
             dir_path = resolve_search_path(base, path)
             isdir(dir_path) || throw(ArgumentError("not a directory: $(path === nothing ? "." : path)"))
-            entries = readdir(dir_path)
+            entries = String[]
+            matcher = ignore_matcher(base)
+            walkfiltered(matcher, dir_path) do _root, dirs, files
+                append!(entries, dirs)
+                append!(entries, files)
+                return false
+            end
             sort!(entries, lt = (a, b) -> lowercase(a) < lowercase(b))
             effective_limit = limit === nothing ? DEFAULT_LS_LIMIT : max(1, limit)
             results = String[]
@@ -446,7 +465,7 @@ Arguments:
 - path (String or nothing, optional): Directory to search within, relative to the working directory. Defaults to the working directory.
 - limit (Int, optional): Maximum number of results. Defaults to 1000.
 
-Matched directories have a trailing `/` suffix. Output is also capped at 50KB.
+Matched directories have a trailing `/` suffix. `.git` and entries excluded by applicable `.gitignore` rules are omitted. Output is also capped at 50KB.
 
 Examples:
 - `find("*.jl")` — find all Julia files recursively
@@ -456,10 +475,11 @@ Examples:
             search_dir = resolve_search_path(base, path)
             isdir(search_dir) || throw(ArgumentError("not a directory: $(path === nothing ? "." : path)"))
             regex = glob_to_regex(pattern)
+            matcher = ignore_matcher(base)
             effective_limit = limit === nothing ? DEFAULT_FIND_LIMIT : max(1, limit)
             results = String[]
             limit_reached = false
-            for (root, dirs, files) in walkdir(search_dir)
+            walk_result = walkfiltered(matcher, search_dir) do root, dirs, files
                 rel_root = relpath(root, search_dir)
                 rel_root = rel_root == "." ? "" : normalize_relpath(rel_root)
                 for dir in dirs
@@ -468,23 +488,23 @@ Examples:
                         push!(results, rel * "/")
                         if length(results) >= effective_limit
                             limit_reached = true
-                            break
+                            return false
                         end
                     end
                 end
-                limit_reached && break
                 for file in files
                     rel = rel_root == "" ? file : "$(rel_root)/$(file)"
                     if occursin(regex, rel)
                         push!(results, rel)
                         if length(results) >= effective_limit
                             limit_reached = true
-                            break
+                            return false
                         end
                     end
                 end
-                limit_reached && break
+                return true
             end
+            limit_reached = limit_reached || !walk_result.completed
             isempty(results) && return "No files found matching pattern"
             raw_output = join(results, "\n")
             truncation = truncate_head(raw_output; max_lines = typemax(Int))
@@ -517,7 +537,7 @@ Arguments:
 - context (Int or nothing, optional): Number of lines to show before and after each match (like `grep -C`).
 - limit (Int, optional): Maximum number of matches. Defaults to 100.
 
-Lines longer than 500 characters are truncated. Output is capped at 50KB.
+`.git` and files excluded by applicable `.gitignore` rules are not searched during recursive directory searches. Lines longer than 500 characters are truncated. Output is capped at 50KB.
 
 Examples:
 - `grep("function main")` — search all files for a regex pattern
@@ -538,22 +558,22 @@ Examples:
             effective_limit = limit === nothing ? DEFAULT_GREP_LIMIT : max(1, limit)
             context_value = context === nothing ? 0 : max(0, context)
             glob_regex = glob === nothing ? nothing : glob_to_regex(glob)
-            match_count = 0
-            match_limit_reached = false
-            lines_truncated = false
+            match_count = Ref(0)
+            match_limit_reached = Ref(false)
+            lines_truncated = Ref(false)
             output_lines = String[]
             search_root = isdir(search_path) ? search_path : dirname(search_path)
-            file_list = isdir(search_path) ? collect(walkdir(search_path)) : [(search_root, String[], [basename(search_path)])]
-            regex = nothing
-            if literal !== true
+            regex = if literal === true
+                nothing
+            else
                 try
                     flags = ignoreCase === true ? "i" : ""
-                    regex = Regex(pattern, flags)
+                    Regex(pattern, flags)
                 catch
                     throw(ArgumentError("invalid regex pattern"))
                 end
             end
-            for (root, _dirs, files) in file_list
+            function search_files(root, files)
                 for file in files
                     file_path = joinpath(root, file)
                     rel_path = normalize_relpath(relpath(file_path, search_root))
@@ -578,9 +598,9 @@ Examples:
                         end
                         if is_match
                             push!(match_lines, idx)
-                            match_count += 1
-                            if match_count >= effective_limit
-                                match_limit_reached = true
+                            match_count[] += 1
+                            if match_count[] >= effective_limit
+                                match_limit_reached[] = true
                                 break
                             end
                         end
@@ -595,7 +615,7 @@ Examples:
                         for line_idx in start_line:end_line
                             line_text = lines[line_idx]
                             truncated = truncate_line(line_text)
-                            truncated.was_truncated && (lines_truncated = true)
+                            truncated.was_truncated && (lines_truncated[] = true)
                             if line_idx in match_set
                                 push!(output_lines, "$(rel_path):$(line_idx): $(truncated.text)")
                             else
@@ -604,17 +624,25 @@ Examples:
                         end
                         last_printed = max(last_printed, end_line)
                     end
-                    match_limit_reached && break
+                    match_limit_reached[] && return false
                 end
-                match_limit_reached && break
+                return true
+            end
+            if isdir(search_path)
+                matcher = ignore_matcher(base)
+                walkfiltered(matcher, search_path) do root, _dirs, files
+                    return search_files(root, files)
+                end
+            else
+                search_files(search_root, [basename(search_path)])
             end
             isempty(output_lines) && return "No matches found"
             raw_output = join(output_lines, "\n")
             truncation = truncate_head(raw_output; max_lines = typemax(Int))
             output = truncation.content
             notices = String[]
-            match_limit_reached && push!(notices, "$(effective_limit) matches limit reached. Use limit=$(effective_limit * 2) for more, or refine pattern")
-            lines_truncated && push!(notices, "some lines were truncated")
+            match_limit_reached[] && push!(notices, "$(effective_limit) matches limit reached. Use limit=$(effective_limit * 2) for more, or refine pattern")
+            lines_truncated[] && push!(notices, "some lines were truncated")
             truncation.truncated && push!(notices, "$(format_size(DEFAULT_MAX_BYTES)) limit reached")
             if !isempty(notices)
                 output *= "\n\n[$(join(notices, ". "))]"
