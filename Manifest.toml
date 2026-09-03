@@ -23,7 +23,7 @@ version = "0.1.1"
     Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [[deps.Agentif]]
-deps = ["Base64", "ConcurrentUtilities", "Dates", "Encid", "HTTP", "InteractiveUtils", "JSON", "JSONSchema", "LLMProviders", "Logging", "LoggingExtras", "PtySessions", "ScopedValues", "StructUtils"]
+deps = ["Base64", "ConcurrentUtilities", "Dates", "Encid", "HTTP", "InteractiveUtils", "JSON", "JSONSchema", "LLMProviders", "Logging", "LoggingExtras", "PtySessions", "ScopedValues", "StructUtils", "YAML"]
 path = "Agentif"
 uuid = "b1e21dde-9d8e-492f-89d0-ee48af23bfc5"
 version = "1.0.0"
@@ -289,6 +289,12 @@ version = "1.11.3+1"
 uuid = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 version = "1.11.0"
 
+[[deps.Libiconv_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "be484f5c92fad0bd8acfef35fe017900b0b73809"
+uuid = "94ce4f54-9a6c-5748-9c1c-f9c7231a4531"
+version = "1.18.0+0"
+
 [[deps.LocalSearch]]
 deps = ["Dates", "Downloads", "Libdl", "SHA", "SQLite", "llama_cpp_jll", "sqlite_vec_jll"]
 git-tree-sha1 = "d82d515cc679ffe4d291c7d0f20a9bedc948715f"
@@ -476,6 +482,12 @@ git-tree-sha1 = "80cef67d2953e33935b41c6ab0a178b9987b1c99"
 uuid = "2133526b-2bfb-4018-ac12-889fb3908a75"
 version = "0.1.1"
 
+[[deps.StringEncodings]]
+deps = ["Libiconv_jll"]
+git-tree-sha1 = "b765e46ba27ecf6b44faf70df40c57aa3a547dcb"
+uuid = "69024149-9ee7-55f6-a4c4-859efe599b68"
+version = "0.3.7"
+
 [[deps.StructUtils]]
 deps = ["Dates", "UUIDs"]
 git-tree-sha1 = "2d0fc55c61321ba245c47be599570d11bac50303"
@@ -570,6 +582,12 @@ deps = ["DataAPI", "InlineStrings", "Parsers"]
 git-tree-sha1 = "0716e01c3b40413de5dedbc9c5c69f27cddfddfc"
 uuid = "ea10d353-3f73-51f8-a26c-33c1cb351aa5"
 version = "1.4.3"
+
+[[deps.YAML]]
+deps = ["Base64", "Dates", "Printf", "StringEncodings"]
+git-tree-sha1 = "a1c0c7585346251353cddede21f180b96388c403"
+uuid = "ddb6d928-2868-570f-bddf-ab3f9cf99eb6"
+version = "0.4.16"
 
 [[deps.ZipFile]]
 deps = ["Libdl", "Printf", "Zlib_jll"]
