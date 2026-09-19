@@ -129,7 +129,7 @@ macro tool(description::String, func_expr::Expr)
         # Original function definition
         $(esc(func_expr))
         # AgentTool construction
-        Agentif.AgentTool{typeof($(esc(func_name))), $named_tuple_type}(
+        Agentif.AgentTool{typeof($(esc(func_name))), $(esc(named_tuple_type))}(
             name = string($(Meta.quot(func_name))),
             description = $(description),
             func = $(esc(func_name))
