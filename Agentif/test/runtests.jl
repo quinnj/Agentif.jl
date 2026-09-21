@@ -259,6 +259,27 @@ Agentif.finish_streaming(ch::StreamTestChannel) = (ch.finished += 1)
 Agentif.send_message(::StreamTestChannel, ::Any) = nothing
 Agentif.close_channel(ch::StreamTestChannel) = (ch.closed += 1)
 
+module ToolScopeProbe
+using Agentif
+const CallerText = String
+struct CallerValue
+    text::String
+end
+const alias_tool = @tool "Echo an alias" echo_alias(text::CallerText) = text
+const struct_tool = @tool "Echo a value" function echo_value(value::CallerValue)
+    value.text
+end
+const vector_tool = @tool "Echo values" echo_values(values::Vector{CallerValue}) = join(v.text for v in values)
+end
+@testset "caller-defined tool argument types" begin
+    @test Agentif.parameters(ToolScopeProbe.alias_tool) === @NamedTuple{text::String}
+    @test Agentif.invoke_parsed_tool(ToolScopeProbe.alias_tool, (text="hello",)) == "hello"
+    @test Agentif.parameters(ToolScopeProbe.struct_tool) === @NamedTuple{value::ToolScopeProbe.CallerValue}
+    @test Agentif.invoke_parsed_tool(ToolScopeProbe.struct_tool, (value=ToolScopeProbe.CallerValue("hello"),)) == "hello"
+    @test Agentif.parameters(ToolScopeProbe.vector_tool) === @NamedTuple{values::Vector{ToolScopeProbe.CallerValue}}
+    @test Agentif.invoke_parsed_tool(ToolScopeProbe.vector_tool, (values=[ToolScopeProbe.CallerValue("a"), ToolScopeProbe.CallerValue("b")],)) == "ab"
+end
+
 @testset "public API bindings" begin
     tool = @tool "Echo text." echo_text(text::String) = text
     @test tool_name(tool) == "echo_text"
