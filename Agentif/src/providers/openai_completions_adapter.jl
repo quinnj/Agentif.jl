@@ -660,11 +660,8 @@ function openai_completions_event_callback(
                     saw_text = true
                 end
             else
-                if all(isspace, content_str)
-                    if !saw_text
-                        leading_whitespace *= content_str
-                        return
-                    end
+                if !saw_text && all(isspace, content_str)
+                    leading_whitespace *= content_str
                 else
                     if !isempty(leading_whitespace)
                         if !started[]
@@ -676,14 +673,14 @@ function openai_completions_event_callback(
                         leading_whitespace = ""
                         saw_text = true
                     end
+                    if !started[]
+                        started[] = true
+                        f(MessageStartEvent(:assistant, assistant_message))
+                    end
+                    append_text!(assistant_message, content_str)
+                    f(MessageUpdateEvent(:assistant, assistant_message, :text, content_str, nothing))
+                    saw_text = true
                 end
-                if !started[]
-                    started[] = true
-                    f(MessageStartEvent(:assistant, assistant_message))
-                end
-                append_text!(assistant_message, content_str)
-                f(MessageUpdateEvent(:assistant, assistant_message, :text, content_str, nothing))
-                saw_text = true
             end
         end
         # When a delta carries reasoning_details with text, the details stream is

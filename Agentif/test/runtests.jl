@@ -3792,6 +3792,54 @@ end
     end
 end
 
+@testset "completions leading whitespace preserves other chunk fields" begin
+    fixtures = (
+        ("reasoning and later text", [
+            raw"""data: {"choices":[{"index":0,"delta":{"content":" \n","reasoning_content":"plan"},"finish_reason":null}]}""",
+            raw"""data: {"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":null}]}""",
+            raw"""data: {"choices":[{"index":0,"delta":{"content":" "},"finish_reason":"stop"}]}""",
+        ], " \nanswer ", "plan", :stop, false),
+        ("reasoning details and tool call", [
+            raw"""data: {"choices":[{"index":0,"delta":{"content":" \n","reasoning":"plan","reasoning_details":[{"type":"reasoning.text","text":"plan"}],"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"stream_echo","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}""",
+        ], "", "plan", :tool_calls, true),
+        ("whitespace-only length limit", [
+            raw"""data: {"choices":[{"index":0,"delta":{"content":" \n"},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}""",
+        ], "", "", :length, false),
+    )
+    tool = @tool "Return a greeting." stream_echo() = "hello"
+    @testset "$name" for (name, chunks, expected_text, expected_thinking, stop_reason, has_tool) in fixtures
+        body = join([chunks; "data: [DONE]"], "\n\n") * "\n\n"
+        server = HTTP.serve!("127.0.0.1", 0) do req
+            HTTP.Response(200, ["Content-Type" => "text/event-stream"], body)
+        end
+        try
+            model = compaction_test_model(test_server_port(server); contextWindow = 4096)
+            agent = Agent(prompt = "p", model = model, apikey = "test-key", tools = [tool])
+            events = Agentif.AgentEvent[]
+            state = stream(event -> push!(events, event), agent, AgentState(), "q", Abort())
+            msg = state.messages[end]
+            @test isempty([event for event in events if event isa AgentErrorEvent])
+            @test Agentif.message_text(msg) == expected_text
+            @test join((block.thinking for block in msg.content if block isa Agentif.ThinkingContent), "") == expected_thinking
+            @test join((event.delta for event in events if event isa MessageUpdateEvent && event.kind == :reasoning), "") == expected_thinking
+            @test join((event.delta for event in events if event isa MessageUpdateEvent && event.kind == :text), "") == expected_text
+            @test state.most_recent_stop_reason == stop_reason
+            @test length(state.pending_tool_calls) == Int(has_tool)
+            @test length(msg.tool_calls) == Int(has_tool)
+            if !isempty(msg.tool_calls)
+                call = only(msg.tool_calls)
+                @test call.call_id == "call-1"
+                @test call.name == "stream_echo"
+                @test JSON.parse(call.arguments) == Dict()
+                @test join((event.delta for event in events if event isa MessageUpdateEvent && event.kind == :tool_arguments), "") == call.arguments
+            end
+            stop_reason == :length && @test state.usage.total == 3
+        finally
+            close(server)
+        end
+    end
+end
+
 @testset "openrouter reasoning_details deltas are not double-appended" begin
     # OpenRouter mirrors each reasoning token into BOTH delta.reasoning and
     # delta.reasoning_details[].text. The details stream is canonical; the
