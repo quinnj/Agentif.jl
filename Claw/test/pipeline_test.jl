@@ -572,6 +572,37 @@ end
     Claw.shutdown!(a; timeout_s = 5)
 end
 
+@testset "a refusal (an :error turn with no provider error) is not retried" begin
+    a = Claw.AgentAssistant(":memory:";
+        provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
+        timezone = "UTC", level = :error,
+        pipeline = Claw.PipelineConfig(; retry_backoff_s = [0.05], max_attempts = 2,
+            min_refire_gap_s = 0.05, scan_interval_s = 0.05, lane_backlog_warn_s = 5.0))
+    Claw.CURRENT_ASSISTANT[] = a
+    ch = RecordingChannel("refusal")
+    a._channels[ch.id] = ch
+    register_test_handler!(a)
+    refusal = function (f, agent, state, input, abort; kw...)
+        msg = Agentif.AssistantMessage(; provider = "test", api = "test", model = "test")
+        Agentif.append_text!(msg, "I can't help with that.")
+        Agentif.append_state!(state, input, msg, Agentif.Usage())
+        state.most_recent_stop_reason = :error
+        return state
+    end
+    runs = Threads.Atomic{Int}(0)
+    local id
+    with_handler(function (assistant, ev, handler; kwargs...)
+        Threads.atomic_add!(runs, 1)
+        return Claw._run_event_handler!(assistant, ev, handler; kwargs..., base_handler = refusal)
+    end) do
+        Claw.start_event_loop!(a)
+        id = Claw.submit_event!(a, PipelineTestEvent("hello", ch))
+        @test timedwait(() -> event_row(a, id).status == "done", 20.0) == :ok
+    end
+    @test runs[] == 1
+    Claw.shutdown!(a; timeout_s = 5)
+end
+
 @testset ":auth failure dead-letters without retrying" begin
     a = make_assistant(":memory:";
         retry_backoff_s = [0.05], max_attempts = 5, min_refire_gap_s = 0.05,
