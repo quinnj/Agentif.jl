@@ -18,6 +18,8 @@ abstract type SessionStore end
     post_id::Union{Nothing, String} = nothing
     # `input_key` of the evaluation that wrote this entry (see `evaluate`).
     input_key::Union{Nothing, String} = nothing
+    # Shared by every entry one evaluation wrote; see `same_run_chain`.
+    run_id::Union{Nothing, String} = nothing
 end
 
 struct EntryBoundary
@@ -51,11 +53,31 @@ function with_session_write end
 
 # ─── InMemorySessionStore implementations ───
 
-function append_entry!(store::InMemorySessionStore, entry::SessionEntry; branch_id::Union{Nothing, String} = nothing)
+function append_entry!(store::InMemorySessionStore, entry::SessionEntry)
     lock(store.lock) do
         store.entries[entry.id] = entry
-        branch_id === nothing || (store.branches[branch_id] = entry.id)
     end
+end
+
+"""
+    append_branch_entry!(store, branch_id, entry)
+
+Append `entry` and make it the leaf of `branch_id`. Stores that can do both
+atomically should specialize this; the fallback does them in turn, so a crash
+between the two leaves the entry outside its branch.
+"""
+function append_branch_entry!(store::SessionStore, branch_id::String, entry::SessionEntry)
+    append_entry!(store, entry)
+    set_branch_leaf!(store, branch_id, entry.id)
+    return nothing
+end
+
+function append_branch_entry!(store::InMemorySessionStore, branch_id::String, entry::SessionEntry)
+    lock(store.lock) do
+        store.entries[entry.id] = entry
+        store.branches[branch_id] = entry.id
+    end
+    return nothing
 end
 
 function get_entry(store::InMemorySessionStore, entry_id::String)
@@ -254,8 +276,29 @@ function scrubbed_entry(entry::SessionEntry)
         is_compaction = entry.is_compaction, first_kept_entry_id = entry.first_kept_entry_id,
         is_deleted = true, channel_id = entry.channel_id,
         search_channel_id = entry.search_channel_id, channel_flags = entry.channel_flags,
-        post_id = entry.post_id,
+        post_id = entry.post_id, input_key = entry.input_key, run_id = entry.run_id,
     )
+end
+
+"""
+    same_run_chain(lookup, entry) -> Vector{SessionEntry}
+
+`entry` plus the entries the same evaluation wrote before it. An evaluation
+saves its progress as a chain of entries sharing one `run_id`, and only the
+last of them may carry the post id a scrub is asked for (a reply whose own post
+id is known only once it streams), so scrubbing that post must reach the whole
+chain. `lookup(entry_id)` returns the stored entry or `nothing`.
+"""
+function same_run_chain(lookup, entry::SessionEntry)
+    chain = SessionEntry[entry]
+    entry.run_id === nothing && return chain
+    while entry.parent_id !== nothing
+        parent = lookup(entry.parent_id)
+        (parent === nothing || parent.run_id != entry.run_id) && break
+        push!(chain, parent)
+        entry = parent
+    end
+    return chain
 end
 
 # An entry matches a scrub request when it was produced from that platform post.
@@ -265,10 +308,12 @@ entry_matches_post(entry::SessionEntry, post_id::String) =
 
 function scrub_post!(store::InMemorySessionStore, post_id::String)
     lock(store.lock) do
-        for (eid, entry) in collect(store.entries)
+        for entry in collect(values(store.entries))
             entry.is_deleted && continue
             entry_matches_post(entry, post_id) || continue
-            store.entries[eid] = scrubbed_entry(entry)
+            for e in same_run_chain(id -> get(store.entries, id, nothing), entry)
+                store.entries[e.id] = scrubbed_entry(e)
+            end
         end
     end
     return nothing

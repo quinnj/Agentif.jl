@@ -188,11 +188,31 @@ function _maybe_fork_branch!(store::SessionStore, ch::AbstractChannel, bid::Stri
     end
     pbid = parent_branch_id(ch)
     if pbid !== nothing
-        parent_leaf = get_branch_leaf(store, pbid)
-        parent_leaf !== nothing && set_branch_leaf!(store, bid, parent_leaf)
+        fork_point = _last_finished_entry(store, get_branch_leaf(store, pbid))
+        fork_point !== nothing && set_branch_leaf!(store, bid, fork_point)
     end
     return
 end
+
+# The parent's leaf can be a checkpoint of an evaluation still running (or one
+# a crash cut short). Fork from the newest entry that ends a finished exchange
+# instead, so the new branch never inherits tool calls whose results are still
+# to come.
+function _last_finished_entry(store::SessionStore, entry_id::Union{Nothing, String})
+    seen = Set{String}()
+    while entry_id !== nothing && !(entry_id in seen)
+        push!(seen, entry_id)
+        entry = get_entry(store, entry_id)
+        entry === nothing && return nothing
+        if entry.is_compaction || isempty(entry.messages) || _ends_exchange(entry.messages[end])
+            return entry_id
+        end
+        entry_id = entry.parent_id
+    end
+    return nothing
+end
+
+_ends_exchange(msg::AgentMessage) = msg isa AssistantMessage && isempty(pending_tool_calls_from_message(msg))
 
 # Entry ids must be unique: a single incoming message can drive several
 # evaluations (queue_middleware), and each needs its own entry. Keep the
@@ -220,6 +240,8 @@ mutable struct SessionWriter
     const channel::AbstractChannel
     const captured_eid::Union{Nothing, String}
     const input_key::Union{Nothing, String}
+    # Shared by every entry this evaluation writes; see `same_run_chain`.
+    const run_id::String
     # Entries holding the current message list, in its current positions.
     boundaries::Vector{EntryBoundary}
     leaf::Union{Nothing, String}
@@ -227,7 +249,8 @@ end
 
 # Bound by `session_middleware` to the evaluation it persists. The tool loop
 # calls it once a turn's tool calls are known, before any of them starts, and
-# after each tool result, so a crash loses at most the call in flight.
+# after each tool result. Results are recorded in call order, so a crash loses
+# the model call in flight, or the tool results not yet recorded.
 const SESSION_CHECKPOINT = ScopedValue{Union{Nothing, Function}}(nothing)
 
 function checkpoint_session!(state::AgentState)
@@ -237,33 +260,39 @@ function checkpoint_session!(state::AgentState)
 end
 
 """
-    persist_session!(writer, state; final = false, input_key = writer.input_key)
+    persist_session!(writer, state; final = false)
 
 Append every message of `state` the store does not hold yet as one entry on
 the branch, preceded by a compaction entry when compaction ran since the last
 save, and move the branch leaf to it. A trailing assistant message from a turn
-that ended in `:error` or `:aborted` is never persisted: that turn is retried,
+that ended in `:error` or `:aborted` is not persisted: that turn is retried,
 not replayed. The `final` save of an evaluation takes the platform post id as
 its entry id, so a fork from that post (e.g. a thread reply) sees the whole
 exchange; earlier saves get fresh ids.
 """
-function persist_session!(w::SessionWriter, state::AgentState; final::Bool = false,
-        input_key::Union{Nothing, String} = w.input_key)
+function persist_session!(w::SessionWriter, state::AgentState; final::Bool = false)
+    compacted = state.last_compaction !== nothing
+    # Last position the store already holds (after compaction, the summary is
+    # new and the persisted kept messages follow it).
+    persisted_end = compacted ? state.persisted_prefix_count + 1 :
+        state.persisted_prefix_start + state.persisted_prefix_count - 1
     last_idx = length(state.messages)
     if (state.most_recent_stop_reason === :error || state.most_recent_stop_reason === :aborted) &&
-            last_idx > 0 && state.messages[end] isa AssistantMessage
+            last_idx > persisted_end && state.messages[end] isa AssistantMessage
         last_idx -= 1
     end
     platform_post_id = w.captured_eid === nothing ? response_entry_id(w.channel) : w.captured_eid
     user_id, ch_id, sch_id, ch_flags = _entry_metadata(w.channel)
-    new_entry(; kw...) = SessionEntry(; user_id, channel_id = ch_id, search_channel_id = sch_id,
-        channel_flags = ch_flags, input_key, kw...)
+    new_entry(; key = w.input_key, kw...) = SessionEntry(; user_id, channel_id = ch_id,
+        search_channel_id = sch_id, channel_flags = ch_flags, run_id = w.run_id, input_key = key, kw...)
     eval_entry_id() = _unique_entry_id(w.store,
         final && platform_post_id !== nothing ? platform_post_id : string(UID8()))
-    if state.last_compaction !== nothing
+    entries = SessionEntry[]
+    boundaries = EntryBoundary[]
+    if compacted
         # `persisted_prefix_*` says exactly which kept messages the store
-        # already holds; every other message goes into the new entry, which
-        # hangs off the compaction entry so the lineage walk replays
+        # already holds; every other message goes into new entries, which hang
+        # off the compaction entry so the lineage walk replays
         # [summary, kept…, new…] in order.
         # messages[1] is the summary, so at most length-1 can be kept.
         kept_persisted = clamp(state.persisted_prefix_count, 0, max(0, length(state.messages) - 1))
@@ -271,55 +300,48 @@ function persist_session!(w::SessionWriter, state::AgentState; final::Bool = fal
         if kept_persisted > 0
             first_kept_idx = state.persisted_prefix_start
             for b in w.boundaries
+                # Lineage pointers operate at entry granularity, so only a cut
+                # at an entry's first message can point at that entry.
                 if b.message_start <= first_kept_idx <= b.message_end
-                    # Lineage pointers operate at entry granularity. If the cut
-                    # lands inside an entry, persist the kept suffix again under
-                    # the new compaction instead of replaying the entry's
-                    # already-summarized prefix.
-                    if first_kept_idx == b.message_start
-                        first_kept_eid = b.entry_id
-                    else
-                        kept_persisted = 0
-                    end
+                    first_kept_idx == b.message_start && (first_kept_eid = b.entry_id)
                     break
                 end
             end
-            # No entry to point at: persist the kept messages here instead of
-            # leaving them unreachable.
-            first_kept_eid === nothing && (kept_persisted = 0)
         end
-        compaction_entry = new_entry(;
-            id = _unique_entry_id(w.store, string(UID8())),
-            parent_id = w.leaf,
+        # With no entry to point at, the kept messages the store holds are
+        # written again under the new compaction. They belong to earlier
+        # evaluations, so they carry no input key.
+        resaved = first_kept_eid === nothing ? kept_persisted : 0
+        first_kept_eid === nothing && (kept_persisted = 0)
+        push!(entries, new_entry(; key = nothing,
+            id = _unique_entry_id(w.store, string(UID8())), parent_id = w.leaf,
             messages = AgentMessage[state.last_compaction],
-            is_compaction = true,
-            first_kept_entry_id = first_kept_eid,
-        )
-        # Skip the summary (1) plus the kept messages the store already has.
-        first_new = kept_persisted + 2
-        if first_new <= last_idx
-            append_entry!(w.store, compaction_entry)
-            entry = new_entry(; id = eval_entry_id(), parent_id = compaction_entry.id,
-                messages = state.messages[first_new:last_idx], post_id = platform_post_id)
-            append_entry!(w.store, entry; branch_id = w.branch_id)
-            w.boundaries = [EntryBoundary(compaction_entry.id, 1, 1, input_key),
-                EntryBoundary(entry.id, first_new, last_idx, input_key)]
-            w.leaf = entry.id
-        else
-            append_entry!(w.store, compaction_entry; branch_id = w.branch_id)
-            w.boundaries = [EntryBoundary(compaction_entry.id, 1, 1, input_key)]
-            w.leaf = compaction_entry.id
+            is_compaction = true, first_kept_entry_id = first_kept_eid))
+        push!(boundaries, EntryBoundary(entries[end].id, 1, 1, nothing))
+        if resaved > 0
+            push!(entries, new_entry(; key = nothing, id = _unique_entry_id(w.store, string(UID8())),
+                parent_id = entries[end].id, messages = state.messages[2:(resaved + 1)], post_id = platform_post_id))
+            push!(boundaries, EntryBoundary(entries[end].id, 2, resaved + 1, nothing))
         end
+        # Skip the summary (1) plus the kept messages already stored or re-saved.
+        first_new = kept_persisted + resaved + 2
         state.last_compaction = nothing
     else
         first_new = state.persisted_prefix_start + state.persisted_prefix_count
         first_new <= last_idx || return nothing
-        entry = new_entry(; id = eval_entry_id(), parent_id = w.leaf,
-            messages = state.messages[first_new:last_idx], post_id = platform_post_id)
-        append_entry!(w.store, entry; branch_id = w.branch_id)
-        push!(w.boundaries, EntryBoundary(entry.id, first_new, last_idx, input_key))
-        w.leaf = entry.id
+        boundaries = w.boundaries
     end
+    if first_new <= last_idx
+        push!(entries, new_entry(; id = eval_entry_id(), parent_id = isempty(entries) ? w.leaf : entries[end].id,
+            messages = state.messages[first_new:last_idx], post_id = platform_post_id))
+        push!(boundaries, EntryBoundary(entries[end].id, first_new, last_idx, w.input_key))
+    end
+    for entry in @view(entries[1:(end - 1)])
+        append_entry!(w.store, entry)
+    end
+    append_branch_entry!(w.store, w.branch_id, entries[end])
+    w.boundaries = boundaries
+    w.leaf = entries[end].id
     _reset_persisted_prefix!(state)
     return nothing
 end
@@ -348,15 +370,24 @@ function interrupted_tool_results(messages::Vector{StoredAgentMessage})
     return results
 end
 
-# The settled results belong to the evaluation that was interrupted, so they
-# carry its input key.
+# The settled results belong to the evaluation that was interrupted, so their
+# entry carries that evaluation's metadata, run and input key.
 function _settle_interrupted_tool_calls!(w::SessionWriter, state::AgentState)
     results = interrupted_tool_results(state.messages)
     isempty(results) && return nothing
     @warn "Tool calls were interrupted before their results were recorded" branch_id = w.branch_id tools = [r.name for r in results]
+    leaf = get_entry(w.store, w.leaf)
+    entry = SessionEntry(;
+        id = _unique_entry_id(w.store, string(UID8())), parent_id = w.leaf,
+        messages = StoredAgentMessage[results...],
+        user_id = leaf.user_id, channel_id = leaf.channel_id, search_channel_id = leaf.search_channel_id,
+        channel_flags = leaf.channel_flags, post_id = leaf.post_id, input_key = leaf.input_key, run_id = leaf.run_id,
+    )
+    append_branch_entry!(w.store, w.branch_id, entry)
+    push!(w.boundaries, EntryBoundary(entry.id, length(state.messages) + 1, length(state.messages) + length(results), entry.input_key))
     append!(state.messages, results)
-    leaf_entry = get_entry(w.store, w.leaf)
-    persist_session!(w, state; input_key = leaf_entry === nothing ? nothing : leaf_entry.input_key)
+    w.leaf = entry.id
+    _reset_persisted_prefix!(state)
     return nothing
 end
 
@@ -396,7 +427,7 @@ function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, S
             # provenance up to date if it runs mid-evaluation.
             _reset_persisted_prefix!(loaded)
             writer = SessionWriter(store, bid, current_channel, captured_eid, input_key,
-                boundaries, get_branch_leaf(store, bid))
+                string(UID8()), boundaries, get_branch_leaf(store, bid))
             _settle_interrupted_tool_calls!(writer, loaded)
             input = _resumed_input(writer, loaded, current_input)
             input === nothing && return loaded
@@ -479,6 +510,8 @@ function build_default_handler(
         channel::Union{Nothing, AbstractChannel} = nothing,
         input_key::Union{Nothing, String} = nothing,
     )
+    message_queue !== nothing && input_key !== nothing && throw(ArgumentError(
+        "`input_key` cannot be combined with `message_queue`: every queued input would share the key, so all but the first would be skipped"))
     compaction_handler = compaction_config === nothing ?
         base_handler : compaction_middleware(base_handler, compaction_config)
     steer_handler = steer_middleware(compaction_handler, steer_queue)
