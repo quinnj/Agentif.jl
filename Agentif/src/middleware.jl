@@ -52,6 +52,8 @@ function tool_call_middleware(agent_handler::AgentHandler)
 
                 empty!(futures) # empty futures before we push new tool call evals
                 @debug "Agent requested tool calls" turn_id tool_call_count = length(current_state.pending_tool_calls) tool_names = [tc.name for tc in current_state.pending_tool_calls]
+                # The turn and its calls are durable before any call starts.
+                checkpoint_session!(current_state)
                 for tc in current_state.pending_tool_calls
                     check_abort(abort)
                     push!(futures, start_tool_call!(f, agent.tools, tc, stop_reason))
@@ -60,11 +62,16 @@ function tool_call_middleware(agent_handler::AgentHandler)
                 empty!(tool_results) # empty tool_results before we wait on futures
                 for fut in futures
                     check_abort(abort)
-                    push!(tool_results, wait(fut))
+                    result = wait(fut)
+                    push!(tool_results, result)
+                    # Each result joins the history (and the session) as soon
+                    # as it is known, so the next turn takes no new input.
+                    push!(current_state.messages, result)
+                    checkpoint_session!(current_state)
                 end
                 check_abort(abort)
                 @debug "Tool calls completed" turn_id tool_result_count = length(tool_results) error_count = count(trm -> trm.is_error, tool_results)
-                next_input = tool_results
+                next_input = ToolResultMessage[]
             finally
                 f(TurnEndEvent(turn_id, last_assistant_message(current_state), nothing))
             end
@@ -206,7 +213,172 @@ function _reset_persisted_prefix!(state::AgentState)
     return state
 end
 
-function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, SessionStore}; channel::Union{Nothing, AbstractChannel} = nothing)
+# Where one evaluation's session entries go, and what every entry carries.
+mutable struct SessionWriter
+    const store::SessionStore
+    const branch_id::String
+    const channel::AbstractChannel
+    const captured_eid::Union{Nothing, String}
+    const input_key::Union{Nothing, String}
+    # Entries holding the current message list, in its current positions.
+    boundaries::Vector{EntryBoundary}
+    leaf::Union{Nothing, String}
+end
+
+# Bound by `session_middleware` to the evaluation it persists. The tool loop
+# calls it once a turn's tool calls are known, before any of them starts, and
+# after each tool result, so a crash loses at most the call in flight.
+const SESSION_CHECKPOINT = ScopedValue{Union{Nothing, Function}}(nothing)
+
+function checkpoint_session!(state::AgentState)
+    checkpoint = SESSION_CHECKPOINT[]
+    checkpoint === nothing || checkpoint(state)
+    return nothing
+end
+
+"""
+    persist_session!(writer, state; final = false, input_key = writer.input_key)
+
+Append every message of `state` the store does not hold yet as one entry on
+the branch, preceded by a compaction entry when compaction ran since the last
+save, and move the branch leaf to it. A trailing assistant message from a turn
+that ended in `:error` or `:aborted` is never persisted: that turn is retried,
+not replayed. The `final` save of an evaluation takes the platform post id as
+its entry id, so a fork from that post (e.g. a thread reply) sees the whole
+exchange; earlier saves get fresh ids.
+"""
+function persist_session!(w::SessionWriter, state::AgentState; final::Bool = false,
+        input_key::Union{Nothing, String} = w.input_key)
+    last_idx = length(state.messages)
+    if (state.most_recent_stop_reason === :error || state.most_recent_stop_reason === :aborted) &&
+            last_idx > 0 && state.messages[end] isa AssistantMessage
+        last_idx -= 1
+    end
+    platform_post_id = w.captured_eid === nothing ? response_entry_id(w.channel) : w.captured_eid
+    user_id, ch_id, sch_id, ch_flags = _entry_metadata(w.channel)
+    new_entry(; kw...) = SessionEntry(; user_id, channel_id = ch_id, search_channel_id = sch_id,
+        channel_flags = ch_flags, input_key, kw...)
+    eval_entry_id() = _unique_entry_id(w.store,
+        final && platform_post_id !== nothing ? platform_post_id : string(UID8()))
+    if state.last_compaction !== nothing
+        # `persisted_prefix_*` says exactly which kept messages the store
+        # already holds; every other message goes into the new entry, which
+        # hangs off the compaction entry so the lineage walk replays
+        # [summary, kept…, new…] in order.
+        # messages[1] is the summary, so at most length-1 can be kept.
+        kept_persisted = clamp(state.persisted_prefix_count, 0, max(0, length(state.messages) - 1))
+        first_kept_eid = nothing
+        if kept_persisted > 0
+            first_kept_idx = state.persisted_prefix_start
+            for b in w.boundaries
+                if b.message_start <= first_kept_idx <= b.message_end
+                    # Lineage pointers operate at entry granularity. If the cut
+                    # lands inside an entry, persist the kept suffix again under
+                    # the new compaction instead of replaying the entry's
+                    # already-summarized prefix.
+                    if first_kept_idx == b.message_start
+                        first_kept_eid = b.entry_id
+                    else
+                        kept_persisted = 0
+                    end
+                    break
+                end
+            end
+            # No entry to point at: persist the kept messages here instead of
+            # leaving them unreachable.
+            first_kept_eid === nothing && (kept_persisted = 0)
+        end
+        compaction_entry = new_entry(;
+            id = _unique_entry_id(w.store, string(UID8())),
+            parent_id = w.leaf,
+            messages = AgentMessage[state.last_compaction],
+            is_compaction = true,
+            first_kept_entry_id = first_kept_eid,
+        )
+        # Skip the summary (1) plus the kept messages the store already has.
+        first_new = kept_persisted + 2
+        if first_new <= last_idx
+            append_entry!(w.store, compaction_entry)
+            entry = new_entry(; id = eval_entry_id(), parent_id = compaction_entry.id,
+                messages = state.messages[first_new:last_idx], post_id = platform_post_id)
+            append_entry!(w.store, entry; branch_id = w.branch_id)
+            w.boundaries = [EntryBoundary(compaction_entry.id, 1, 1, input_key),
+                EntryBoundary(entry.id, first_new, last_idx, input_key)]
+            w.leaf = entry.id
+        else
+            append_entry!(w.store, compaction_entry; branch_id = w.branch_id)
+            w.boundaries = [EntryBoundary(compaction_entry.id, 1, 1, input_key)]
+            w.leaf = compaction_entry.id
+        end
+        state.last_compaction = nothing
+    else
+        first_new = state.persisted_prefix_start + state.persisted_prefix_count
+        first_new <= last_idx || return nothing
+        entry = new_entry(; id = eval_entry_id(), parent_id = w.leaf,
+            messages = state.messages[first_new:last_idx], post_id = platform_post_id)
+        append_entry!(w.store, entry; branch_id = w.branch_id)
+        push!(w.boundaries, EntryBoundary(entry.id, first_new, last_idx, input_key))
+        w.leaf = entry.id
+    end
+    _reset_persisted_prefix!(state)
+    return nothing
+end
+
+# Tool calls at the tail of a loaded branch that have no result were cut off
+# by a crash mid-call. They may or may not have taken effect, so they are never
+# re-run; the model gets an error result saying so.
+function interrupted_tool_results(messages::Vector{StoredAgentMessage})
+    idx = findlast(m -> !(m isa ToolResultMessage), messages)
+    idx === nothing && return ToolResultMessage[]
+    turn = messages[idx]
+    turn isa AssistantMessage || return ToolResultMessage[]
+    answered = Set{String}(m.call_id for m in @view(messages[(idx + 1):end]))
+    results = ToolResultMessage[]
+    for tc in pending_tool_calls_from_message(turn)
+        tc.call_id in answered && continue
+        output = render_tool_error_json(;
+            error_kind = "tool_call_interrupted",
+            message = "Tool call `$(tc.name)` was interrupted before its result was recorded; it may or may not have taken effect.",
+            tool = tc.name,
+            call_id = tc.call_id,
+            suggested_fix = "Check the current state before calling it again.",
+        )
+        push!(results, ToolResultMessage(tc.call_id, tc.name, output; is_error = true))
+    end
+    return results
+end
+
+# The settled results belong to the evaluation that was interrupted, so they
+# carry its input key.
+function _settle_interrupted_tool_calls!(w::SessionWriter, state::AgentState)
+    results = interrupted_tool_results(state.messages)
+    isempty(results) && return nothing
+    @warn "Tool calls were interrupted before their results were recorded" branch_id = w.branch_id tools = [r.name for r in results]
+    append!(state.messages, results)
+    leaf_entry = get_entry(w.store, w.leaf)
+    persist_session!(w, state; input_key = leaf_entry === nothing ? nothing : leaf_entry.input_key)
+    return nothing
+end
+
+# With an input key, an input the branch already holds is not appended again:
+# an answered one returns `nothing` (skip the evaluation), and one whose
+# evaluation was cut short at the branch tail continues with no new input.
+function _resumed_input(w::SessionWriter, state::AgentState, input::AgentTurnInput)
+    w.input_key === nothing && return input
+    idx = findlast(b -> b.input_key == w.input_key, w.boundaries)
+    idx === nothing && return input
+    b = w.boundaries[idx]
+    last_message = state.messages[b.message_end]
+    last_message isa AssistantMessage && isempty(pending_tool_calls_from_message(last_message)) && return nothing
+    if b.message_end == length(state.messages) &&
+            (last_message isa UserMessage || last_message isa ToolResultMessage)
+        return ToolResultMessage[]
+    end
+    return input
+end
+
+function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, SessionStore};
+        channel::Union{Nothing, AbstractChannel} = nothing, input_key::Union{Nothing, String} = nothing)
     search_tool = store === nothing ? nothing : _create_search_session_tool(store)
     return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) where {F <: Function}
         store === nothing && return agent_handler(f, agent, state, current_input, abort; kw...)
@@ -219,104 +391,24 @@ function session_middleware(agent_handler::AgentHandler, store::Union{Nothing, S
 
         return lock_branch(store, bid) do
             _maybe_fork_branch!(store, current_channel, bid)
-            current_state, entry_boundaries = load_branch_with_boundaries(store, bid)
-            pre_eval_msg_count = length(current_state.messages)
+            loaded, boundaries = load_branch_with_boundaries(store, bid)
             # Everything we just loaded is already persisted; compact! keeps this
             # provenance up to date if it runs mid-evaluation.
-            _reset_persisted_prefix!(current_state)
-            current_leaf = get_branch_leaf(store, bid)
+            _reset_persisted_prefix!(loaded)
+            writer = SessionWriter(store, bid, current_channel, captured_eid, input_key,
+                boundaries, get_branch_leaf(store, bid))
+            _settle_interrupted_tool_calls!(writer, loaded)
+            input = _resumed_input(writer, loaded, current_input)
+            input === nothing && return loaded
 
             agent = search_tool === nothing ? agent : with_tools(agent, vcat(agent.tools, [search_tool]))
-            current_state = agent_handler(f, agent, current_state, current_input, abort; kw...)
-
-            # Resolve final entry ID
-            response_eid = response_entry_id(current_channel)
-            platform_post_id = captured_eid === nothing ? response_eid : captured_eid
-            base_eid = platform_post_id === nothing ? string(UID8()) : platform_post_id
-            final_eid = _unique_entry_id(store, base_eid)
-            user_id, ch_id, sch_id, ch_flags = _entry_metadata(current_channel)
-
-            if current_state.last_compaction !== nothing
-                # Compaction happened, possibly mid-evaluation. `persisted_prefix_*`
-                # says exactly which kept messages the store already holds; every
-                # other message goes into this evaluation's entry, which hangs off
-                # the compaction entry so the lineage walk replays
-                # [summary, kept…, new…] in order.
-                # messages[1] is the summary, so at most length-1 can be kept.
-                kept_persisted = clamp(current_state.persisted_prefix_count, 0, max(0, length(current_state.messages) - 1))
-                first_kept_eid = nothing
-                if kept_persisted > 0
-                    first_kept_idx = current_state.persisted_prefix_start
-                    for b in entry_boundaries
-                        if b.message_start <= first_kept_idx <= b.message_end
-                            # Lineage pointers operate at entry granularity. If
-                            # the cut lands inside an entry, persist the kept
-                            # suffix again under the new compaction instead of
-                            # replaying the entry's already-summarized prefix.
-                            if first_kept_idx == b.message_start
-                                first_kept_eid = b.entry_id
-                            else
-                                kept_persisted = 0
-                            end
-                            break
-                        end
-                    end
-                    # No entry to point at: persist the kept messages here instead
-                    # of leaving them unreachable.
-                    first_kept_eid === nothing && (kept_persisted = 0)
-                end
-
-                compaction_entry = SessionEntry(;
-                    id = _unique_entry_id(store, string(UID8())),
-                    parent_id = current_leaf,
-                    messages = AgentMessage[current_state.last_compaction],
-                    is_compaction = true,
-                    first_kept_entry_id = first_kept_eid,
-                    user_id = user_id,
-                    channel_id = ch_id,
-                    search_channel_id = sch_id,
-                    channel_flags = ch_flags,
-                )
-                append_entry!(store, compaction_entry)
-
-                # Skip the summary (1) plus the kept messages the store already has.
-                new_messages = current_state.messages[kept_persisted + 2:end]
-                if !isempty(new_messages)
-                    eval_entry = SessionEntry(;
-                        id = final_eid,
-                        parent_id = compaction_entry.id,
-                        messages = new_messages,
-                        user_id = user_id,
-                        channel_id = ch_id,
-                        search_channel_id = sch_id,
-                        channel_flags = ch_flags,
-                        post_id = platform_post_id,
-                    )
-                    append_entry!(store, eval_entry)
-                    set_branch_leaf!(store, bid, eval_entry.id)
-                else
-                    set_branch_leaf!(store, bid, compaction_entry.id)
-                end
-                current_state.last_compaction = nothing
-                _reset_persisted_prefix!(current_state)
-            elseif length(current_state.messages) > pre_eval_msg_count
-                # No compaction: save new messages as a single entry
-                new_messages = current_state.messages[pre_eval_msg_count + 1:end]
-                eval_entry = SessionEntry(;
-                    id = final_eid,
-                    parent_id = current_leaf,
-                    messages = new_messages,
-                    user_id = user_id,
-                    channel_id = ch_id,
-                    search_channel_id = sch_id,
-                    channel_flags = ch_flags,
-                    post_id = platform_post_id,
-                )
-                append_entry!(store, eval_entry)
-                set_branch_leaf!(store, bid, eval_entry.id)
-                _reset_persisted_prefix!(current_state)
+            # Nested evaluations (e.g. inside a tool) see this binding too, so
+            # only checkpoint the state this evaluation loaded.
+            checkpoint = st -> (st === loaded && persist_session!(writer, st); nothing)
+            current_state = @with SESSION_CHECKPOINT => checkpoint begin
+                agent_handler(f, agent, loaded, input, abort; kw...)
             end
-
+            persist_session!(writer, current_state; final = true)
             return current_state
         end
     end
@@ -385,6 +477,7 @@ function build_default_handler(
         input_guardrail::Union{Nothing, Bool, Function} = nothing,
         skill_registry::Union{Nothing, SkillRegistry} = nothing,
         channel::Union{Nothing, AbstractChannel} = nothing,
+        input_key::Union{Nothing, String} = nothing,
     )
     compaction_handler = compaction_config === nothing ?
         base_handler : compaction_middleware(base_handler, compaction_config)
@@ -407,7 +500,7 @@ function build_default_handler(
     end
     session_handler = session_store === nothing ?
         channel_tools_handler :
-        session_middleware(channel_tools_handler, session_store; channel)
+        session_middleware(channel_tools_handler, session_store; channel, input_key)
     guardrail_handler = input_guardrail_middleware(session_handler, input_guardrail)
     skills_handler = skills_middleware(guardrail_handler, skill_registry)
     evaluate_handler = evaluate_middleware(skills_handler)
@@ -435,11 +528,12 @@ function evaluate(
         input_guardrail::Union{Nothing, Bool, Function} = nothing,
         skill_registry::Union{Nothing, SkillRegistry} = nothing,
         channel::Union{Nothing, AbstractChannel} = nothing,
+        input_key::Union{Nothing, String} = nothing,
         abort::Abort = Abort(),
         level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing,
         kw...,
     ) where {F <: Function}
-    handler = build_default_handler(; base_handler, compaction_config, steer_queue, message_queue, session_store, input_guardrail, skill_registry, channel)
+    handler = build_default_handler(; base_handler, compaction_config, steer_queue, message_queue, session_store, input_guardrail, skill_registry, channel, input_key)
     return with_log_level(level) do
         handler(f, agent, state, input, abort; kw...)
     end

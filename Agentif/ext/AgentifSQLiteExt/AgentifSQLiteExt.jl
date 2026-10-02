@@ -148,7 +148,8 @@ function session_entry_tags(entry::Agentif.SessionEntry)
     return tags
 end
 
-function Agentif.append_entry!(store::SQLiteSessionStore, entry::Agentif.SessionEntry)
+function Agentif.append_entry!(store::SQLiteSessionStore, entry::Agentif.SessionEntry;
+        branch_id::Union{Nothing, String} = nothing)
     entry_json = JSON.json(entry)
     _write_transaction(store) do db, search_store
         SQLite.execute(
@@ -172,12 +173,19 @@ function Agentif.append_entry!(store::SQLiteSessionStore, entry::Agentif.Session
                 entry.post_id,
             ),
         )
+        # Moving the leaf in the same transaction means a crash can never leave
+        # the entry outside its branch.
+        branch_id === nothing || _set_branch_leaf!(db, branch_id, entry.id)
         doc_id = "session:entry:$(entry.id)"
         tags = session_entry_tags(entry)
         LocalSearch.load!(search_store, entry_json; id=doc_id, title="session", tags=tags)
     end
     return nothing
 end
+
+_set_branch_leaf!(db::SQLite.DB, branch_id::String, entry_id::String) = SQLite.execute(db,
+    "INSERT OR REPLACE INTO session_branches (branch_id, leaf_entry_id) VALUES (?, ?)",
+    (branch_id, entry_id))
 
 function Agentif.get_entry(store::SQLiteSessionStore, entry_id::String)
     row = _fetch_one_copy(
@@ -202,11 +210,7 @@ end
 
 function Agentif.set_branch_leaf!(store::SQLiteSessionStore, branch_id::String, entry_id::String)
     _write_transaction(store) do db, _
-        SQLite.execute(
-            db,
-            "INSERT OR REPLACE INTO session_branches (branch_id, leaf_entry_id) VALUES (?, ?)",
-            (branch_id, entry_id),
-        )
+        _set_branch_leaf!(db, branch_id, entry_id)
     end
     return nothing
 end

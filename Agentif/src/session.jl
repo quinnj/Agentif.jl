@@ -16,12 +16,15 @@ abstract type SessionStore end
     # (several evaluations can share one incoming message), so `scrub_post!`
     # matches on this instead of on the entry id.
     post_id::Union{Nothing, String} = nothing
+    # `input_key` of the evaluation that wrote this entry (see `evaluate`).
+    input_key::Union{Nothing, String} = nothing
 end
 
 struct EntryBoundary
     entry_id::String
     message_start::Int  # 1-based index into state.messages
     message_end::Int
+    input_key::Union{Nothing, String}
 end
 
 mutable struct InMemorySessionStore <: SessionStore
@@ -48,9 +51,10 @@ function with_session_write end
 
 # ─── InMemorySessionStore implementations ───
 
-function append_entry!(store::InMemorySessionStore, entry::SessionEntry)
+function append_entry!(store::InMemorySessionStore, entry::SessionEntry; branch_id::Union{Nothing, String} = nothing)
     lock(store.lock) do
         store.entries[entry.id] = entry
+        branch_id === nothing || (store.branches[branch_id] = entry.id)
     end
 end
 
@@ -169,7 +173,7 @@ function load_branch_with_boundaries(store::SessionStore, branch_id::String)
         apply_session_entry!(state, entry)
         end_idx = length(state.messages)
         if end_idx >= start_idx
-            push!(boundaries, EntryBoundary(entry.id, start_idx, end_idx))
+            push!(boundaries, EntryBoundary(entry.id, start_idx, end_idx, entry.input_key))
         end
     end
     return state, boundaries

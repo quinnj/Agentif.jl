@@ -56,6 +56,21 @@ end
 - `build_default_handler`: compose middleware for tools, sessions, skills, channels, and compaction.
 - `@tool` and `AgentTool`: wrap Julia functions as callable tools.
 
+## Sessions and Crash Recovery
+
+With a `session_store` and a `channel`, `evaluate` loads the channel's branch of the session tree and saves progress while it runs: a model turn that requests tools is saved before any of them starts, and each tool result is saved as soon as it is known. If the process dies mid-run:
+
+- finished turns and tool results are in the history;
+- a tool call that was running gets an error result saying it was interrupted and may or may not have taken effect, and it is never re-run automatically;
+- a turn that ended in a provider error or an abort is not saved as an answer.
+
+Pass `input_key` to make running the same input again safe. If the branch already holds an evaluation with that key, `evaluate` continues it from where it stopped instead of appending the input again, or returns without calling the model when it was already answered.
+
+```julia
+store = InMemorySessionStore()   # or SQLiteSessionStore(path)
+state = evaluate(agent, "Triage issue #42"; session_store = store, channel, input_key = "issue-42")
+```
+
 ## Related Packages
 
 - `LLMTools` for ready-made tool suites.

@@ -377,10 +377,13 @@ end
     result_state = handler(identity, agent, state, "hello", Abort())
     @test call_counter[] == 2
     @test length(inputs) == 2
-    @test inputs[2] isa Vector{ToolResultMessage}
-    tool_results = inputs[2]
-    @test length(tool_results) == 1
-    @test message_text(tool_results[1]) == "hi"
+    # Results join the history as soon as they are known, so the next turn
+    # takes no new input.
+    @test isempty(inputs[2])
+    results = [m for m in result_state.messages if m isa ToolResultMessage]
+    @test length(results) == 1
+    @test message_text(results[1]) == "hi"
+    @test result_state.messages[end - 1] === results[1]
     @test isempty(result_state.pending_tool_calls)
 end
 
@@ -1908,6 +1911,162 @@ end
     @test message_signatures(load_branch(store, "chan:proactive")) == message_signatures(result)
     scrub_post!(store, "response-shared")
     @test isempty(load_branch(store, "chan:proactive").messages)
+end
+
+# ── Session checkpoints and resume ──
+
+# Model call n follows `script[n]`: a vector of tool names to call, `:crash` (the
+# process dies mid-call), `:fail` (a provider error ends the turn), or, by
+# default, the answer "answer-n". `seen` records the history each call was sent.
+function resume_test_handler(script::Dict{Int, Any}; calls = Ref(0), seen = Vector{Vector{StoredAgentMessage}}())
+    return function (f, agent::Agent, state::AgentState, input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+        calls[] += 1
+        n = calls[]
+        action = get(script, n, :answer)
+        action === :crash && error("process died during model call $n")
+        msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+        if action isa Vector
+            for (i, name) in enumerate(action)
+                push!(msg.tool_calls, AgentToolCall(; call_id = "call-$n-$i", name, arguments = "{}"))
+            end
+        else
+            Agentif.append_text!(msg, action === :fail ? "partial" : "answer-$n")
+        end
+        Agentif.append_state!(state, input, msg, Usage())
+        push!(seen, state.messages[1:(end - 1)])
+        state.pending_tool_calls = Agentif.pending_tool_calls_from_message(msg)
+        state.most_recent_stop_reason = action isa Vector ? :tool_calls : action === :fail ? :error : :stop
+        return state
+    end
+end
+
+const StoredAgentMessage = Agentif.StoredAgentMessage
+
+@testset "a crash mid-run keeps finished turns and tool results ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    runs = Ref(0)
+    lookup = @tool "Look something up." lookup() = (runs[] += 1; "found it")
+    agent = Agent(; prompt = "p", model = dummy_model(), apikey = "k", tools = [lookup])
+    calls = Ref(0)
+    seen = Vector{Vector{StoredAgentMessage}}()
+    handler = resume_test_handler(Dict{Int, Any}(1 => ["lookup"], 2 => :crash); calls, seen)
+    run_eval() = evaluate(agent, "find it"; session_store = store, compaction_config = nothing,
+        channel = SessionTestChannel("chan:crash", nothing, "msg-1"), base_handler = handler, input_key = "event-1")
+    progress = [(UserMessage, "find it"), (AssistantMessage, ""), (ToolResultMessage, "found it")]
+
+    @test_throws ErrorException run_eval()
+    @test runs[] == 1
+    @test message_signatures(load_branch(store, "chan:crash")) == progress
+
+    # The retry continues from the saved tool result: the input is not repeated
+    # and the finished tool call does not run again.
+    run_eval()
+    @test runs[] == 1
+    @test calls[] == 3
+    @test message_signatures(seen[end]) == progress
+    @test message_signatures(load_branch(store, "chan:crash")) == [progress; (AssistantMessage, "answer-3")]
+    # The final entry carries the platform post id, so forks from it see the whole run.
+    @test get_branch_leaf(store, "chan:crash") == "msg-1"
+
+    # Once answered, the same input is not answered again.
+    run_eval()
+    @test calls[] == 3
+    @test length(load_branch(store, "chan:crash").messages) == 4
+end
+
+@testset "a tool cut off mid-call is reported, never re-run ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    abort = Abort()
+    slow_runs = Ref(0)
+    stopper = @tool "Stop the run." stopper() = (abort!(abort); "stopping")
+    slow = @tool "Take a while." slow() = (slow_runs[] += 1; sleep(0.3); "slow done")
+    agent = Agent(; prompt = "p", model = dummy_model(), apikey = "k", tools = [stopper, slow])
+    calls = Ref(0)
+    seen = Vector{Vector{StoredAgentMessage}}()
+    handler = resume_test_handler(Dict{Int, Any}(1 => ["stopper", "slow"]); calls, seen)
+    run_eval(abort) = evaluate(agent, "go"; session_store = store, compaction_config = nothing,
+        channel = SessionTestChannel("chan:cut", nothing, nothing), base_handler = handler,
+        input_key = "event-1", abort)
+
+    # The run stops before `slow`'s result is recorded; `slow` may or may not
+    # have started by then.
+    @test_throws Agentif.AbortEvaluation run_eval(abort)
+    sleep(0.5)  # let a started `slow` finish, so a rerun would show in the count
+    started = slow_runs[]
+    @test started <= 1
+
+    # Neither call runs again (a second `stopper` would abort the retry too).
+    run_eval(Abort())
+    @test slow_runs[] == started
+    history = load_branch(store, "chan:cut").messages
+    results = Dict(m.call_id => m for m in history if m isa ToolResultMessage)
+    @test sort!(collect(keys(results))) == ["call-1-1", "call-1-2"]
+    # The abort can land before `stopper`'s result is recorded; either way every
+    # call without a recorded result is reported, not re-run.
+    @test message_text(results["call-1-1"]) == "stopping" || occursin("tool_call_interrupted", message_text(results["call-1-1"]))
+    @test results["call-1-2"].is_error
+    @test occursin("tool_call_interrupted", message_text(results["call-1-2"]))
+    # The model was told before answering.
+    @test message_signatures(seen[end])[end] == message_signatures([results["call-1-2"]])[1]
+    @test message_signatures(history)[end] == (AssistantMessage, "answer-2")
+end
+
+@testset "a failed model turn is retried, not saved as an answer" begin
+    store = InMemorySessionStore()
+    calls = Ref(0)
+    seen = Vector{Vector{StoredAgentMessage}}()
+    handler = resume_test_handler(Dict{Int, Any}(1 => :fail); calls, seen)
+    run_eval() = evaluate(make_agent(), "hello"; session_store = store, compaction_config = nothing,
+        channel = SessionTestChannel("chan:fail", nothing, nothing), base_handler = handler, input_key = "event-1")
+
+    @test run_eval().most_recent_stop_reason == :error
+    @test message_signatures(load_branch(store, "chan:fail")) == [(UserMessage, "hello")]
+    run_eval()
+    @test message_signatures(seen[end]) == [(UserMessage, "hello")]
+    @test message_signatures(load_branch(store, "chan:fail")) == [(UserMessage, "hello"), (AssistantMessage, "answer-2")]
+end
+
+@testset "compaction after an in-run checkpoint round-trips ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    hits = Ref(0)
+    server, port = start_summary_server(; summary_text = "SUMMARY", hits)
+    try
+        store = make_store()
+        tool = @tool "Echo text." echo_back(text::String) = "echoed"
+        agent = Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 1000), apikey = "k", tools = [tool])
+        config = CompactionConfig(; enabled = true, reserve_tokens = 200, keep_recent_tokens = 100)
+        # The second evaluation checkpoints two tool rounds; call 3 then reports a
+        # context over the threshold, so call 4 compacts after those checkpoints.
+        handler = scripted_handler(; usage_inputs = [100, 100, 900, 100], tool_turns = Set([2, 3]))
+        run_eval(msg_id, input) = evaluate(agent, input; session_store = store, base_handler = handler,
+            compaction_config = config, channel = SessionTestChannel("chan:late", nothing, msg_id))
+        run_eval("m1", "A"^400)
+        result = run_eval("m2", "B"^400)
+        @test hits[] == 1
+        loaded = load_branch(store, "chan:late")
+        @test message_signatures(loaded) == message_signatures(result)
+        @test message_signatures(load_branch(store, "chan:late")) == message_signatures(loaded)
+        @test count(m -> m isa CompactionSummaryMessage, loaded.messages) == 1
+        for reply in ("reply-2", "reply-3", "reply-4")
+            @test count(m -> message_text(m) == reply, loaded.messages) <= 1
+        end
+        @test message_text(loaded.messages[end]) == "reply-4"
+    finally
+        close(server)
+    end
+end
+
+@testset "a nested evaluation inside a tool does not write to the outer session" begin
+    store = InMemorySessionStore()
+    noop = @tool "Do nothing." child_noop() = "child result"
+    child = Agent(; prompt = "child", model = dummy_model(), apikey = "k", tools = [noop])
+    sub = @tool "Run a sub-agent." sub() = message_text(evaluate(child, "sub-task";
+        base_handler = resume_test_handler(Dict{Int, Any}(1 => ["child_noop"])), compaction_config = nothing).messages[end])
+    agent = Agent(; prompt = "p", model = dummy_model(), apikey = "k", tools = [sub])
+    evaluate(agent, "go"; session_store = store, compaction_config = nothing,
+        channel = SessionTestChannel("chan:nested", nothing, nothing),
+        base_handler = resume_test_handler(Dict{Int, Any}(1 => ["sub"])))
+    @test message_signatures(load_branch(store, "chan:nested")) ==
+        [(UserMessage, "go"), (AssistantMessage, ""), (ToolResultMessage, "answer-2"), (AssistantMessage, "answer-2")]
 end
 
 @testset "skills_middleware" begin
