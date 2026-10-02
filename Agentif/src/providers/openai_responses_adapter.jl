@@ -315,7 +315,6 @@ function openai_responses_event_callback(
                 )
                 push!(assistant_message.tool_calls, call)
                 push!(assistant_message.content, ToolCallContent(; id = compound_id, name = item.name, arguments = args))
-                findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc))
             elseif item_type == "reasoning"

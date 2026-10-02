@@ -285,7 +285,8 @@ end
     @test tool_name(tool) == "echo_text"
     agent = make_agent(; tools = [tool])
     @test eltype(agent.tools) === typeof(tool)
-    @test @inferred(Agentif.findtool(agent.tools, "echo_text")) === tool
+    @test @inferred(Union{Nothing, typeof(tool)}, Agentif.findtool(agent.tools, "echo_text")) === tool
+    @test Agentif.findtool(agent.tools, "missing") === nothing
     default_agent = Agent(
         id = "default-tools",
         prompt = "test",
@@ -381,6 +382,126 @@ end
     @test length(tool_results) == 1
     @test message_text(tool_results[1]) == "hi"
     @test isempty(result_state.pending_tool_calls)
+end
+
+# First turn requests `calls` and ends with `reason`; later turns answer "done".
+function scripted_turn_handler(calls::Vector{AgentToolCall}, reason::Symbol)
+    turns = Ref(0)
+    return function (f, agent::Agent, state::AgentState, input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+        turns[] += 1
+        msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+        if turns[] == 1
+            append!(msg.tool_calls, calls)
+        else
+            push!(msg.content, Agentif.TextContent("done"))
+        end
+        Agentif.append_state!(state, input, msg, Usage())
+        state.pending_tool_calls = Agentif.pending_tool_calls_from_message(msg)
+        state.most_recent_stop_reason = turns[] == 1 ? reason : :stop
+        return state
+    end
+end
+
+tool_results(state) = [m for m in state.messages if m isa ToolResultMessage]
+
+@testset "truncation and failure outrank tool calls in stop reasons" begin
+    calls = [AgentToolCall(; call_id = "c1", name = "echo", arguments = "{}")]
+    none = AgentToolCall[]
+    @test Agentif.openai_completions_stop_reason("length", calls) == :length
+    @test Agentif.openai_completions_stop_reason("content_filter", calls) == :content_filter
+    @test Agentif.openai_completions_stop_reason("stop", calls) == :tool_calls
+    @test Agentif.openai_completions_stop_reason("tool_calls", none) == :tool_calls
+    @test Agentif.anthropic_stop_reason("max_tokens", calls) == :length
+    @test Agentif.anthropic_stop_reason("refusal", calls) == :error
+    @test Agentif.anthropic_stop_reason("error", calls) == :error
+    @test Agentif.anthropic_stop_reason("end_turn", calls) == :tool_calls
+    # A paused turn still owes the results of the client calls it made.
+    @test Agentif.anthropic_stop_reason("pause_turn", calls) == :tool_calls
+    @test Agentif.anthropic_stop_reason("pause_turn", none) == :length
+    @test Agentif.google_stop_reason("MAX_TOKENS", calls) == :length
+    @test Agentif.google_stop_reason("SAFETY", calls) == :safety
+    @test Agentif.google_stop_reason("STOP", calls) == :tool_calls
+end
+
+@testset "tool_call_middleware runs tools only after a normal turn" begin
+    runs = Ref(0)
+    tool = @tool "Count calls." counted(text::String) = (runs[] += 1; text)
+    agent = make_agent(; tools = [tool])
+    calls = [AgentToolCall(; call_id = "c1", name = "counted", arguments = "{\"text\":\"hi\"}")]
+
+    # A truncated turn's calls get an error result and the model gets another turn.
+    state = tool_call_middleware(scripted_turn_handler(calls, :length))(identity, agent, AgentState(), "go", Abort())
+    @test runs[] == 0
+    result = only(tool_results(state))
+    @test result.is_error
+    @test occursin("tool_call_not_executed", message_text(result))
+    @test message_text(state.messages[end]) == "done"
+
+    # A failed turn ends the evaluation without running or answering its calls.
+    state = tool_call_middleware(scripted_turn_handler(calls, :error))(identity, agent, AgentState(), "go", Abort())
+    @test runs[] == 0
+    @test isempty(tool_results(state))
+    @test isempty(state.pending_tool_calls)
+    @test state.most_recent_stop_reason == :error
+
+    state = tool_call_middleware(scripted_turn_handler(calls, :tool_calls))(identity, agent, AgentState(), "go", Abort())
+    @test runs[] == 1
+    @test !only(tool_results(state)).is_error
+end
+
+@testset "an unknown tool name becomes an error result" begin
+    echo = @tool "Echo a string." echo(text::String) = text
+    calls = [AgentToolCall(; call_id = "c1", name = "no_such_tool", arguments = "{}")]
+    events = Agentif.AgentEvent[]
+    handler = tool_call_middleware(scripted_turn_handler(calls, :tool_calls))
+    state = handler(ev -> push!(events, ev), make_agent(; tools = [echo]), AgentState(), "go", Abort())
+    result = only(tool_results(state))
+    @test result.is_error
+    @test occursin("unknown_tool", message_text(result))
+    @test occursin("echo", message_text(result))
+    @test message_text(state.messages[end]) == "done"
+    @test count(e -> e isa ToolExecutionEndEvent, events) == 1
+end
+
+completions_sse(chunks...) = join(["data: " * JSON.json(c) for c in chunks], "\n\n") * "\n\ndata: [DONE]\n\n"
+
+function completions_tool_call_sse(name::String, finish_reason::String)
+    call = (; index = 0, id = "call_1", type = "function", var"function" = (; name, arguments = "{\"text\":\"hi\"}"))
+    return completions_sse(
+        (; choices = [(; index = 0, delta = (; tool_calls = [call]), finish_reason = nothing)]),
+        (; choices = [(; index = 0, delta = (;), finish_reason)]),
+    )
+end
+
+@testset "completions stream: $label" for (label, name, finish_reason, expected_runs, expected_kind) in [
+        ("truncated tool call is not executed", "counted", "length", 0, "tool_call_not_executed"),
+        ("unknown tool does not abort the stream", "no_such_tool", "tool_calls", 0, "unknown_tool"),
+        ("normal tool call runs", "counted", "tool_calls", 1, nothing),
+    ]
+    runs = Ref(0)
+    tool = @tool "Count calls." counted(text::String) = (runs[] += 1; text)
+    hits = Ref(0)
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        hits[] += 1
+        body = hits[] == 1 ? completions_tool_call_sse(name, finish_reason) : summary_sse_body("done")
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], body)
+    end
+    try
+        model = Model(; id = "m", name = "m", api = "openai-completions", provider = "test",
+            baseUrl = "http://127.0.0.1:$(test_server_port(server))", reasoning = false, input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000, maxTokens = 4096)
+        agent = Agent(; prompt = "p", model, apikey = "k", tools = [tool])
+        state = evaluate(agent, "go"; compaction_config = nothing)
+        @test runs[] == expected_runs
+        @test hits[] == 2
+        result = only(tool_results(state))
+        @test result.is_error == (expected_kind !== nothing)
+        expected_kind === nothing || @test occursin(expected_kind, message_text(result))
+        @test message_text(state.messages[end]) == "done"
+    finally
+        close(server)
+    end
 end
 
 @testset "tool result truncation" begin

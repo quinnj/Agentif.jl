@@ -431,18 +431,13 @@ function openai_completions_usage_from_response(u::Union{Nothing, OpenAICompleti
     return Usage(; input = billable_input, output = total_output, cacheRead = cached, total)
 end
 
+# Truncation and filtering outrank tool calls: a cut-off turn can carry
+# cut-off arguments, so its calls must not look executable.
 function openai_completions_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
-    if !isempty(tool_calls)
+    reason == "length" && return :length
+    reason == "content_filter" && return :content_filter
+    if !isempty(tool_calls) || reason == "tool_calls" || reason == "function_call"
         return :tool_calls
-    end
-    if reason == "tool_calls" || reason == "function_call"
-        return :tool_calls
-    elseif reason == "length"
-        return :length
-    elseif reason == "stop"
-        return :stop
-    elseif reason == "content_filter"
-        return :content_filter
     end
     return :stop
 end

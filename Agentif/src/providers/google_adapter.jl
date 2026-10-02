@@ -168,18 +168,19 @@ function google_gemini_cli_usage_from_response(u::Union{Nothing, GoogleGeminiCli
     return Usage(; input, output, cacheRead = cache_read, total)
 end
 
+# Truncation and filtering outrank tool calls: a cut-off turn can carry cut-off
+# arguments, so its calls must not look executable.
 function google_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
-    if !isempty(tool_calls)
-        return :tool_calls
-    end
-    if reason == "STOP"
-        return :stop
-    elseif reason == "MAX_TOKENS"
+    if reason == "MAX_TOKENS"
         return :length
     elseif reason == "RECITATION"
         return :content_filter
     elseif reason == "SAFETY" || reason == "BLOCKLIST" || reason == "PROHIBITED_CONTENT"
         return :safety
+    elseif !isempty(tool_calls)
+        return :tool_calls
+    elseif reason == "STOP"
+        return :stop
     elseif reason == "OTHER"
         return :other
     end
@@ -292,7 +293,6 @@ function google_event_callback(
                 push!(assistant_message.tool_calls, call)
                 args_dict = fc.args isa AbstractDict ? Dict{String, Any}(fc.args) : Dict{String, Any}()
                 push!(assistant_message.content, ToolCallContent(; id = call_id, name = fc.name, arguments = args_dict, thoughtSignature = part.thoughtSignature))
-                findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc))
             end

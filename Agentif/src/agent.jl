@@ -118,6 +118,37 @@ function pending_tool_calls_from_message(message::AssistantMessage)
     return pending_tool_calls
 end
 
+# Tool calls run only after a turn that ended normally. A truncated or filtered
+# turn can carry cut-off arguments, and a model can name a tool it was never
+# given; both get an error result the model can act on instead of running.
+function start_tool_call!(f, tools, tc::PendingToolCall, stop_reason::Union{Nothing, Symbol})
+    if !(stop_reason === nothing || stop_reason === :tool_calls || stop_reason === :stop)
+        return tool_error_future(f, tc;
+            error_kind = "tool_call_not_executed",
+            message = "Tool call `$(tc.name)` was not executed: the response ended with stop reason `$(stop_reason)`, so its arguments may be incomplete.",
+            suggested_fix = "Re-issue the tool call with complete arguments.")
+    end
+    tool = findtool(tools, tc.name)
+    if tool === nothing
+        @warn "Model called an unknown tool" tool = tc.name call_id = tc.call_id
+        return tool_error_future(f, tc;
+            error_kind = "unknown_tool",
+            message = "Unknown tool `$(tc.name)`.",
+            suggested_fix = "Call one of the available tools: $(join((t.name for t in tools), ", ")).")
+    end
+    return call_function_tool!(f, tool, tc)
+end
+
+function tool_error_future(f, tc::PendingToolCall; error_kind::String, message::String, suggested_fix::String)
+    f(ToolExecutionStartEvent(tc))
+    output = render_tool_error_json(; error_kind, message, tool = tc.name, call_id = tc.call_id, suggested_fix)
+    trm = ToolResultMessage(tc.call_id, tc.name, output; is_error = true)
+    f(ToolExecutionEndEvent(tc, trm))
+    fut = Future{ToolResultMessage}()
+    notify(fut, trm)
+    return fut
+end
+
 function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
     return Future{ToolResultMessage}() do
         f(ToolExecutionStartEvent(tc))
