@@ -528,6 +528,50 @@ end
     Claw.shutdown!(a; timeout_s = 5)
 end
 
+const PIPELINE_TEST_MODEL = Agentif.Model(
+    id = "pipeline-test-model", name = "pipeline-test-model", api = "openai-completions",
+    provider = "pipeline-test", baseUrl = "http://localhost", reasoning = false,
+    input = ["text"],
+    cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+    contextWindow = 100000, maxTokens = 4096,
+)
+Agentif.registerModel!(PIPELINE_TEST_MODEL)
+
+# Ends the evaluation the way a provider stream does after an HTTP error it
+# could not retry: an AgentErrorEvent and a returned state with stop reason :error.
+function soft_error_handler(f, agent, state, input, abort; kw...)
+    f(Agentif.AgentErrorEvent(ErrorException("provider overloaded")))
+    msg = Agentif.AssistantMessage(; provider = "test", api = "test", model = "test")
+    Agentif.append_state!(state, input, msg, Agentif.Usage())
+    state.most_recent_stop_reason = :error
+    return state
+end
+
+@testset "unwatched provider failure retries the event instead of finishing it" begin
+    a = Claw.AgentAssistant(":memory:";
+        provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
+        timezone = "UTC", level = :error,
+        pipeline = Claw.PipelineConfig(; retry_backoff_s = [0.05], max_attempts = 2,
+            min_refire_gap_s = 0.05, scan_interval_s = 0.05, lane_backlog_warn_s = 5.0))
+    Claw.CURRENT_ASSISTANT[] = a
+    ch = RecordingChannel("soft-error")
+    a._channels[ch.id] = ch
+    register_test_handler!(a)
+    runs = Threads.Atomic{Int}(0)
+    local id
+    with_handler(function (assistant, ev, handler; kwargs...)
+        Threads.atomic_add!(runs, 1)
+        return Claw._run_event_handler!(assistant, ev, handler; kwargs..., base_handler = soft_error_handler)
+    end) do
+        Claw.start_event_loop!(a)
+        id = Claw.submit_event!(a, PipelineTestEvent("hello", ch))
+        @test timedwait(() -> event_row(a, id).status == "dead", 20.0) == :ok
+    end
+    @test runs[] == 2                           # retried instead of marked done
+    @test occursin("overloaded", String(event_row(a, id).last_error))
+    Claw.shutdown!(a; timeout_s = 5)
+end
+
 @testset ":auth failure dead-letters without retrying" begin
     a = make_assistant(":memory:";
         retry_backoff_s = [0.05], max_attempts = 5, min_refire_gap_s = 0.05,
