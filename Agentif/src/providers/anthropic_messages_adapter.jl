@@ -734,7 +734,6 @@ function anthropic_event_callback(
                 block.arguments = args
                 call = AgentToolCall(; call_id = block.id, name = block.name, arguments = JSON.json(args))
                 push!(assistant_message.tool_calls, call)
-                findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc))
                 stop_on_tool_call && throw(StopStreaming("tool call arguments complete"))

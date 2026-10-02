@@ -407,6 +407,8 @@ tool_results(state) = [m for m in state.messages if m isa ToolResultMessage]
 @testset "truncation and failure outrank tool calls in stop reasons" begin
     calls = [AgentToolCall(; call_id = "c1", name = "echo", arguments = "{}")]
     none = AgentToolCall[]
+    @test Agentif.openai_completions_stop_reason("error", calls) == :error
+    @test Agentif.openai_completions_stop_reason("error", none) == :error
     @test Agentif.openai_completions_stop_reason("length", calls) == :length
     @test Agentif.openai_completions_stop_reason("content_filter", calls) == :content_filter
     @test Agentif.openai_completions_stop_reason("stop", calls) == :tool_calls
@@ -471,6 +473,25 @@ function completions_tool_call_sse(name::String, finish_reason::String)
         (; choices = [(; index = 0, delta = (; tool_calls = [call]), finish_reason = nothing)]),
         (; choices = [(; index = 0, delta = (;), finish_reason)]),
     )
+end
+
+@testset "completions stream: a provider error ends the turn as :error" begin
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        return HTTP.Response(500, ["Content-Type" => "application/json"], JSON.json(Dict("error" => Dict("message" => "overloaded"))))
+    end
+    try
+        model = Model(; id = "m", name = "m", api = "openai-completions", provider = "test",
+            baseUrl = "http://127.0.0.1:$(test_server_port(server))", reasoning = false, input = ["text"],
+            cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000, maxTokens = 4096)
+        errors = Agentif.AgentErrorEvent[]
+        state = stream(ev -> (ev isa Agentif.AgentErrorEvent && push!(errors, ev); ev),
+            Agent(; prompt = "p", model, apikey = "k", http_kw = (; retry = false)), AgentState(), "go", Abort())
+        @test state.most_recent_stop_reason == :error
+        @test occursin("overloaded", sprint(showerror, only(errors).error))
+    finally
+        close(server)
+    end
 end
 
 @testset "completions stream: $label" for (label, name, finish_reason, expected_runs, expected_kind) in [
