@@ -91,6 +91,13 @@ wakes the dispatcher, so events survive a crash. Never `put!` onto
 Pass `dedup_key` when the upstream platform supplies a delivery id — redelivery of a
 key that is already in the table is then a no-op.
 
+If the process dies while a handler is running, the next `init!` on the same
+database picks the event up at once and the handler resumes from its last saved
+step: finished tool calls are not run again, and a tool call that was cut off is
+reported to the model as interrupted rather than re-run. Only one process may run
+on a database at a time (`init!` holds a lock on `<db>.lock`). See
+`docs/hardening.md` §1.9 for the details and limits.
+
 ## Slack Event Source
 
 Load the optional Slack extension by importing `Slack`, then construct a `SlackEventSource`:

@@ -905,6 +905,177 @@ end
     end
 end
 
+# ─── Resuming after a crash ───
+
+function remove_db(path)
+    for suffix in ("", "-wal", "-shm", ".lock")
+        rm(path * suffix; force = true)
+    end
+end
+
+init_test_assistant(path) = Claw.init!(path;
+    event_sources = Claw.EventSource[],
+    provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
+    level = :error, install_signal_handlers = false,
+    pipeline = Claw.PipelineConfig(; FAST...),
+)
+
+@testset "init! owns its database until shutdown!" begin
+    path = tempname() * ".sqlite"
+    a = init_test_assistant(path)
+    try
+        err = try
+            init_test_assistant(path)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException && occursin("another process", err.msg)
+        Claw.shutdown!(a; timeout_s = 5)
+        a = init_test_assistant(path)
+        @test a._state[] == :running
+    finally
+        Claw.shutdown!(a; timeout_s = 5)
+        remove_db(path)
+    end
+end
+
+@testset "init! returns a dead process's claims at once and dead-letters crash loops" begin
+    path = tempname() * ".sqlite"
+    seed = make_assistant(path; FAST...)
+    Claw.CURRENT_ASSISTANT[] = seed
+    register_test_handler!(seed)
+    claimed = Claw.submit_event!(seed, UnownedEvent("was running"))
+    looping = Claw.submit_event!(seed, UnownedEvent("kills the process"))
+    # Both rows look like a dead process's claims: `running` with a live lease.
+    Claw.execute_write(seed._writer,
+        "UPDATE claw_events SET source = 'claw', status = 'running', attempts = 1, lease_expires_at = ? WHERE id = ?",
+        (time() + 3600, claimed))
+    Claw.execute_write(seed._writer,
+        "UPDATE claw_events SET source = 'claw', status = 'running', attempts = 3, lease_expires_at = ? WHERE id = ?",
+        (time() + 3600, looping))
+    Claw.close_writer!(seed._writer)
+    Claw.close_readers!(seed._readers)
+    close(seed.db)
+
+    seen = String[]
+    a = nothing
+    try
+        with_handler(function (assistant, ev, handler; kwargs...)
+            push!(seen, Claw.event_content(ev))
+            return nothing
+        end) do
+            a = init_test_assistant(path)
+            @test timedwait(() -> event_row(a, claimed).status == "done", 20.0) == :ok
+        end
+        @test seen == ["was running"]
+        row = event_row(a, looping)
+        @test row.status == "dead"
+        @test occursin("process_crash", String(row.last_error))
+    finally
+        a === nothing || Claw.shutdown!(a; timeout_s = 5)
+        remove_db(path)
+    end
+end
+
+# The crash test runs this script twice, each time in a fresh process: first in
+# "crash" mode, where the `die` tool kills the process mid-run, then in
+# "recover" mode on the same database. The scripted model calls `mark`, then
+# `die`, then answers once it has two tool results.
+const CRASH_TEST_SCRIPT = raw"""
+using Agentif, Claw
+
+const MODE, DB_PATH, MARKER = ARGS
+Agentif.registerModel!(Agentif.Model(
+    id = "crash-test-model", name = "crash-test-model", api = "openai-completions",
+    provider = "crash-test", baseUrl = "http://localhost", reasoning = false, input = ["text"],
+    cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+    contextWindow = 100000, maxTokens = 4096))
+
+struct CrashTestEvent <: Claw.Event
+    content::String
+end
+Claw.get_name(::CrashTestEvent) = "crash_test_event"
+Claw.event_content(ev::CrashTestEvent) = ev.content
+
+note(line) = open(io -> println(io, line), MARKER, "a")
+const MARK = @tool "Record a mark." mark() = (note("mark"); "marked")
+const DIE = MODE == "crash" ?
+    (@tool "Die." die() = (ccall(:kill, Cint, (Cint, Cint), getpid(), 9); "unreachable")) :
+    (@tool "Die." die() = (note("die"); "died"))
+
+function scripted_model(f, agent, state, input, abort; kw...)
+    msg = Agentif.AssistantMessage(; provider = "test", api = "test", model = "test")
+    n = count(m -> m isa Agentif.ToolResultMessage, state.messages)
+    if n < 2
+        name = n == 0 ? "mark" : "die"
+        push!(msg.tool_calls, Agentif.AgentToolCall(; call_id = "call-$name", name, arguments = "{}"))
+    else
+        Agentif.append_text!(msg, "recovered")
+    end
+    Agentif.append_state!(state, input, msg, Agentif.Usage())
+    state.pending_tool_calls = Agentif.pending_tool_calls_from_message(msg)
+    state.most_recent_stop_reason = isempty(msg.tool_calls) ? :stop : :tool_calls
+    return state
+end
+
+Claw.RUN_EVENT_HANDLER_FN[] = function (assistant, ev, handler; kwargs...)
+    any(t -> t.name == "mark", assistant.tools) || append!(assistant.tools, [MARK, DIE])
+    return Claw._run_event_handler!(assistant, ev, handler; kwargs..., base_handler = scripted_model)
+end
+
+a = Claw.init!(DB_PATH; event_sources = Claw.EventSource[],
+    provider = "crash-test", model_id = "crash-test-model", apikey = "test-key",
+    level = :error, install_signal_handlers = false,
+    pipeline = Claw.PipelineConfig(; scan_interval_s = 0.05, min_refire_gap_s = 0.05))
+if MODE == "crash"
+    Claw.execute_write(a._writer,
+        "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
+        ("crash_test_event", "crash test"))
+    Claw.register_event_handler!(a, Claw.EventHandler("crash-test", ["crash_test_event"], ""))
+    Claw.submit_event!(a, CrashTestEvent("do the work"))
+    sleep(120)  # the `die` tool kills the process long before this
+    exit(1)
+end
+done() = Claw._fetch_one(a.db, "SELECT status FROM claw_events").status == "done"
+ok = timedwait(done, 60.0)
+Claw.shutdown!(a; timeout_s = 5)
+exit(ok == :ok ? 0 : 2)
+"""
+
+@testset "a handler killed mid-run resumes after restart without re-running tools" begin
+    dir = mktempdir()
+    path = joinpath(dir, "claw.sqlite")
+    marker = joinpath(dir, "marker.txt")
+    script = joinpath(dir, "crash_test.jl")
+    write(script, CRASH_TEST_SCRIPT)
+    log = joinpath(dir, "child.log")
+    run_script(mode) = Base.run(Base.pipeline(
+        ignorestatus(`$(Base.julia_cmd()) --project=$(Base.active_project()) --startup-file=no $script $mode $path $marker`);
+        stdout = log, stderr = log, append = true))
+
+    crashed = run_script("crash")
+    @test crashed.termsignal == 9
+    @test readlines(marker) == ["mark"]
+
+    # A fresh process recovers under the default 900 s lease: the event is
+    # reclaimed at boot and its handler resumes from the session checkpoints.
+    recovered = run_script("recover")
+    @test recovered.exitcode == 0
+    recovered.exitcode == 0 || println(read(log, String))
+    # Neither tool ran again: `mark` finished before the crash, `die` was cut off.
+    @test readlines(marker) == ["mark"]
+
+    store = Agentif.SQLiteSessionStore(path; embed = nothing)
+    history = Agentif.load_branch(store, "handler:crash-test").messages
+    @test [typeof(m) for m in history] ==
+        [UserMessage, AssistantMessage, ToolResultMessage, AssistantMessage, ToolResultMessage, AssistantMessage]
+    @test message_text(history[3]) == "marked"
+    @test history[5].is_error && occursin("tool_call_interrupted", message_text(history[5]))
+    @test message_text(history[end]) == "recovered"
+    close(store.db)
+end
+
 # ─── §1.6 Source supervision ───
 
 mutable struct FlakySource <: Claw.EventSource

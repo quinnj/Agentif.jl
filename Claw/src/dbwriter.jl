@@ -317,6 +317,32 @@ end
 # the baseline tables are (idempotently) created, so the ladder below is the only
 # thing that ever has to change a live database.
 
+# ─── Runtime ownership ───
+
+const LOCK_EX = Cint(2)
+const LOCK_NB = Cint(4)
+
+"""
+    _acquire_owner_lock(db_path) -> Union{Nothing, IOStream}
+
+Take an exclusive `flock` on `db_path * ".lock"` for the runtime's lifetime, or
+throw if another live process holds it. The OS drops the lock however the
+process exits, so a crash never leaves a stale owner, and the next owner knows
+that every event still marked `running` belonged to a dead process. Private
+in-memory databases need no lock; on Windows (no `flock`) this returns `nothing`
+and crashed events wait out their leases instead.
+"""
+function _acquire_owner_lock(db_path::String)
+    (_is_private_memory_path(db_path) || Sys.iswindows()) && return nothing
+    path = (isfile(db_path) ? realpath(db_path) : abspath(db_path)) * ".lock"
+    io = open(path, "w")
+    if ccall(:flock, Cint, (Cint, Cint), fd(io), LOCK_EX | LOCK_NB) != 0
+        close(io)
+        error("Claw: another process is already running on $(db_path) (lock file $(path))")
+    end
+    return io
+end
+
 const CLAW_SCHEMA_VERSION = 5
 
 function _is_sensitive_integration_key(key)

@@ -796,11 +796,15 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
     try
         for handler in handlers
             kept = Event[]
+            kept_ids = Int[]
             for (row, ev) in group
                 # Filter errors (e.g. a :prompt filter that cannot reach the model)
                 # propagate: the group rides the retry ladder rather than the event
                 # being silently dropped or spuriously delivered.
-                passes_filter(assistant, handler, ev, row.extra) && push!(kept, ev)
+                if passes_filter(assistant, handler, ev, row.extra)
+                    push!(kept, ev)
+                    push!(kept_ids, row.id)
+                end
             end
             if isempty(kept)
                 @debug "Claw: filter matched no events" handler_id = handler.id event_name = name group_size = length(group)
@@ -815,6 +819,11 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
                 level = assistant.log_level,
                 abort,
                 pipeline_managed = true,
+                # Running the same events through the same handler again (after
+                # a crash or a failed attempt) resumes that run from its session
+                # checkpoints instead of starting it over, and skips it if it
+                # already answered.
+                input_key = string("claw-event:", join(kept_ids, ","), ":", handler.id),
             )
             ev_input isa ChannelEvent && push!(streamed, get_channel(ev_input))
             @info "Claw: handler completed" handler_id = handler.id event_name = name duration_s = round(time() - started_at; digits = 4)
@@ -948,6 +957,34 @@ function _scanner_loop(assistant::AgentAssistant)
         catch e
             @error "Claw: recovery scanner error" exception = (e, catch_backtrace())
         end
+    end
+    return nothing
+end
+
+"""
+    _reclaim_crashed_events!(assistant)
+
+Boot recovery under the owner lock: every `running` row was claimed by a process
+that has since died, so return it to `pending` now instead of waiting out its
+lease. Its handlers resume from their session checkpoints (see `input_key` in
+`_process_claimed_group!`). A row that has used up its attempts is dead-lettered
+instead, so an event that kills the process cannot crash-loop it.
+"""
+function _reclaim_crashed_events!(assistant::AgentAssistant)
+    now = time()
+    max_attempts = assistant.pipeline.unknown_max_attempts
+    execute_write(assistant._writer) do db
+        _exec!(db, """
+            UPDATE claw_events
+            SET status = 'dead', lease_expires_at = NULL,
+                last_error = 'process_crash: the process died while handling this event ' || attempts || ' times'
+            WHERE status = 'running' AND attempts >= ?
+        """, (max_attempts,))
+        _exec!(db, """
+            UPDATE claw_events SET status = 'pending', lease_expires_at = NULL, next_attempt_at = ?
+            WHERE status = 'running'
+        """, (now,))
+        return nothing
     end
     return nothing
 end
@@ -1390,6 +1427,11 @@ function shutdown!(assistant::AgentAssistant; timeout_s::Real = assistant.pipeli
     try
         close(assistant.db)
     catch
+    end
+    owner_lock = assistant._owner_lock[]
+    if owner_lock !== nothing
+        close(owner_lock)
+        assistant._owner_lock[] = nothing
     end
 
     assistant._state[] = :stopped

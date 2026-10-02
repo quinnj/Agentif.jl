@@ -271,6 +271,8 @@ struct AgentAssistant
     _integrations::Dict{String, IntegrationState}
     _integrations_lock::ReentrantLock
     _health_loop_started::Base.RefValue{Bool}
+    # Held by `init!` for the runtime's lifetime; see `_acquire_owner_lock`.
+    _owner_lock::Base.RefValue{Union{Nothing, IOStream}}
 end
 
 function _new_agent_assistant(;
@@ -307,6 +309,7 @@ function _new_agent_assistant(;
         _integrations = Dict{String, IntegrationState}(),
         _integrations_lock = ReentrantLock(),
         _health_loop_started = Ref(false),
+        _owner_lock = Ref{Union{Nothing, IOStream}}(nothing),
     )
     return AgentAssistant(
         config,
@@ -342,6 +345,7 @@ function _new_agent_assistant(;
         _integrations,
         _integrations_lock,
         _health_loop_started,
+        _owner_lock,
     )
 end
 
@@ -1676,6 +1680,9 @@ include("integrations.jl")
 
 # ─── Constructor ───
 
+_resolve_db_path(db_path::String, name) =
+    isempty(db_path) ? joinpath(pwd(), "$(something(name, "claw")).sqlite") : db_path
+
 function AgentAssistant(db_path::String="";
     name::Union{Nothing, String}=nothing,
     provider::String=get(ENV, "CLAW_AGENT_PROVIDER", ""),
@@ -1690,7 +1697,7 @@ function AgentAssistant(db_path::String="";
     pipeline::PipelineConfig=PipelineConfig(),
 )
     watcher !== nothing && validate_watcher_config(watcher)
-    db_path = isempty(db_path) ? joinpath(pwd(), "$(something(name, "claw")).sqlite") : db_path
+    db_path = _resolve_db_path(db_path, name)
     db = SQLite.DB(db_path)
     _init_claw_schema!(db)
     writer = SQLiteWriter(db_path, db)
@@ -1750,7 +1757,15 @@ function init!(
     sources = event_sources === nothing ?
         lock(() -> collect(EVENT_SOURCES), EVENT_SOURCES_LOCK) :
         collect(event_sources)
-    assistant = AgentAssistant(db_path; level, kwargs...)
+    db_path = _resolve_db_path(db_path, get(kwargs, :name, nothing))
+    owner_lock = _acquire_owner_lock(db_path)
+    assistant = try
+        AgentAssistant(db_path; level, kwargs...)
+    catch
+        owner_lock === nothing || close(owner_lock)
+        rethrow()
+    end
+    assistant._owner_lock[] = owner_lock
     CURRENT_ASSISTANT[] = assistant
     # Crash recovery: evals left 'running' by a previous process can never
     # complete; flip them to failed/process_crash for post-crash forensics.
@@ -1760,6 +1775,7 @@ function init!(
             (time(),))
         return nothing
     end
+    owner_lock === nothing || _reclaim_crashed_events!(assistant)
     # Purge ephemeral tables (re-populated from EventSources)
     _exec!(assistant.db, "DELETE FROM claw_event_types")
     # Re-seed event types for persisted Tempus jobs: they are only inserted at
