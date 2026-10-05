@@ -20,6 +20,9 @@ abstract type SessionStore end
     input_key::Union{Nothing, String} = nothing
     # Shared by every entry one evaluation wrote; see `same_run_chain`.
     run_id::Union{Nothing, String} = nothing
+    # Set on a copy of another entry's messages that compaction kept (`id` of
+    # the copied entry). A copy keeps that entry's post, run and input key.
+    copied_from::Union{Nothing, String} = nothing
 end
 
 struct EntryBoundary
@@ -278,6 +281,7 @@ function scrubbed_entry(entry::SessionEntry)
         is_deleted = true, channel_id = entry.channel_id,
         search_channel_id = entry.search_channel_id, channel_flags = entry.channel_flags,
         post_id = entry.post_id, input_key = entry.input_key, run_id = entry.run_id,
+        copied_from = entry.copied_from,
     )
 end
 
@@ -290,7 +294,8 @@ last of them may carry the post id a scrub is asked for (a reply whose own post
 id is known only once it streams), so scrubbing that post must reach the whole
 chain. A compaction the evaluation ran is part of the chain only when its
 summary covers the evaluation's own messages; one that summarized only older
-history has no `run_id` and is passed over, not returned.
+history has no `run_id`, and a copy of an older entry keeps that entry's
+`run_id`. Both are passed over, not returned.
 `lookup(entry_id)` returns the stored entry or `nothing`.
 """
 function same_run_chain(lookup, entry::SessionEntry)
@@ -302,7 +307,7 @@ function same_run_chain(lookup, entry::SessionEntry)
         entry === nothing && break
         if entry.run_id == run_id
             push!(chain, entry)
-        elseif !(entry.is_compaction && entry.run_id === nothing)
+        elseif !(entry.is_compaction && entry.run_id === nothing) && entry.copied_from === nothing
             break
         end
     end
