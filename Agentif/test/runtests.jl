@@ -2049,6 +2049,27 @@ end
     @test message_signatures(load_branch(store, "chan:fail")) == [(UserMessage, "hello"), (AssistantMessage, "answer-2")]
 end
 
+@testset "a failed Gemini generation is not saved as an answer ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    body = "data: " * JSON.json((; candidates = [(; content = (; parts = [], role = "model"),
+        finishReason = "MALFORMED_FUNCTION_CALL", index = 0)])) * "\n\n"
+    server = HTTP.serve!(req -> HTTP.Response(200, ["Content-Type" => "text/event-stream"], body), "127.0.0.1", 0)
+    try
+        store = make_store()
+        model = Model(id = "gemini-2.5-flash", name = "gemini-2.5-flash", api = "google-generative-ai",
+            provider = "google", baseUrl = "http://127.0.0.1:$(test_server_port(server))", reasoning = false,
+            input = ["text"], cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000, maxTokens = 32000)
+        state = evaluate(Agent(; prompt = "p", model, apikey = "k"), "do the work"; session_store = store,
+            compaction_config = nothing, channel = SessionTestChannel("chan:gemini-failed", nothing, "m1"),
+            input_key = "event-1")
+        @test state.most_recent_stop_reason == :error
+        # Only the input is kept, for the retry to continue from.
+        @test message_signatures(load_branch(store, "chan:gemini-failed")) == [(UserMessage, "do the work")]
+    finally
+        close(server)
+    end
+end
+
 @testset "compaction after an in-run checkpoint round-trips ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
     hits = Ref(0)
     server, port = start_summary_server(; summary_text = "SUMMARY", hits)
