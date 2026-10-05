@@ -29,7 +29,7 @@ function _watcher_outbox!(db,h,seq,root,note)
     _exec!(db,"INSERT OR IGNORE INTO claw_outbox(id,conversation_id,run_id,logical_key,address,body,state) VALUES(?,?,?,?,?,?,'pending')",
         (id,root.conversation_id,root.run_id,key,run.delivery,note))
     saved=_done(db,"SELECT id FROM claw_outbox WHERE logical_key=?",(key,))
-    _task_create!(db,seq,root.conversation_id,"delivery",key;background=true,
+    _task_create!(db,seq,root.conversation_id,"delivery","deliver:$key";background=true,
         input=Dict("outbox"=>saved.id),checkpoint=Dict("phase"=>"send"))
 end
 _watcher_default(reason)="⚠️ I hit a problem while handling this event ($reason) and couldn't finish. The error has been logged; you may want to retry or check the logs."
@@ -137,7 +137,7 @@ function _supervise_durable!(h)
             failure=something(reason,get(outcome,"reason",nothing),"unknown")
             _transition!(h;point=:watcher_terminal) do db,seq
                 _exec!(db,"UPDATE claw_evals SET status=?,failure_class=?,finished_at=?,turns=?,tool_calls=? WHERE id=? AND status='running'",
-                    (completed ? "completed" : zombie ? "zombie" : "failed",completed ? nothing : failure,h.clock(),
+                    (completed ? "completed" : failure in ("stalled","overrun","aborted") ? failure : "failed",completed ? nothing : failure,h.clock(),
                         sum(t.attempt for t in rows if t.kind=="generation";init=0),count(t->t.kind=="tool",rows),spec["eval_id"]))
                 !completed && spec["respond"] && _schedule_watcher!(db,h,seq,root,spec,"failure","watcher-failure:$(root.id)";reason=failure)
             end

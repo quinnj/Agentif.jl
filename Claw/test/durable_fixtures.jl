@@ -17,7 +17,7 @@ function durable_stream(f,agent,state,input,abort;kw...)
     state
 end
 function durable_fixture(path;stream=durable_stream,tools=Agentif.AgentTool[],specs=nothing,limits=Claw.HarnessLimits(),fault=(p,h)->nothing,window=100000,compact=false)
-    h=Claw.open_harness(path;stream_fn=stream,limits,fault,compaction=Agentif.CompactionConfig(;enabled=compact,keep_recent_tokens=16,reserve_tokens=20))
+    h=Claw.open_harness(path;stream_fn=stream,limits,fault,compaction=Agentif.CompactionConfig(;enabled=compact,keep_recent_tokens=16,reserve_tokens=compact ? 1000 : 20))
     agent=Agentif.Agent(;model=durable_model(;window),prompt="test",apikey="secret-test-key",tools)
     profile=specs===nothing ? Claw.register_profile!(h,agent) : Claw.register_profile!(h,agent;specs)
     c=Claw.ensure_conversation!(h;branch_id="test",profile)

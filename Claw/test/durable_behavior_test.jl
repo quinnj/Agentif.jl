@@ -153,11 +153,11 @@ end
                 summary=a.prompt==Agentif.COMPACTION_SUMMARY_PROMPT
                 turn_result!(a,s,input,summary ? "compacted memory" : "answer";stop=summary ? stop : :stop)
             end
-            h,c,p=durable_fixture(joinpath(dir,"claw.sqlite");stream,compact=true,window=180)
+            h,c,p=durable_fixture(joinpath(dir,"claw.sqlite");stream,compact=true,window=2000)
             try
                 Claw._transition!(h;point=:fixture_history) do db,seq
                     row=Claw._done(db,"SELECT * FROM claw_conversations WHERE id=?",(c.id,))
-                    Claw._entry!(db,h,seq,row,[Agentif.UserMessage(repeat("old ",100)),durable_message(h.agents[p.id],repeat("response ",100))])
+                    Claw._entry!(db,h,seq,row,[Agentif.UserMessage(repeat("old ",1000)),durable_message(h.agents[p.id],repeat("response ",100))])
                 end
                 fresh=repeat("fresh input ",8)
                 r=Claw.submit!(h,c,fresh;request_id="fresh")
@@ -181,11 +181,11 @@ end
         stream=(f,a,s,input,abort;kw...)->begin
             notify(entered);wait(release);turn_result!(a,s,input,"stale summary")
         end
-        h,c,p=durable_fixture(joinpath(dir,"claw.sqlite");stream,compact=true,window=180)
+        h,c,p=durable_fixture(joinpath(dir,"claw.sqlite");stream,compact=true,window=2000)
         try
             Claw._transition!(h) do db,seq
                 row=Claw._done(db,"SELECT * FROM claw_conversations WHERE id=?",(c.id,))
-                Claw._entry!(db,h,seq,row,[Agentif.UserMessage(repeat("old ",200)),durable_message(h.agents[p.id],"old answer")])
+                Claw._entry!(db,h,seq,row,[Agentif.UserMessage(repeat("old ",1200)),durable_message(h.agents[p.id],"old answer")])
             end
             r=Claw.submit!(h,c,repeat("new input ",10);request_id="reset")
             awaitsignal(entered)
