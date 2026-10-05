@@ -1171,7 +1171,7 @@ end
         # Answered batch: the second "done" write fails, so neither row settles.
         e1, e2 = Claw.submit_event!(a, PipelineTestEvent("one", ch)), Claw.submit_event!(a, PipelineTestEvent("two", ch))
         fail_settle!(e2, "done")
-        Claw._process_event_batch!(a, [e1, e2])
+        @test_throws SQLite.SQLiteException Claw._process_event_batch!(a, [e1, e2])
         allow_settle!()
         @test effects[] == 1
         @test status(e1) == status(e2) == "running"
@@ -1186,7 +1186,7 @@ end
         failing[] = true
         e3, e4 = Claw.submit_event!(a, PipelineTestEvent("three", ch)), Claw.submit_event!(a, PipelineTestEvent("four", ch))
         fail_settle!(e4, "pending")
-        Claw._process_event_batch!(a, [e3, e4])
+        @test_throws SQLite.SQLiteException Claw._process_event_batch!(a, [e3, e4])
         allow_settle!()
         @test status(e3) == status(e4) == "running"
         Claw._process_event_batch!(a, [e3, e4])     # not pending: nothing runs

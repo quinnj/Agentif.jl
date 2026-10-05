@@ -12,4 +12,9 @@ include("msteams_auth_test.jl")
 include("extensions_test.jl")
 include("pty_output_test.jl")
 include("watcher_test.jl")
-include("durable_all_test.jl")
+if Sys.iswindows()
+    # Durable ownership requires POSIX flock; legacy tests still run on Windows.
+    @test_skip "POSIX durable ownership and owned-process SIGKILL recovery"
+else
+    include("durable_all_test.jl")
+end
