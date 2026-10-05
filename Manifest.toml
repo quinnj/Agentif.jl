@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "0dc391b6268dae8628484182440593ccb116681a"
+project_hash = "10b86e0d7dec901e328f8668602a2c9ecbde8276"
 
 [[deps.AbstractStores]]
 deps = ["Base64", "Dates", "Serialization"]
@@ -51,7 +51,7 @@ uuid = "fa961155-64e5-5f13-b03f-caf6b980ea82"
 version = "0.5.0"
 
 [[deps.Claw]]
-deps = ["Agentif", "Base64", "Dates", "HTTP", "JSON", "LLMTools", "LocalSearch", "Logging", "LoggingExtras", "Mattermost", "SHA", "SQLite", "ScopedValues", "Sockets", "Tempus", "TimeZones"]
+deps = ["Agentif", "Base64", "Dates", "HTTP", "JSON", "JevSDK", "LLMTools", "LocalSearch", "Logging", "LoggingExtras", "Mattermost", "SHA", "SQLite", "ScopedValues", "Sockets", "Tempus", "TimeZones"]
 path = "Claw"
 uuid = "46916a23-5c37-4b23-b62b-45b422578c04"
 version = "0.1.0"
@@ -164,11 +164,11 @@ version = "0.1.1"
 
 [[deps.HTTP]]
 deps = ["Base64", "CodecZlib", "Dates", "EnumX", "PrecompileTools", "Random", "Reseau", "SHA", "URIs", "UUIDs", "Zlib_jll"]
-git-tree-sha1 = "0a58fbbdee93d132a2fb1159b7f5e1b5c2465e71"
-repo-rev = "master"
+git-tree-sha1 = "b0ff6627f1308bc1691528aac3b70ac3abd1d598"
+repo-rev = "v2.6.7"
 repo-url = "https://github.com/JuliaWeb/HTTP.jl.git"
 uuid = "cd3eb016-35fb-5094-929b-558a96fad6f3"
-version = "2.6.4"
+version = "2.6.7"
 
 [[deps.HashArrayMappedTries]]
 git-tree-sha1 = "2eaa69a7cab70a52b9687c8bf950a5a93ec895ae"
@@ -206,9 +206,9 @@ version = "1.8.0"
 
 [[deps.JSON]]
 deps = ["Dates", "Logging", "Parsers", "PrecompileTools", "StructUtils", "UUIDs", "Unicode"]
-git-tree-sha1 = "c7345ab1a7ca4dc8a02c9f6510da0d9857bbe513"
+git-tree-sha1 = "cb5b63c11dd08229716a8b41a2325ab941a7b797"
 uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-version = "1.7.1"
+version = "1.8.1"
 
     [deps.JSON.extensions]
     JSONArrowExt = ["ArrowTypes"]
@@ -229,6 +229,14 @@ version = "1.6.0"
 
     [deps.JSONSchema.weakdeps]
     JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+
+[[deps.JevSDK]]
+deps = ["HTTP", "JSON", "ScopedValues"]
+git-tree-sha1 = "3805103431fdef40190f3063747e9cb0bba4c85a"
+repo-rev = "aebbed7181698d76ba284dab0f57b664e1e594c9"
+repo-url = "https://github.com/JuliaServices/JevSDK.jl.git"
+uuid = "131c9545-31de-4807-9342-127be5dea8db"
+version = "1.0.0"
 
 [[deps.Juco]]
 deps = ["Agentif", "Dates", "JSON", "LLMOAuth", "LLMProviders", "LLMTools", "LocalSearch", "Markdown", "REPL", "SQLite"]
@@ -382,9 +390,9 @@ version = "2.0.1"
 
 [[deps.Parsers]]
 deps = ["Dates", "PrecompileTools", "UUIDs"]
-git-tree-sha1 = "3de8f5e6e90ebfa8d6d1f86997d6cdcd6a912ff3"
+git-tree-sha1 = "ba0dc8a8a67cacac4842631f960c046e4e563675"
 uuid = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
-version = "2.8.7"
+version = "2.8.8"
 
 [[deps.PrecompileTools]]
 deps = ["Preferences"]

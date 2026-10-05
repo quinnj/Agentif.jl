@@ -7,6 +7,7 @@ GitHub = "bc5e4493-9b4d-5f90-b8aa-2b2bcaad7a26"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 JSONSchema = "7d188eb4-7ad8-530c-ae41-71a32a6d4692"
+JevSDK = "131c9545-31de-4807-9342-127be5dea8db"
 Juco = "a4f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2e"
 LLMOAuth = "f3f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2d"
 LLMProviders = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
@@ -28,8 +29,9 @@ Agentif = {path = "Agentif"}
 Claw = {path = "Claw"}
 ConcurrentUtilities = {rev = "main", url = "https://github.com/JuliaServices/ConcurrentUtilities.jl.git"}
 Encid = {url = "https://github.com/JuliaServices/Encid.jl.git"}
-HTTP = {rev = "master", url = "https://github.com/JuliaWeb/HTTP.jl.git"}
+HTTP = {rev = "v2.6.7", url = "https://github.com/JuliaWeb/HTTP.jl.git"}
 JSONSchema = {rev = "4076c12e69f8191b611580744c42579f95e92974", url = "https://github.com/JuliaIO/JSONSchema.jl.git"}
+JevSDK = {rev = "aebbed7181698d76ba284dab0f57b664e1e594c9", url = "https://github.com/JuliaServices/JevSDK.jl.git"}
 Juco = {path = "Juco"}
 LLMOAuth = {path = "LLMOAuth"}
 LLMProviders = {path = "LLMProviders"}
@@ -45,4 +47,5 @@ Telegram = {url = "https://github.com/quinnj/Telegram.jl.git"}
 Tempus = {rev = "main", url = "https://github.com/JuliaServices/Tempus.jl.git"}
 
 [compat]
+JevSDK = "1"
 julia = "1.11"
