@@ -34,7 +34,7 @@ Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
 Agentif = {path = "../Agentif"}
 HTTP = {url = "https://github.com/JuliaWeb/HTTP.jl.git", rev = "v2.6.7"}
 LLMTools = {path = "../LLMTools"}
-JevSDK = {url = "https://github.com/JuliaServices/JevSDK.jl.git", rev = "aebbed7181698d76ba284dab0f57b664e1e594c9"}
+JevSDK = {url = "https://github.com/JuliaServices/JevSDK.jl.git", rev = "5050431e20d26de0abf6343b2e24be264b0ed34f"}
 LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}
 MSTeams = {url = "https://github.com/quinnj/MSTeams.jl.git"}
 Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}

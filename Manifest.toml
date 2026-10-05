@@ -232,8 +232,8 @@ version = "1.6.0"
 
 [[deps.JevSDK]]
 deps = ["HTTP", "JSON", "ScopedValues"]
-git-tree-sha1 = "3805103431fdef40190f3063747e9cb0bba4c85a"
-repo-rev = "aebbed7181698d76ba284dab0f57b664e1e594c9"
+git-tree-sha1 = "d4a836bfaec7205368174b14239ecb4efab92121"
+repo-rev = "5050431e20d26de0abf6343b2e24be264b0ed34f"
 repo-url = "https://github.com/JuliaServices/JevSDK.jl.git"
 uuid = "131c9545-31de-4807-9342-127be5dea8db"
 version = "1.0.0"

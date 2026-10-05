@@ -31,7 +31,7 @@ ConcurrentUtilities = {rev = "main", url = "https://github.com/JuliaServices/Con
 Encid = {url = "https://github.com/JuliaServices/Encid.jl.git"}
 HTTP = {rev = "v2.6.7", url = "https://github.com/JuliaWeb/HTTP.jl.git"}
 JSONSchema = {rev = "4076c12e69f8191b611580744c42579f95e92974", url = "https://github.com/JuliaIO/JSONSchema.jl.git"}
-JevSDK = {rev = "aebbed7181698d76ba284dab0f57b664e1e594c9", url = "https://github.com/JuliaServices/JevSDK.jl.git"}
+JevSDK = {rev = "5050431e20d26de0abf6343b2e24be264b0ed34f", url = "https://github.com/JuliaServices/JevSDK.jl.git"}
 Juco = {path = "Juco"}
 LLMOAuth = {path = "LLMOAuth"}
 LLMProviders = {path = "LLMProviders"}
