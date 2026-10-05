@@ -43,7 +43,7 @@ Claw.get_tools(es::TestEventSource) = es.tools
 # ─── Helper ───
 
 function make_test_assistant(; kwargs...)
-    AgentAssistant(":memory:";
+    AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider="openai-completions",
         model_id="gpt-4o-mini",
         apikey="test-key",
@@ -94,7 +94,7 @@ println("=" ^ 60)
 end
 
 @testset "Logging level configuration" begin
-    a_warn = AgentAssistant(":memory:";
+    a_warn = AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider = "openai-completions",
         model_id = "gpt-4o-mini",
         apikey = "test-key",
@@ -102,7 +102,7 @@ end
     )
     @test a_warn.log_level == Warn
 
-    a_default = AgentAssistant(":memory:";
+    a_default = AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider = "openai-completions",
         model_id = "gpt-4o-mini",
         apikey = "test-key",
@@ -112,7 +112,7 @@ end
     # Keep the pre-hardening keyword-only constructor API.
     mktempdir() do dir
         cd(dir) do
-            a_keyword = AgentAssistant(;
+            a_keyword = AgentAssistant(; search_options=(embed=nothing,),
                 name = "compat",
                 provider = "openai-completions",
                 model_id = "gpt-4o-mini",
@@ -513,7 +513,7 @@ end
     println("  All 10 management+tempus tools: $tool_names")
 
     # With coding enabled via LLMToolsEventSource
-    a2 = AgentAssistant(":memory:";
+    a2 = AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider="openai-completions", model_id="gpt-4o-mini", apikey="test-key",
         enable_coding=true,
     )
@@ -574,7 +574,7 @@ end
     db_path = tempname() * ".sqlite"
 
     # First init: register channels, event types, and an agent-created handler
-    a1 = AgentAssistant(db_path;
+    a1 = AgentAssistant(db_path; search_options=(embed=nothing,),
         provider="openai-completions", model_id="gpt-4o-mini", apikey="test-key",
         timezone="America/Denver",
     )
@@ -597,12 +597,10 @@ end
     @test count_rows(a1.db, "claw_event_types") == 1
 
     # Close first db to release lock, simulating process exit
-    Claw.close_writer!(a1._writer)
-    Claw.close_readers!(a1._readers)
-    close(a1.db)
+    Claw.shutdown!(a1;timeout_s=0.1)
 
     # Second init with same db_path: simulates restart
-    a2 = AgentAssistant(db_path;
+    a2 = AgentAssistant(db_path; search_options=(embed=nothing,),
         provider="openai-completions", model_id="gpt-4o-mini", apikey="test-key",
         timezone="America/Denver",
     )
@@ -638,9 +636,7 @@ end
     @test occursin("es_handler", result)
 
     # Clean up temp file
-    Claw.close_writer!(a2._writer)
-    Claw.close_readers!(a2._readers)
-    close(a2.db)
+    Claw.shutdown!(a2;timeout_s=0.1)
     rm(db_path; force=true)
     rm(db_path * "-wal"; force=true)
     rm(db_path * "-shm"; force=true)

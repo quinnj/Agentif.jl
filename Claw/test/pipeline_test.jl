@@ -70,8 +70,8 @@ Claw.get_name(ev::NamedPipelineEvent) = ev.name
 Claw.get_channel(ev::NamedPipelineEvent) = ev.channel
 Claw.event_content(ev::NamedPipelineEvent) = ev.content
 
-function make_assistant(db_path::String = ":memory:"; kwargs...)
-    return Claw.AgentAssistant(db_path;
+function make_assistant(db_path::String = ":memory:"; search_options=(embed=nothing,),kwargs...)
+    return Claw.AgentAssistant(db_path; search_options,
         provider = "openai-completions",
         model_id = "gpt-4o-mini",
         apikey = "test-key",
@@ -164,7 +164,7 @@ end
 
 @testset "session persistence shares the pipeline writer" begin
     path = tempname() * ".sqlite"
-    a = make_assistant(path)
+    a = make_assistant(path;search_options=(embed=texts->zeros(Float32,2,length(texts)),))
     try
         # Pause inside LocalSearch after it has read the document metadata and
         # before it writes the embedding rows. With a second write connection,
@@ -254,7 +254,7 @@ end
         id = Claw.submit_event!(a, PipelineTestEvent("durable", ch))
         row = Claw._claim_event!(a, id)
         @test row !== nothing
-        Claw._finish_event!(a, id, "done")     # last statement on the writer
+        Claw._finish_event!(a, row, "done")     # last statement on the writer
 
         probe = SQLite.DB(path)                # an independent connection
         status = nothing
@@ -548,7 +548,7 @@ function soft_error_handler(f, agent, state, input, abort; kw...)
 end
 
 @testset "unwatched provider failure retries the event instead of finishing it" begin
-    a = Claw.AgentAssistant(":memory:";
+    a = Claw.AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
         timezone = "UTC", level = :error,
         pipeline = Claw.PipelineConfig(; retry_backoff_s = [0.05], max_attempts = 2,
@@ -573,7 +573,7 @@ end
 end
 
 @testset "a refusal (an :error turn with no provider error) is not retried" begin
-    a = Claw.AgentAssistant(":memory:";
+    a = Claw.AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
         timezone = "UTC", level = :error,
         pipeline = Claw.PipelineConfig(; retry_backoff_s = [0.05], max_attempts = 2,
@@ -669,6 +669,8 @@ end
     Claw.close_writer!(crashed._writer)
     Claw.close_readers!(crashed._readers)
     close(crashed.db)
+    crashed._owner_lock[]===nothing || close(crashed._owner_lock[])
+    crashed._owner_lock[]=nothing
     sleep(0.4)                                   # lease expires
 
     recovered = make_assistant(path; lease_duration_s = 30.0, FAST...)
@@ -876,6 +878,8 @@ end
     Claw.close_writer!(seed._writer)
     Claw.close_readers!(seed._readers)
     close(seed.db)
+    seed._owner_lock[]===nothing || close(seed._owner_lock[])
+    seed._owner_lock[]=nothing
 
     seen = String[]
     a = nothing
@@ -884,7 +888,7 @@ end
             push!(seen, Claw.event_content(ev))
             return nothing
         end) do
-            a = Claw.init!(path;
+            a = Claw.init!(path; search_options=(embed=nothing,),
                 event_sources = Claw.EventSource[],
                 provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key",
                 level = :error, install_signal_handlers = false,
@@ -913,7 +917,7 @@ function remove_db(path)
     end
 end
 
-init_test_assistant(path) = Claw.init!(path;
+init_test_assistant(path) = Claw.init!(path; search_options=(embed=nothing,),
     event_sources = Claw.EventSource[],
     provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
     level = :error, install_signal_handlers = false,
@@ -957,6 +961,8 @@ end
     Claw.close_writer!(seed._writer)
     Claw.close_readers!(seed._readers)
     close(seed.db)
+    seed._owner_lock[]===nothing || close(seed._owner_lock[])
+    seed._owner_lock[]=nothing
 
     seen = String[]
     a = nothing
@@ -1024,7 +1030,7 @@ Claw.RUN_EVENT_HANDLER_FN[] = function (assistant, ev, handler; kwargs...)
     return Claw._run_event_handler!(assistant, ev, handler; kwargs..., base_handler = scripted_model)
 end
 
-a = Claw.init!(DB_PATH; event_sources = Claw.EventSource[],
+a = Claw.init!(DB_PATH; search_options=(embed=nothing,), event_sources = Claw.EventSource[],
     provider = "crash-test", model_id = "crash-test-model", apikey = "test-key",
     level = :error, install_signal_handlers = false,
     pipeline = Claw.PipelineConfig(; scan_interval_s = 0.05, min_refire_gap_s = 0.05))

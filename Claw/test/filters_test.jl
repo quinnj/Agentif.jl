@@ -172,7 +172,7 @@ end
 # ─── Persistence roundtrip ───
 
 @testset "filter persistence roundtrip" begin
-    a = Claw.AgentAssistant(":memory:";
+    a = Claw.AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "k", level = :error)
     try
         Claw._exec!(a.db, "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
@@ -207,13 +207,13 @@ end
 
 @testset "handler mutations use the pipeline writer" begin
     path = tempname() * ".sqlite"
-    a = Claw.AgentAssistant(path;
+    a = Claw.AgentAssistant(path; search_options=(embed=nothing,),
         provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "k", level = :error)
     try
         Claw.execute_write(a._writer,
             "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
             ("writer_event", "writer ownership"))
-        close(a.db)
+        close(a.db) # Intentionally close only the unrelated main handle.
         handler = Claw.EventHandler("writer-handler", ["writer_event"], "";
             filter = Claw.EventFilter(:regex, "owned"))
         Claw.register_event_handler!(a, handler)
@@ -237,7 +237,7 @@ end
 end
 
 @testset "add_event_handler tool filter arguments" begin
-    a = Claw.AgentAssistant(":memory:";
+    a = Claw.AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "k", level = :error)
     old = Claw.CURRENT_ASSISTANT[]
     Claw.CURRENT_ASSISTANT[] = a
@@ -351,7 +351,7 @@ Claw.get_event_types(::FieldsSource) = Claw.EventType[
     # the 2-arg constructor every existing call site uses stays valid
     @test Claw.EventType("x", "y").fields == Pair{String, String}[]
 
-    a = Claw.AgentAssistant(":memory:";
+    a = Claw.AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "k", level = :error)
     old = Claw.CURRENT_ASSISTANT[]
     Claw.CURRENT_ASSISTANT[] = a

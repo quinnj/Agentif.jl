@@ -29,7 +29,7 @@ Agentif.send_message(::DBMockChannel, ::Any) = nothing
 Agentif.close_channel(::DBMockChannel) = nothing
 
 function make_assistant()
-    return AgentAssistant(":memory:";
+    return AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider = "openai-completions",
         model_id = "gpt-4o-mini",
         apikey = "test-key",

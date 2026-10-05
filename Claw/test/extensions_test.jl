@@ -234,7 +234,7 @@ if HAS_JMAP
     @test which(Claw.stop!, (typeof(source),)).module === ext
     @test Claw.stop!(source) === nothing
     @test source._stopping[]
-    assistant = Claw.AgentAssistant(":memory:";
+    assistant = Claw.AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider="openai-completions",
         model_id="gpt-4o-mini",
         apikey="test-key",
@@ -617,7 +617,7 @@ end
         ext.CHAT_POST_MESSAGE_FN[] = original_chat_post_message_fn
     end
 
-    assistant = Claw.AgentAssistant(":memory:";
+    assistant = Claw.AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider="openai-completions",
         model_id="gpt-4o-mini",
         apikey="test-key",
@@ -802,7 +802,7 @@ end
     @test Agentif.channel_id(replayed_mattermost) == "mattermost:chan-top"
     @test Agentif.entry_id(replayed_mattermost) == "post-top"
 
-    assistant = Claw.AgentAssistant(":memory:";
+    assistant = Claw.AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider="openai-completions",
         model_id="gpt-4o-mini",
         apikey="test-key",
