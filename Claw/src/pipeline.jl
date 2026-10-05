@@ -877,6 +877,7 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
     # group is released afterwards so nothing waits on a response that will never
     # come (a coalesced member, or an event a filter rejected).
     streamed = Base.IdSet{Any}()
+    handlers_finished = false
     try
         for handler in handlers
             filtered = Tuple{EventRow, Event}[]
@@ -913,15 +914,24 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
             ev_input isa ChannelEvent && push!(streamed, get_channel(ev_input))
             @info "Claw: handler completed" handler_id = handler.id event_name = name duration_s = round(time() - started_at; digits = 4)
         end
+        handlers_finished = true
         _finish_event!(assistant, rows, "done")
         foreach(id -> _forget_live_event!(assistant, id), ids)
         _release_group_channels!(group, streamed)
     catch e
-        # One failure fails the whole group: every row returns to the retry ladder
-        # together (same at-least-once semantics as a multi-handler single event),
-        # with a single dead-letter notice so a dead group does not spam its
-        # channel N times.
-        _handle_event_failure!(assistant, rows, group[1][2], handlers, e)
+        if handlers_finished
+            # Settlement is atomic. Keep failed writes recoverable under the
+            # original claims instead of treating completed work as a failure.
+            @error "Claw: completed event batch could not be finalized" event_ids = ids exception = (e, catch_backtrace())
+        else
+            # One handler failure selects one retry decision for the whole
+            # group. A failed settlement leaves every claim for recovery.
+            try
+                _handle_event_failure!(assistant, rows, group[1][2], handlers, e)
+            catch settle_error
+                @error "Claw: failed event batch could not be settled" event_ids = ids exception = (settle_error, catch_backtrace())
+            end
+        end
         _release_group_channels!(group, streamed)
     finally
         lock(assistant._inflight_lock) do
