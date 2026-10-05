@@ -377,10 +377,13 @@ end
     result_state = handler(identity, agent, state, "hello", Abort())
     @test call_counter[] == 2
     @test length(inputs) == 2
-    @test inputs[2] isa Vector{ToolResultMessage}
-    tool_results = inputs[2]
-    @test length(tool_results) == 1
-    @test message_text(tool_results[1]) == "hi"
+    # Results join the history as soon as they are known, so the next turn
+    # takes no new input.
+    @test isempty(inputs[2])
+    results = [m for m in result_state.messages if m isa ToolResultMessage]
+    @test length(results) == 1
+    @test message_text(results[1]) == "hi"
+    @test result_state.messages[end - 1] === results[1]
     @test isempty(result_state.pending_tool_calls)
 end
 
@@ -1931,6 +1934,494 @@ end
     @test message_signatures(load_branch(store, "chan:proactive")) == message_signatures(result)
     scrub_post!(store, "response-shared")
     @test isempty(load_branch(store, "chan:proactive").messages)
+end
+
+# ── Session checkpoints and resume ──
+
+# Model call n follows `script[n]`: a vector of tool names to call, `:crash` (the
+# process dies mid-call), `:fail` (a provider error ends the turn), or, by
+# default, the answer "answer-n". `seen` records the history each call was sent.
+function resume_test_handler(script::Dict{Int, Any}; calls = Ref(0), seen = Vector{Vector{StoredAgentMessage}}())
+    return function (f, agent::Agent, state::AgentState, input::Agentif.AgentTurnInput, abort::Agentif.Abort; kw...)
+        calls[] += 1
+        n = calls[]
+        action = get(script, n, :answer)
+        action === :crash && error("process died during model call $n")
+        msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+        if action isa Vector
+            for (i, name) in enumerate(action)
+                push!(msg.tool_calls, AgentToolCall(; call_id = "call-$n-$i", name, arguments = "{}"))
+            end
+        else
+            Agentif.append_text!(msg, action === :fail ? "partial" : "answer-$n")
+        end
+        Agentif.append_state!(state, input, msg, Usage())
+        push!(seen, state.messages[1:(end - 1)])
+        state.pending_tool_calls = Agentif.pending_tool_calls_from_message(msg)
+        state.most_recent_stop_reason = action isa Vector ? :tool_calls : action === :fail ? :error : :stop
+        return state
+    end
+end
+
+const StoredAgentMessage = Agentif.StoredAgentMessage
+
+@testset "a crash mid-run keeps finished turns and tool results ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    runs = Ref(0)
+    lookup = @tool "Look something up." lookup() = (runs[] += 1; "found it")
+    agent = Agent(; prompt = "p", model = dummy_model(), apikey = "k", tools = [lookup])
+    calls = Ref(0)
+    seen = Vector{Vector{StoredAgentMessage}}()
+    handler = resume_test_handler(Dict{Int, Any}(1 => ["lookup"], 2 => :crash); calls, seen)
+    run_eval() = evaluate(agent, "find it"; session_store = store, compaction_config = nothing,
+        channel = SessionTestChannel("chan:crash", nothing, "msg-1"), base_handler = handler, input_key = "event-1")
+    progress = [(UserMessage, "find it"), (AssistantMessage, ""), (ToolResultMessage, "found it")]
+
+    @test_throws ErrorException run_eval()
+    @test runs[] == 1
+    @test message_signatures(load_branch(store, "chan:crash")) == progress
+
+    # The retry continues from the saved tool result: the input is not repeated
+    # and the finished tool call does not run again.
+    run_eval()
+    @test runs[] == 1
+    @test calls[] == 3
+    @test message_signatures(seen[end]) == progress
+    @test message_signatures(load_branch(store, "chan:crash")) == [progress; (AssistantMessage, "answer-3")]
+    # The final entry carries the platform post id, so forks from it see the whole run.
+    @test get_branch_leaf(store, "chan:crash") == "msg-1"
+
+    # Once answered, the same input is not answered again.
+    run_eval()
+    @test calls[] == 3
+    @test length(load_branch(store, "chan:crash").messages) == 4
+end
+
+@testset "a tool cut off mid-call is reported, never re-run ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    abort = Abort()
+    slow_runs = Ref(0)
+    stopper = @tool "Stop the run." stopper() = (abort!(abort); "stopping")
+    slow = @tool "Take a while." slow() = (slow_runs[] += 1; sleep(0.3); "slow done")
+    agent = Agent(; prompt = "p", model = dummy_model(), apikey = "k", tools = [stopper, slow])
+    calls = Ref(0)
+    seen = Vector{Vector{StoredAgentMessage}}()
+    handler = resume_test_handler(Dict{Int, Any}(1 => ["stopper", "slow"]); calls, seen)
+    run_eval(abort) = evaluate(agent, "go"; session_store = store, compaction_config = nothing,
+        channel = SessionTestChannel("chan:cut", nothing, nothing), base_handler = handler,
+        input_key = "event-1", abort)
+
+    # The run stops before `slow`'s result is recorded; `slow` may or may not
+    # have started by then.
+    @test_throws Agentif.AbortEvaluation run_eval(abort)
+    sleep(0.5)  # let a started `slow` finish, so a rerun would show in the count
+    started = slow_runs[]
+    @test started <= 1
+
+    # Neither call runs again (a second `stopper` would abort the retry too).
+    run_eval(Abort())
+    @test slow_runs[] == started
+    history = load_branch(store, "chan:cut").messages
+    results = Dict(m.call_id => m for m in history if m isa ToolResultMessage)
+    @test sort!(collect(keys(results))) == ["call-1-1", "call-1-2"]
+    # The abort can land before `stopper`'s result is recorded; either way every
+    # call without a recorded result is reported, not re-run.
+    @test message_text(results["call-1-1"]) == "stopping" || occursin("tool_call_interrupted", message_text(results["call-1-1"]))
+    @test results["call-1-2"].is_error
+    @test occursin("tool_call_interrupted", message_text(results["call-1-2"]))
+    # The model was told before answering.
+    @test message_signatures(seen[end])[end] == message_signatures([results["call-1-2"]])[1]
+    @test message_signatures(history)[end] == (AssistantMessage, "answer-2")
+end
+
+@testset "a failed model turn is retried, not saved as an answer" begin
+    store = InMemorySessionStore()
+    calls = Ref(0)
+    seen = Vector{Vector{StoredAgentMessage}}()
+    handler = resume_test_handler(Dict{Int, Any}(1 => :fail); calls, seen)
+    run_eval() = evaluate(make_agent(), "hello"; session_store = store, compaction_config = nothing,
+        channel = SessionTestChannel("chan:fail", nothing, nothing), base_handler = handler, input_key = "event-1")
+
+    @test run_eval().most_recent_stop_reason == :error
+    @test message_signatures(load_branch(store, "chan:fail")) == [(UserMessage, "hello")]
+    run_eval()
+    @test message_signatures(seen[end]) == [(UserMessage, "hello")]
+    @test message_signatures(load_branch(store, "chan:fail")) == [(UserMessage, "hello"), (AssistantMessage, "answer-2")]
+end
+
+@testset "a failed Gemini generation is not saved as an answer ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    body = "data: " * JSON.json((; candidates = [(; content = (; parts = [], role = "model"),
+        finishReason = "MALFORMED_FUNCTION_CALL", index = 0)])) * "\n\n"
+    server = HTTP.serve!(req -> HTTP.Response(200, ["Content-Type" => "text/event-stream"], body), "127.0.0.1", 0)
+    try
+        store = make_store()
+        model = Model(id = "gemini-2.5-flash", name = "gemini-2.5-flash", api = "google-generative-ai",
+            provider = "google", baseUrl = "http://127.0.0.1:$(test_server_port(server))", reasoning = false,
+            input = ["text"], cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000, maxTokens = 32000)
+        state = evaluate(Agent(; prompt = "p", model, apikey = "k"), "do the work"; session_store = store,
+            compaction_config = nothing, channel = SessionTestChannel("chan:gemini-failed", nothing, "m1"),
+            input_key = "event-1")
+        @test state.most_recent_stop_reason == :error
+        # Only the input is kept, for the retry to continue from.
+        @test message_signatures(load_branch(store, "chan:gemini-failed")) == [(UserMessage, "do the work")]
+    finally
+        close(server)
+    end
+end
+
+@testset "compaction after an in-run checkpoint round-trips ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    hits = Ref(0)
+    server, port = start_summary_server(; summary_text = "SUMMARY", hits)
+    try
+        store = make_store()
+        tool = @tool "Echo text." echo_back(text::String) = "echoed"
+        agent = Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 1000), apikey = "k", tools = [tool])
+        config = CompactionConfig(; enabled = true, reserve_tokens = 200, keep_recent_tokens = 100)
+        # The second evaluation checkpoints two tool rounds; call 3 then reports a
+        # context over the threshold, so call 4 compacts after those checkpoints.
+        handler = scripted_handler(; usage_inputs = [100, 100, 900, 100], tool_turns = Set([2, 3]))
+        run_eval(msg_id, input) = evaluate(agent, input; session_store = store, base_handler = handler,
+            compaction_config = config, channel = SessionTestChannel("chan:late", nothing, msg_id))
+        run_eval("m1", "A"^400)
+        result = run_eval("m2", "B"^400)
+        @test hits[] == 1
+        loaded = load_branch(store, "chan:late")
+        @test message_signatures(loaded) == message_signatures(result)
+        @test message_signatures(load_branch(store, "chan:late")) == message_signatures(loaded)
+        @test count(m -> m isa CompactionSummaryMessage, loaded.messages) == 1
+        for reply in ("reply-2", "reply-3", "reply-4")
+            @test count(m -> message_text(m) == reply, loaded.messages) <= 1
+        end
+        @test message_text(loaded.messages[end]) == "reply-4"
+    finally
+        close(server)
+    end
+end
+
+@testset "a nested evaluation inside a tool does not write to the outer session" begin
+    store = InMemorySessionStore()
+    noop = @tool "Do nothing." child_noop() = "child result"
+    child = Agent(; prompt = "child", model = dummy_model(), apikey = "k", tools = [noop])
+    sub = @tool "Run a sub-agent." sub() = message_text(evaluate(child, "sub-task";
+        base_handler = resume_test_handler(Dict{Int, Any}(1 => ["child_noop"])), compaction_config = nothing).messages[end])
+    agent = Agent(; prompt = "p", model = dummy_model(), apikey = "k", tools = [sub])
+    evaluate(agent, "go"; session_store = store, compaction_config = nothing,
+        channel = SessionTestChannel("chan:nested", nothing, nothing),
+        base_handler = resume_test_handler(Dict{Int, Any}(1 => ["sub"])))
+    @test message_signatures(load_branch(store, "chan:nested")) ==
+        [(UserMessage, "go"), (AssistantMessage, ""), (ToolResultMessage, "answer-2"), (AssistantMessage, "answer-2")]
+end
+
+@testset "compaction can cut before large trailing tool results" begin
+    call = AgentToolCall(; call_id = "c1", name = "read_big", arguments = "{}")
+    messages = StoredAgentMessage[
+        UserMessage("old " * "o"^400),
+        AssistantMessage(; provider = "test", api = "test", model = "test", content = Agentif.AssistantContentBlock[Agentif.TextContent("old answer")]),
+        UserMessage("new"),
+        AssistantMessage(; provider = "test", api = "test", model = "test", tool_calls = [call]),
+        ToolResultMessage("c1", "read_big", "Z"^600),
+    ]
+    # The result alone fills the budget; the cut keeps it with its call.
+    @test Agentif.find_cut_point(messages, 100) == 4
+end
+
+@testset "input_key cannot be combined with message_queue" begin
+    @test_throws ArgumentError evaluate(make_agent(), "go";
+        message_queue = Channel{Agentif.AgentTurnInput}(1), input_key = "event-1")
+end
+
+struct ThreadTestChannel <: Agentif.AbstractChannel
+    id::String
+    parent::String
+    root::String
+end
+Agentif.channel_id(ch::ThreadTestChannel) = ch.id
+Agentif.parent_branch_id(ch::ThreadTestChannel) = ch.parent
+Agentif.branch_entry_id(ch::ThreadTestChannel) = ch.root
+
+@testset "a thread forked while its root is still running skips the unfinished run" begin
+    store = InMemorySessionStore()
+    release = Base.Event()
+    runs = Ref(0)
+    email = @tool "Send the report." send_email() = (runs[] += 1; wait(release); "sent")
+    agent = Agent(; prompt = "p", model = dummy_model(), apikey = "k", tools = [email])
+    run_root(input, msg_id, handler) = evaluate(agent, input; session_store = store, compaction_config = nothing,
+        channel = SessionTestChannel("chan:root", nothing, msg_id), base_handler = handler)
+    run_root("hello", "hello-ts", resume_test_handler(Dict{Int, Any}()))
+    root = @async run_root("email the report", "root-ts", resume_test_handler(Dict{Int, Any}(1 => ["send_email"])))
+    @test timedwait(() -> runs[] == 1, 10.0) == :ok
+    # A reply in the root message's thread while send_email is still running.
+    seen = Vector{Vector{StoredAgentMessage}}()
+    evaluate(agent, "also cc Bob"; session_store = store, compaction_config = nothing,
+        channel = ThreadTestChannel("chan:root:root-ts", "chan:root", "root-ts"),
+        base_handler = resume_test_handler(Dict{Int, Any}(); seen))
+    @test message_signatures(seen[end]) == [(UserMessage, "hello"), (AssistantMessage, "answer-1"), (UserMessage, "also cc Bob")]
+    notify(release)
+    wait(root)
+    @test runs[] == 1
+end
+
+mutable struct LateResponseChannel <: Agentif.AbstractChannel
+    id::String
+    post::Union{Nothing, String}
+end
+Agentif.channel_id(ch::LateResponseChannel) = ch.id
+Agentif.response_entry_id(ch::LateResponseChannel) = ch.post
+Agentif.start_streaming(ch::LateResponseChannel) = (ch.post = "bot-post"; nothing)
+Agentif.append_to_stream(::LateResponseChannel, ::AbstractString) = nothing
+Agentif.finish_streaming(::LateResponseChannel) = nothing
+Agentif.close_channel(::LateResponseChannel) = nothing
+
+@testset "deleting a reply scrubs the whole run that produced it ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    lookup = @tool "Look something up." lookup() = "SECRET TOOL OUTPUT"
+    agent = Agent(; prompt = "p", model = dummy_model(), apikey = "k", tools = [lookup])
+    # Turn 1 calls the tool without text (nothing is posted yet); turn 2 streams the reply.
+    handler = function (f, agent, state, input, abort; kw...)
+        msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+        if any(m -> m isa ToolResultMessage, state.messages)
+            Agentif.append_text!(msg, "answer")
+            f(Agentif.MessageStartEvent(:assistant, msg))
+            f(Agentif.MessageUpdateEvent(:assistant, msg, :text, "answer", nothing))
+            f(Agentif.MessageEndEvent(:assistant, msg))
+        else
+            push!(msg.tool_calls, AgentToolCall(; call_id = "c1", name = "lookup", arguments = "{}"))
+        end
+        Agentif.append_state!(state, input, msg, Usage())
+        state.pending_tool_calls = Agentif.pending_tool_calls_from_message(msg)
+        state.most_recent_stop_reason = isempty(msg.tool_calls) ? :stop : :tool_calls
+        return state
+    end
+    ch = LateResponseChannel("chan:late-post", nothing)
+    evaluate(agent, "private question"; session_store = store, compaction_config = nothing, channel = ch, base_handler = handler)
+    @test ch.post == "bot-post"
+    @test length(load_branch(store, "chan:late-post").messages) == 4
+    scrub_post!(store, "bot-post")
+    @test isempty(load_branch(store, "chan:late-post").messages)
+end
+
+@testset "an abort right after compaction keeps the saved answer" begin
+    hits = Ref(0)
+    server, port = start_summary_server(; summary_text = "SUMMARY", hits)
+    try
+        store = InMemorySessionStore()
+        agent = Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 1000), apikey = "k")
+        ch = SessionTestChannel("chan:stale", nothing, nothing)
+        evaluate(agent, "Q1 " * "q"^4000; session_store = store, compaction_config = nothing, channel = ch,
+            base_handler = resume_test_handler(Dict{Int, Any}()))
+        # Compaction cuts inside the saved entry, then the call returns the way
+        # `stream` does when the abort flag is already set: nothing appended.
+        early_abort = (f, agent, state, input, abort; kw...) -> (state.most_recent_stop_reason = :aborted; state)
+        config = CompactionConfig(; enabled = true, reserve_tokens = 200, keep_recent_tokens = 1)
+        evaluate(agent, "Q2"; session_store = store, compaction_config = config, channel = ch,
+            base_handler = early_abort, input_key = "q2")
+        @test hits[] == 1
+        @test message_signatures(load_branch(store, "chan:stale")) == [(CompactionSummaryMessage, "SUMMARY"), (AssistantMessage, "answer-1")]
+        # The re-saved earlier answer is not mistaken for Q2's: retrying Q2 still runs.
+        calls = Ref(0)
+        evaluate(agent, "Q2"; session_store = store, compaction_config = nothing, channel = ch,
+            base_handler = resume_test_handler(Dict{Int, Any}(); calls), input_key = "q2")
+        @test calls[] == 1
+    finally
+        close(server)
+    end
+end
+
+# Serves a different summary text for each compaction call, in order.
+function counting_summary_server(texts::Vector{String})
+    hits = Ref(0)
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        hits[] += 1
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], summary_sse_body(texts[min(hits[], end)]))
+    end
+    return server, test_server_port(server), hits
+end
+
+has_summary(state, text) = any(m -> m isa CompactionSummaryMessage && m.summary == text, state.messages)
+mentions(state, text) = any(m -> occursin(text, message_text(m)), state.messages)
+
+@testset "scrubbing a run keeps a summary of older history only ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    # m3 compacts before its first call, so its summary covers m1/m2 only.
+    server, port, hits = counting_summary_server(["OLDER-SUMMARY"])
+    try
+        store = make_store()
+        agent = Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 300), apikey = "k")
+        config = CompactionConfig(; enabled = true, reserve_tokens = 100, keep_recent_tokens = 100)
+        handler = scripted_handler()
+        run_eval(id, input) = evaluate(agent, input; session_store = store, base_handler = handler,
+            compaction_config = config, channel = SessionTestChannel("chan:scrub-older", nothing, id))
+        run_eval("m1", "A"^400); run_eval("m2", "B"^400); run_eval("m3", "private m3 question")
+        @test hits[] == 1
+        scrub_post!(store, "m3")
+        loaded = load_branch(store, "chan:scrub-older")
+        @test !mentions(loaded, "private m3")
+        @test has_summary(loaded, "OLDER-SUMMARY")
+    finally
+        close(server)
+    end
+
+    # m2's tool results fill the keep budget mid-run, so its summary covers m2's
+    # own question: scrubbing m2 must remove that summary too.
+    server, port, hits = counting_summary_server(["SUMMARY-OF-SECRET"])
+    try
+        store = make_store()
+        tool = @tool "Echo text." echo_back(text::String) = "SECRET-RESULT " * "Z"^800
+        agent = Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 1000), apikey = "k", tools = [tool])
+        config = CompactionConfig(; enabled = true, reserve_tokens = 200, keep_recent_tokens = 100)
+        handler = scripted_handler(; usage_inputs = [100, 100, 900, 100], tool_turns = Set([2, 3]))
+        run_eval(id, input) = evaluate(agent, input; session_store = store, base_handler = handler,
+            compaction_config = config, channel = SessionTestChannel("chan:scrub-own", nothing, id))
+        run_eval("m1", "A"^400); run_eval("m2", "SECRET-QUESTION")
+        loaded = load_branch(store, "chan:scrub-own")
+        @test has_summary(loaded, "SUMMARY-OF-SECRET")
+        @test !any(m -> message_text(m) == "SECRET-QUESTION", loaded.messages)
+        @test !isempty(Agentif.search_sessions(store, "SECRET"))
+        scrub_post!(store, "m2")
+        @test !mentions(load_branch(store, "chan:scrub-own"), "SECRET")
+        @test isempty(Agentif.search_sessions(store, "SECRET"))
+    finally
+        close(server)
+    end
+end
+
+@testset "a second compaction over a run's kept messages is scrubbed with the run ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    # The first compaction (call 4) summarizes m1a only and keeps m2's first
+    # tool round; the second (call 5) summarizes that round, m2's question included.
+    server, port, hits = counting_summary_server(["OLDER-SUMMARY", "SUMMARY-WITH-SECRET"])
+    try
+        store = make_store()
+        outputs = Ref(0)
+        tool = @tool "Echo text." echo_back(text::String) = (outputs[] += 1; outputs[] == 1 ? "SECRET-SMALL" : "SECRET-BIG " * "Z"^880)
+        agent = Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 1000), apikey = "k", tools = [tool])
+        config = CompactionConfig(; enabled = true, reserve_tokens = 200, keep_recent_tokens = 200)
+        handler = scripted_handler(; usage_inputs = [100, 100, 900, 900, 100], tool_turns = Set([3, 4]))
+        run_eval(id, input) = evaluate(agent, input; session_store = store, base_handler = handler,
+            compaction_config = config, channel = SessionTestChannel("chan:scrub-twice", nothing, id))
+        run_eval("m1a", "A"^800); run_eval("m1b", "B"^800); run_eval("m2", "SECRET-QUESTION")
+        @test hits[] == 2
+        @test has_summary(load_branch(store, "chan:scrub-twice"), "SUMMARY-WITH-SECRET")
+        scrub_post!(store, "m2")
+        @test !mentions(load_branch(store, "chan:scrub-twice"), "SECRET")
+        @test isempty(Agentif.search_sessions(store, "SECRET"))
+    finally
+        close(server)
+    end
+end
+
+@testset "copies of kept messages are scrubbed with the post they came from ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    text_reply(text) = AssistantMessage(; provider = "test", api = "test", model = "test",
+        content = Agentif.AssistantContentBlock[Agentif.TextContent(text)])
+    # One stored entry holds two exchanges; the new run's compaction cuts inside
+    # it, so the kept exchange is copied under the new compaction.
+    function compact_inside_older_entry()
+        store = make_store()
+        append_entry!(store, SessionEntry(; id = "older-combined", run_id = "older-run", post_id = "older-post",
+            messages = AgentMessage[UserMessage("D"^400), text_reply("discarded older reply"),
+                UserMessage("K"^400), text_reply("kept older reply plugh")]))
+        set_branch_leaf!(store, "chan:copies", "older-combined")
+        server, port, hits = counting_summary_server(["OLDER-SUMMARY"])
+        try
+            handler = (f, agent, state, input, abort; kw...) ->
+                (Agentif.append_state!(state, input, text_reply("new reply"), Usage()); state.most_recent_stop_reason = :stop; state)
+            evaluate(Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 280), apikey = "k"), "new private input";
+                session_store = store, channel = SessionTestChannel("chan:copies", nothing, "new-post"), base_handler = handler,
+                compaction_config = CompactionConfig(; enabled = true, reserve_tokens = 100, keep_recent_tokens = 100))
+            @test hits[] == 1
+        finally
+            close(server)
+        end
+        @test mentions(load_branch(store, "chan:copies"), "kept older reply")
+        return store
+    end
+
+    # Scrubbing the new run keeps the older summary and the older kept exchange.
+    store = compact_inside_older_entry()
+    scrub_post!(store, "new-post")
+    loaded = load_branch(store, "chan:copies")
+    @test !mentions(loaded, "new private input")
+    @test has_summary(loaded, "OLDER-SUMMARY")
+    @test mentions(loaded, "kept older reply")
+
+    # Deleting the older post removes its copy too, from the branch and from search.
+    store = compact_inside_older_entry()
+    scrub_post!(store, "older-post")
+    loaded = load_branch(store, "chan:copies")
+    @test !mentions(loaded, "kept older reply")
+    @test isempty(Agentif.search_sessions(store, "plugh"))
+    @test mentions(loaded, "new reply")
+
+    # A cut inside the run's own first entry copies the run's own messages:
+    # scrubbing the run removes those copies and the summary of its question.
+    server, port, hits = counting_summary_server(["SUMMARY-OF-SECRET"])
+    try
+        store = make_store()
+        tool = @tool "Echo text." echo_back(text::String) = "SECRET-RESULT " * "Z"^800
+        agent = Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 1000), apikey = "k", tools = [tool])
+        handler = scripted_handler(; usage_inputs = [100, 900, 100], tool_turns = Set([2]))
+        run_eval(id, input) = evaluate(agent, input; session_store = store, base_handler = handler,
+            compaction_config = CompactionConfig(; enabled = true, reserve_tokens = 200, keep_recent_tokens = 100),
+            channel = SessionTestChannel("chan:own-copies", nothing, id))
+        run_eval("m1", "A"^400); run_eval("m2", "SECRET-QUESTION")
+        loaded = load_branch(store, "chan:own-copies")
+        @test mentions(loaded, "SECRET-RESULT") && !any(m -> message_text(m) == "SECRET-QUESTION", loaded.messages)
+        scrub_post!(store, "m2")
+        @test !mentions(load_branch(store, "chan:own-copies"), "SECRET")
+        @test isempty(Agentif.search_sessions(store, "SECRET"))
+    finally
+        close(server)
+    end
+end
+
+@testset "a refused turn leaves nothing in the session ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    refusing = Ref(false)
+    lookup = @tool "Look something up." lookup() = "lookup result"
+    agent = Agent(; prompt = "p", model = dummy_model(), apikey = "k", tools = [lookup])
+    handler = function (f, agent, state, input, abort; kw...)
+        msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+        if refusing[]
+            Agentif.append_text!(msg, "I can't help with that.")
+        elseif input == "use the tool" && !any(m -> m isa ToolResultMessage, state.messages)
+            push!(msg.tool_calls, AgentToolCall(; call_id = "c1", name = "lookup", arguments = "{}"))
+        else
+            Agentif.append_text!(msg, "fine")
+        end
+        Agentif.append_state!(state, input, msg, Usage())
+        state.pending_tool_calls = Agentif.pending_tool_calls_from_message(msg)
+        state.most_recent_stop_reason = refusing[] ? :refusal : isempty(msg.tool_calls) ? :stop : :tool_calls
+        refusing[] = refusing[] || input == "use the tool"
+        return state
+    end
+    run_eval(id, input) = evaluate(agent, input; session_store = store, compaction_config = nothing,
+        channel = SessionTestChannel("chan:refused", nothing, id), base_handler = handler)
+    run_eval("m1", "hello")
+    @test run_eval("m2", "do the disallowed thing").most_recent_stop_reason == :stop
+    refusing[] = true
+    @test run_eval("m3", "do the disallowed thing again").most_recent_stop_reason == :refusal
+    @test message_signatures(load_branch(store, "chan:refused"))[end - 1:end] ==
+        [(UserMessage, "do the disallowed thing"), (AssistantMessage, "fine")]
+    # Refused after a tool round: the round is kept, the refusal is not.
+    refusing[] = false
+    @test run_eval("m4", "use the tool").most_recent_stop_reason == :refusal
+    @test message_signatures(load_branch(store, "chan:refused"))[end - 2:end] ==
+        [(UserMessage, "use the tool"), (AssistantMessage, ""), (ToolResultMessage, "lookup result")]
+end
+
+@testset "scrubbing a resumed reply reaches what was saved before the interruption ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    lookup = @tool "Look something up." lookup() = "SECRET TOOL OUTPUT"
+    agent = Agent(; prompt = "p", model = dummy_model(), apikey = "k", tools = [lookup])
+    handler = resume_test_handler(Dict{Int, Any}(1 => ["lookup"], 2 => :crash))
+    # A proactive run: entries carry the reply's post id, which changes when the
+    # run is resumed by a new process.
+    run_eval(post) = evaluate(agent, "private job prompt"; session_store = store, compaction_config = nothing,
+        channel = ProactiveSessionTestChannel("chan:resumed-reply", post), base_handler = handler, input_key = "job-1")
+    @test_throws ErrorException run_eval("post-1")
+    run_eval("post-2")
+    @test message_signatures(load_branch(store, "chan:resumed-reply"))[end] == (AssistantMessage, "answer-3")
+    scrub_post!(store, "post-2")
+    @test isempty(load_branch(store, "chan:resumed-reply").messages)
 end
 
 @testset "skills_middleware" begin

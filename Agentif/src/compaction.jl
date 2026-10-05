@@ -109,26 +109,27 @@ function find_cut_point(messages::Vector{StoredAgentMessage}, keep_recent_tokens
     # If we never hit the threshold, nothing to compact
     candidate == 0 && return 0
 
-    # Walk forward to nearest valid turn boundary.
-    # Valid boundaries: UserMessage, or AssistantMessage not preceded by
-    # an AssistantMessage with tool_calls (which would need its tool results).
+    # Walk forward to the nearest turn boundary. When the newest messages alone
+    # fill the budget (e.g. large tool results that a tool round just
+    # appended), there is none ahead: walk back to the turn that produced them.
     for i in candidate:length(messages)
-        msg = messages[i]
-        if msg isa UserMessage
-            return i
-        elseif msg isa AssistantMessage
-            # Valid cut point if the previous message is NOT an AssistantMessage
-            # with pending tool calls (i.e., we're not between a tool call and
-            # its results).
-            previous = i == 1 ? nothing : messages[i - 1]
-            if previous === nothing ||
-                    !(previous isa AssistantMessage && !isempty(previous.tool_calls))
-                return i
-            end
-        end
+        is_turn_boundary(messages, i) && return i
     end
-
+    for i in (candidate - 1):-1:2
+        is_turn_boundary(messages, i) && return i
+    end
     return 0  # no valid cut point found
+end
+
+# A UserMessage, or an AssistantMessage not preceded by an AssistantMessage
+# with tool calls (cutting there would split the calls from their results).
+function is_turn_boundary(messages::Vector{StoredAgentMessage}, i::Int)
+    msg = messages[i]
+    msg isa UserMessage && return true
+    msg isa AssistantMessage || return false
+    i == 1 && return true
+    previous = messages[i - 1]
+    return !(previous isa AssistantMessage && !isempty(previous.tool_calls))
 end
 
 """

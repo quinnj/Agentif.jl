@@ -148,7 +148,15 @@ function session_entry_tags(entry::Agentif.SessionEntry)
     return tags
 end
 
-function Agentif.append_entry!(store::SQLiteSessionStore, entry::Agentif.SessionEntry)
+Agentif.append_entry!(store::SQLiteSessionStore, entry::Agentif.SessionEntry) =
+    _append_entry!(store, entry, nothing)
+
+# The entry and its branch leaf commit in one transaction, so a crash can never
+# leave the entry outside its branch.
+Agentif.append_branch_entry!(store::SQLiteSessionStore, branch_id::String, entry::Agentif.SessionEntry) =
+    _append_entry!(store, entry, branch_id)
+
+function _append_entry!(store::SQLiteSessionStore, entry::Agentif.SessionEntry, branch_id::Union{Nothing, String})
     entry_json = JSON.json(entry)
     _write_transaction(store) do db, search_store
         SQLite.execute(
@@ -172,12 +180,17 @@ function Agentif.append_entry!(store::SQLiteSessionStore, entry::Agentif.Session
                 entry.post_id,
             ),
         )
+        branch_id === nothing || _set_branch_leaf!(db, branch_id, entry.id)
         doc_id = "session:entry:$(entry.id)"
         tags = session_entry_tags(entry)
         LocalSearch.load!(search_store, entry_json; id=doc_id, title="session", tags=tags)
     end
     return nothing
 end
+
+_set_branch_leaf!(db::SQLite.DB, branch_id::String, entry_id::String) = SQLite.execute(db,
+    "INSERT OR REPLACE INTO session_branches (branch_id, leaf_entry_id) VALUES (?, ?)",
+    (branch_id, entry_id))
 
 function Agentif.get_entry(store::SQLiteSessionStore, entry_id::String)
     row = _fetch_one_copy(
@@ -202,11 +215,7 @@ end
 
 function Agentif.set_branch_leaf!(store::SQLiteSessionStore, branch_id::String, entry_id::String)
     _write_transaction(store) do db, _
-        SQLite.execute(
-            db,
-            "INSERT OR REPLACE INTO session_branches (branch_id, leaf_entry_id) VALUES (?, ?)",
-            (branch_id, entry_id),
-        )
+        _set_branch_leaf!(db, branch_id, entry_id)
     end
     return nothing
 end
@@ -261,19 +270,28 @@ function Agentif.scrub_post!(store::SQLiteSessionStore, post_id::String)
                WHERE (post_id = ? OR (post_id IS NULL AND entry_id = ?)) AND is_deleted = 0""",
             (post_id, post_id),
         ) |> SQLite.rowtable
-        for row in rows
-            entry = JSON.parse(String(row.entry), Agentif.SessionEntry)
-            # Rewrite the stored entry without its messages: flagging is_deleted is
-            # not enough, the lineage walk replays whatever the entry JSON holds.
-            scrubbed = Agentif.scrubbed_entry(entry)
-            Base.delete!(search_store, "session:entry:$(row.entry_id)")
-            SQLite.execute(
-                db,
-                "UPDATE session_entries SET entry = ?, is_deleted = 1, user_id = NULL WHERE entry_id = ?",
-                (JSON.json(scrubbed), row.entry_id),
-            )
+        lookup = id -> begin
+            row = _fetch_one_copy(db, "SELECT entry FROM session_entries WHERE entry_id = ?", (id,))
+            row === nothing ? nothing : JSON.parse(String(row.entry), Agentif.SessionEntry)
         end
-        return length(rows)
+        count = 0
+        for row in rows
+            matched = JSON.parse(String(row.entry), Agentif.SessionEntry)
+            for entry in Agentif.same_run_chain(lookup, matched)
+                entry.is_deleted && continue
+                # Rewrite the stored entry without its messages: flagging is_deleted is
+                # not enough, the lineage walk replays whatever the entry JSON holds.
+                scrubbed = Agentif.scrubbed_entry(entry)
+                Base.delete!(search_store, "session:entry:$(entry.id)")
+                SQLite.execute(
+                    db,
+                    "UPDATE session_entries SET entry = ?, is_deleted = 1, user_id = NULL WHERE entry_id = ?",
+                    (JSON.json(scrubbed), entry.id),
+                )
+                count += 1
+            end
+        end
+        return count
     end
     count == 0 && return nothing
     @info "scrub_post!: scrubbed session entries" post_id count

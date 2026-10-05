@@ -16,12 +16,21 @@ abstract type SessionStore end
     # (several evaluations can share one incoming message), so `scrub_post!`
     # matches on this instead of on the entry id.
     post_id::Union{Nothing, String} = nothing
+    # `input_key` of the evaluation that wrote this entry (see `evaluate`).
+    input_key::Union{Nothing, String} = nothing
+    # Shared by every entry one evaluation wrote; see `same_run_chain`.
+    run_id::Union{Nothing, String} = nothing
+    # Set on a copy of another entry's messages that compaction kept (`id` of
+    # the copied entry). A copy keeps that entry's post, run and input key.
+    copied_from::Union{Nothing, String} = nothing
 end
 
 struct EntryBoundary
     entry_id::String
     message_start::Int  # 1-based index into state.messages
     message_end::Int
+    input_key::Union{Nothing, String}
+    run_id::Union{Nothing, String}
 end
 
 mutable struct InMemorySessionStore <: SessionStore
@@ -52,6 +61,27 @@ function append_entry!(store::InMemorySessionStore, entry::SessionEntry)
     lock(store.lock) do
         store.entries[entry.id] = entry
     end
+end
+
+"""
+    append_branch_entry!(store, branch_id, entry)
+
+Append `entry` and make it the leaf of `branch_id`. Stores that can do both
+atomically should specialize this; the fallback does them in turn, so a crash
+between the two leaves the entry outside its branch.
+"""
+function append_branch_entry!(store::SessionStore, branch_id::String, entry::SessionEntry)
+    append_entry!(store, entry)
+    set_branch_leaf!(store, branch_id, entry.id)
+    return nothing
+end
+
+function append_branch_entry!(store::InMemorySessionStore, branch_id::String, entry::SessionEntry)
+    lock(store.lock) do
+        store.entries[entry.id] = entry
+        store.branches[branch_id] = entry.id
+    end
+    return nothing
 end
 
 function get_entry(store::InMemorySessionStore, entry_id::String)
@@ -169,7 +199,7 @@ function load_branch_with_boundaries(store::SessionStore, branch_id::String)
         apply_session_entry!(state, entry)
         end_idx = length(state.messages)
         if end_idx >= start_idx
-            push!(boundaries, EntryBoundary(entry.id, start_idx, end_idx))
+            push!(boundaries, EntryBoundary(entry.id, start_idx, end_idx, entry.input_key, entry.run_id))
         end
     end
     return state, boundaries
@@ -250,8 +280,38 @@ function scrubbed_entry(entry::SessionEntry)
         is_compaction = entry.is_compaction, first_kept_entry_id = entry.first_kept_entry_id,
         is_deleted = true, channel_id = entry.channel_id,
         search_channel_id = entry.search_channel_id, channel_flags = entry.channel_flags,
-        post_id = entry.post_id,
+        post_id = entry.post_id, input_key = entry.input_key, run_id = entry.run_id,
+        copied_from = entry.copied_from,
     )
+end
+
+"""
+    same_run_chain(lookup, entry) -> Vector{SessionEntry}
+
+`entry` plus the entries the same evaluation wrote before it. An evaluation
+saves its progress as a chain of entries sharing one `run_id`, and only the
+last of them may carry the post id a scrub is asked for (a reply whose own post
+id is known only once it streams), so scrubbing that post must reach the whole
+chain. A compaction the evaluation ran is part of the chain only when its
+summary covers the evaluation's own messages; one that summarized only older
+history has no `run_id`, and a copy of an older entry keeps that entry's
+`run_id`. Both are passed over, not returned.
+`lookup(entry_id)` returns the stored entry or `nothing`.
+"""
+function same_run_chain(lookup, entry::SessionEntry)
+    chain = SessionEntry[entry]
+    run_id = entry.run_id
+    run_id === nothing && return chain
+    while entry.parent_id !== nothing
+        entry = lookup(entry.parent_id)
+        entry === nothing && break
+        if entry.run_id == run_id
+            push!(chain, entry)
+        elseif !(entry.is_compaction && entry.run_id === nothing) && entry.copied_from === nothing
+            break
+        end
+    end
+    return chain
 end
 
 # An entry matches a scrub request when it was produced from that platform post.
@@ -261,10 +321,12 @@ entry_matches_post(entry::SessionEntry, post_id::String) =
 
 function scrub_post!(store::InMemorySessionStore, post_id::String)
     lock(store.lock) do
-        for (eid, entry) in collect(store.entries)
+        for entry in collect(values(store.entries))
             entry.is_deleted && continue
             entry_matches_post(entry, post_id) || continue
-            store.entries[eid] = scrubbed_entry(entry)
+            for e in same_run_chain(id -> get(store.entries, id, nothing), entry)
+                store.entries[e.id] = scrubbed_entry(e)
+            end
         end
     end
     return nothing
