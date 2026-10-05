@@ -168,21 +168,23 @@ function google_gemini_cli_usage_from_response(u::Union{Nothing, GoogleGeminiCli
     return Usage(; input, output, cacheRead = cache_read, total)
 end
 
-# Truncation and filtering outrank tool calls: a cut-off turn can carry cut-off
-# arguments, so its calls must not look executable.
+# Only a turn that stopped normally can have executable tool calls: a cut-off
+# or blocked turn can carry cut-off arguments. Content blocks are the model's
+# answer. Every other reason (MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL,
+# TOO_MANY_TOOL_CALLS, MALFORMED_RESPONSE, MISSING_THOUGHT_SIGNATURE, NO_IMAGE,
+# OTHER, or a reason added later) means generation failed, so the turn is an
+# :error, not an answer. See https://ai.google.dev/api/generate-content#FinishReason
 function google_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
-    if reason == "MAX_TOKENS"
-        return :length
-    elseif reason == "RECITATION"
-        return :content_filter
-    elseif reason == "SAFETY" || reason == "BLOCKLIST" || reason == "PROHIBITED_CONTENT"
-        return :safety
-    elseif reason === nothing || reason == "STOP"
+    if reason === nothing || reason == "STOP"
         return isempty(tool_calls) ? :stop : :tool_calls
+    elseif reason == "MAX_TOKENS"
+        return :length
+    elseif reason in ("RECITATION", "IMAGE_RECITATION", "LANGUAGE")
+        return :content_filter
+    elseif reason in ("SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT")
+        return :safety
     end
-    # OTHER, SPII, MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL, ...: the turn
-    # ended abnormally, so its calls must not run either.
-    return :other
+    return :error
 end
 
 const google_generative_stop_reason = google_stop_reason
@@ -233,7 +235,14 @@ function google_event_callback(
         response.candidates === nothing && return
         isempty(response.candidates) && return
         candidate = response.candidates[1]
-        candidate.finishReason !== nothing && (latest_finish[] = candidate.finishReason)
+        reason = candidate.finishReason
+        reason !== nothing && (latest_finish[] = reason)
+        if reason !== nothing && google_stop_reason(reason, AgentToolCall[]) === :error
+            # A failed generation: surface it like any other provider failure,
+            # with the reason and Google's explanation when it gives one.
+            detail = candidate.finishMessage === nothing ? "" : ": " * candidate.finishMessage
+            f(AgentErrorEvent(ErrorException("Gemini generation failed ($(reason))$(detail)")))
+        end
         candidate.content === nothing && return
         candidate.content.parts === nothing && return
 
