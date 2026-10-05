@@ -1767,7 +1767,7 @@ function _run_event_handler!(
     # policy. Refusals have their own reason. Legacy effects forbid whole-run retry.
     if pipeline_managed && (state.most_recent_stop_reason===:error || observed_error[]!==nothing)
         tools_started[] && throw(SupervisedEvaluationFailure(:unsafe_to_retry,"failed","legacy tools started before provider failure"))
-        throw(something(observed_error[],ErrorException("evaluation returned :error without an error event")))
+        throw(something(observed_error[],ErrorException("evaluation returned stop reason :error without an error event")))
     end
     return nothing
 end
