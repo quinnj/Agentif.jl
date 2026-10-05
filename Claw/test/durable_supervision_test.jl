@@ -17,13 +17,29 @@ isdefined(@__MODULE__, :attached_fixture) || include("durable_integration_fixtur
             end
             watcher=Claw.WatcherConfig(;provider="test",model_id="durable-test",apikey="watcher-live-secret",check_interval_s=.05)
             a,h=attached_fixture(joinpath(dir,"watcher.sqlite");stream,watcher)
+            sent=Threads.Atomic{Bool}(false);receipt_release=Threads.Event()
+            h.fault=(point,_)->begin
+                if point===:after_remote_send
+                    sent[]=true
+                    wait(receipt_release)
+                end
+                nothing
+            end
             try
                 a._state[]=:running
                 Claw.register_event_handler!(a,Claw.EventHandler("watched",["durable-event"],"watch this"))
                 channel=DurableChannel("watcher")
                 id=Claw.submit_event!(a,DurableEvent(channel,"source"))
                 Claw._process_event!(a,id)
-                integration_until(()->length(channel.responses)==1)
+                # Remote visibility precedes the local receipt commit. Hold that
+                # gap open so observing the response cannot satisfy receipt checks.
+                integration_until(()->sent[])
+                @test length(channel.responses)==1
+                before=Claw._dread(db->Claw._done(db,"SELECT * FROM claw_evals ORDER BY id DESC LIMIT 1"),h)
+                @test before.fallback_sent==0
+                notify(receipt_release)
+                integration_until(()->Claw._dread(db->Claw._done(db,
+                    "SELECT fallback_sent FROM claw_evals ORDER BY id DESC LIMIT 1"),h).fallback_sent==1)
                 @test calls[]==1
                 @test failed_watcher ? occursin("problem",only(channel.responses)) : only(channel.responses)=="I could not finish this event."
                 journal=Claw._dread(db->Claw._done(db,"SELECT * FROM claw_evals ORDER BY id DESC LIMIT 1"),h)
@@ -32,6 +48,7 @@ isdefined(@__MODULE__, :attached_fixture) || include("durable_integration_fixtur
                 @test length(Claw._dread(db->Claw._drows(db,"SELECT * FROM claw_usage WHERE category='watcher'"),h))==1
                 @test !occursin("watcher-live-secret",join((r.payload for r in Claw._dread(db->Claw._drows(db,"SELECT payload FROM claw_agent_profiles"),h))))
             finally
+                notify(receipt_release)
                 Claw.shutdown!(a;timeout_s=10)
             end
         end
