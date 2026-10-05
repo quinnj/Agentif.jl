@@ -424,11 +424,19 @@ tool_results(state) = [m for m in state.messages if m isa ToolResultMessage]
     @test Agentif.anthropic_stop_reason("pause_turn", calls) == :tool_calls
     @test Agentif.anthropic_stop_reason("pause_turn", none) == :length
     @test Agentif.google_stop_reason("MAX_TOKENS", calls) == :length
-    @test Agentif.google_stop_reason("SAFETY", calls) == :safety
     @test Agentif.google_stop_reason("STOP", calls) == :tool_calls
     @test Agentif.google_stop_reason(nothing, calls) == :tool_calls
-    for reason in ("OTHER", "SPII", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
-        @test Agentif.google_stop_reason(reason, calls) == :other
+    # Content blocks are the model's answer; failed generation is an error.
+    for (reasons, expected) in (
+            (("SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY"), :safety),
+            (("RECITATION", "LANGUAGE"), :content_filter),
+            (("MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS",
+                "MALFORMED_RESPONSE", "MISSING_THOUGHT_SIGNATURE", "OTHER", "SOME_FUTURE_REASON"), :error),
+        )
+        for reason in reasons
+            @test Agentif.google_stop_reason(reason, calls) == expected
+            @test Agentif.google_stop_reason(reason, none) == expected
+        end
     end
 end
 
@@ -4261,6 +4269,36 @@ end
         @test count(ev -> ev isa Agentif.MessageStartEvent, seen_events) == 1
         @test count(ev -> ev isa Agentif.MessageEndEvent, seen_events) == 1
         @test result.messages[end] isa AssistantMessage
+    finally
+        close(server)
+    end
+end
+
+@testset "google_generative stream: finish reason $reason" for (reason, expected, reported) in [
+        # A failed generation is a provider error carrying Google's explanation.
+        ("MALFORMED_FUNCTION_CALL", :error, "Malformed function call: missing args"),
+        # A policy block is the model's answer, not a failure.
+        ("SAFETY", :safety, nothing),
+    ]
+    seen_events = Agentif.AgentEvent[]
+    body = "data: " * JSON.json((; candidates = [(; content = (; parts = [], role = "model"),
+        finishReason = reason, finishMessage = "Malformed function call: missing args", index = 0)])) * "\n\n"
+    server = HTTP.serve!(req -> HTTP.Response(200, ["Content-Type" => "text/event-stream"], body), "127.0.0.1", 0)
+    try
+        model = Model(id = "gemini-2.5-flash", name = "gemini-2.5-flash", api = "google-generative-ai",
+            provider = "google", baseUrl = "http://127.0.0.1:$(test_server_port(server))", reasoning = false,
+            input = ["text"], cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 128000, maxTokens = 32000)
+        result = stream(ev -> (push!(seen_events, ev); ev), Agent(; prompt = "p", model, apikey = "k"),
+            AgentState(), "Say hello", Abort())
+        @test result.most_recent_stop_reason == expected
+        error_events = filter(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
+        if reported === nothing
+            @test isempty(error_events)
+        else
+            message = sprint(showerror, only(error_events).error)
+            @test occursin(reason, message) && occursin(reported, message)
+        end
     finally
         close(server)
     end
