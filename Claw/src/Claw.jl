@@ -1659,13 +1659,12 @@ function _run_event_handler!(
         evaluate(assistant, input; channel = ch, level = level, tools = tools, abort = abort, observer, eval_kw...)
     end
     @debug "Claw handler evaluate end" handler_id = handler.id event_name = get_name(ev)
-    # A provider failure can end the evaluation normally, as an AgentErrorEvent
-    # plus a stop reason of :error. The pipeline must still see it as a failure,
-    # or the event is marked done and never retried. An :error turn with no
-    # provider error (an Anthropic refusal) is the model's answer; retrying
-    # would only ask the same question again.
-    if pipeline_managed && state.most_recent_stop_reason === :error && observed_error[] !== nothing
-        throw(observed_error[])
+    # A provider failure can end the evaluation normally, with a stop reason of
+    # :error (usually after an AgentErrorEvent). The pipeline must still see it
+    # as a failure, or the event is marked done and never retried. A refusal
+    # ends with :refusal instead: that is the model's answer.
+    if pipeline_managed && state.most_recent_stop_reason === :error
+        throw(something(observed_error[], ErrorException("evaluation ended with stop reason :error")))
     end
     return nothing
 end

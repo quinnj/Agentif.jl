@@ -36,8 +36,8 @@ function tool_call_middleware(agent_handler::AgentHandler)
             try
                 current_state = agent_handler(f, agent, current_state, next_input, abort; kw...)
                 stop_reason = current_state.most_recent_stop_reason
-                # A failed or aborted turn ends the evaluation; its calls never run.
-                if stop_reason === :error || stop_reason === :aborted
+                # A failed, aborted or refused turn ends the evaluation; its calls never run.
+                if stop_reason === :error || stop_reason === :aborted || stop_reason === :refusal
                     empty!(current_state.pending_tool_calls)
                 end
 
@@ -240,8 +240,9 @@ mutable struct SessionWriter
     const channel::AbstractChannel
     const captured_eid::Union{Nothing, String}
     const input_key::Union{Nothing, String}
-    # Shared by every entry this evaluation writes; see `same_run_chain`.
-    const run_id::String
+    # Shared by every entry this evaluation writes (a resumed evaluation keeps
+    # the interrupted one's); see `same_run_chain`.
+    run_id::String
     # Entries holding the current message list, in its current positions.
     boundaries::Vector{EntryBoundary}
     leaf::Union{Nothing, String}
@@ -263,12 +264,16 @@ end
     persist_session!(writer, state; final = false)
 
 Append every message of `state` the store does not hold yet as one entry on
-the branch, preceded by a compaction entry when compaction ran since the last
-save, and move the branch leaf to it. A trailing assistant message from a turn
-that ended in `:error` or `:aborted` is not persisted: that turn is retried,
-not replayed. The `final` save of an evaluation takes the platform post id as
-its entry id, so a fork from that post (e.g. a thread reply) sees the whole
-exchange; earlier saves get fresh ids.
+the branch and move the branch leaf to it. When compaction ran since the last
+save, that entry hangs off a new compaction entry (and, if the cut fell inside
+a stored entry, a copy of the kept messages). A trailing assistant message
+from a turn that ended in `:error` or `:aborted` is not persisted: that turn
+is retried, not replayed. A turn that ended in `:refusal` leaves nothing it
+added, neither its input nor the refusal: Anthropic asks callers to remove a
+refused turn before continuing, or later requests are refused too. The `final`
+save of an evaluation takes the platform post id as its entry id, so a fork
+from that post (e.g. a thread reply) sees the whole exchange; earlier saves get
+fresh ids.
 """
 function persist_session!(w::SessionWriter, state::AgentState; final::Bool = false)
     compacted = state.last_compaction !== nothing
@@ -277,14 +282,17 @@ function persist_session!(w::SessionWriter, state::AgentState; final::Bool = fal
     persisted_end = compacted ? state.persisted_prefix_count + 1 :
         state.persisted_prefix_start + state.persisted_prefix_count - 1
     last_idx = length(state.messages)
-    if (state.most_recent_stop_reason === :error || state.most_recent_stop_reason === :aborted) &&
+    stop_reason = state.most_recent_stop_reason
+    if stop_reason === :refusal
+        last_idx = min(last_idx, persisted_end)
+    elseif (stop_reason === :error || stop_reason === :aborted) &&
             last_idx > persisted_end && state.messages[end] isa AssistantMessage
         last_idx -= 1
     end
     platform_post_id = w.captured_eid === nothing ? response_entry_id(w.channel) : w.captured_eid
     user_id, ch_id, sch_id, ch_flags = _entry_metadata(w.channel)
-    new_entry(; key = w.input_key, kw...) = SessionEntry(; user_id, channel_id = ch_id,
-        search_channel_id = sch_id, channel_flags = ch_flags, run_id = w.run_id, input_key = key, kw...)
+    new_entry(; key = w.input_key, run = w.run_id, kw...) = SessionEntry(; user_id, channel_id = ch_id,
+        search_channel_id = sch_id, channel_flags = ch_flags, run_id = run, input_key = key, kw...)
     eval_entry_id() = _unique_entry_id(w.store,
         final && platform_post_id !== nothing ? platform_post_id : string(UID8()))
     entries = SessionEntry[]
@@ -296,6 +304,13 @@ function persist_session!(w::SessionWriter, state::AgentState; final::Bool = fal
         # [summary, kept…, new…] in order.
         # messages[1] is the summary, so at most length-1 can be kept.
         kept_persisted = clamp(state.persisted_prefix_count, 0, max(0, length(state.messages) - 1))
+        # The summary covers this run's own messages when one of its entries
+        # (or an earlier summary that did) lay before the cut, or when the cut
+        # passed everything stored. Only then is it part of the run for
+        # scrubbing; a summary of older history alone must survive a scrub.
+        summarizes_run = kept_persisted == 0 || any(w.boundaries) do b
+            b.run_id == w.run_id && b.message_start < state.persisted_prefix_start
+        end
         first_kept_eid = nothing
         if kept_persisted > 0
             first_kept_idx = state.persisted_prefix_start
@@ -313,15 +328,24 @@ function persist_session!(w::SessionWriter, state::AgentState; final::Bool = fal
         # evaluations, so they carry no input key.
         resaved = first_kept_eid === nothing ? kept_persisted : 0
         first_kept_eid === nothing && (kept_persisted = 0)
-        push!(entries, new_entry(; key = nothing,
+        push!(entries, new_entry(; key = nothing, run = summarizes_run ? w.run_id : nothing,
             id = _unique_entry_id(w.store, string(UID8())), parent_id = w.leaf,
             messages = AgentMessage[state.last_compaction],
             is_compaction = true, first_kept_entry_id = first_kept_eid))
-        push!(boundaries, EntryBoundary(entries[end].id, 1, 1, nothing))
+        push!(boundaries, EntryBoundary(entries[end].id, 1, 1, nothing, entries[end].run_id))
+        if first_kept_eid !== nothing
+            # The kept entries now follow the summary; a later compaction in
+            # this run needs them to place its cut and to see whose they are.
+            shift = state.persisted_prefix_start - 2
+            for b in w.boundaries
+                b.message_start >= state.persisted_prefix_start || continue
+                push!(boundaries, EntryBoundary(b.entry_id, b.message_start - shift, b.message_end - shift, b.input_key, b.run_id))
+            end
+        end
         if resaved > 0
             push!(entries, new_entry(; key = nothing, id = _unique_entry_id(w.store, string(UID8())),
                 parent_id = entries[end].id, messages = state.messages[2:(resaved + 1)], post_id = platform_post_id))
-            push!(boundaries, EntryBoundary(entries[end].id, 2, resaved + 1, nothing))
+            push!(boundaries, EntryBoundary(entries[end].id, 2, resaved + 1, nothing, w.run_id))
         end
         # Skip the summary (1) plus the kept messages already stored or re-saved.
         first_new = kept_persisted + resaved + 2
@@ -334,7 +358,7 @@ function persist_session!(w::SessionWriter, state::AgentState; final::Bool = fal
     if first_new <= last_idx
         push!(entries, new_entry(; id = eval_entry_id(), parent_id = isempty(entries) ? w.leaf : entries[end].id,
             messages = state.messages[first_new:last_idx], post_id = platform_post_id))
-        push!(boundaries, EntryBoundary(entries[end].id, first_new, last_idx, w.input_key))
+        push!(boundaries, EntryBoundary(entries[end].id, first_new, last_idx, w.input_key, w.run_id))
     end
     for entry in @view(entries[1:(end - 1)])
         append_entry!(w.store, entry)
@@ -384,7 +408,7 @@ function _settle_interrupted_tool_calls!(w::SessionWriter, state::AgentState)
         channel_flags = leaf.channel_flags, post_id = leaf.post_id, input_key = leaf.input_key, run_id = leaf.run_id,
     )
     append_branch_entry!(w.store, w.branch_id, entry)
-    push!(w.boundaries, EntryBoundary(entry.id, length(state.messages) + 1, length(state.messages) + length(results), entry.input_key))
+    push!(w.boundaries, EntryBoundary(entry.id, length(state.messages) + 1, length(state.messages) + length(results), entry.input_key, entry.run_id))
     append!(state.messages, results)
     w.leaf = entry.id
     _reset_persisted_prefix!(state)
@@ -393,7 +417,9 @@ end
 
 # With an input key, an input the branch already holds is not appended again:
 # an answered one returns `nothing` (skip the evaluation), and one whose
-# evaluation was cut short at the branch tail continues with no new input.
+# evaluation was cut short at the branch tail continues with no new input. A
+# continued evaluation keeps the interrupted one's run id, so scrubbing its
+# reply also reaches what was saved before the interruption.
 function _resumed_input(w::SessionWriter, state::AgentState, input::AgentTurnInput)
     w.input_key === nothing && return input
     idx = findlast(b -> b.input_key == w.input_key, w.boundaries)
@@ -403,6 +429,7 @@ function _resumed_input(w::SessionWriter, state::AgentState, input::AgentTurnInp
     last_message isa AssistantMessage && isempty(pending_tool_calls_from_message(last_message)) && return nothing
     if b.message_end == length(state.messages) &&
             (last_message isa UserMessage || last_message isa ToolResultMessage)
+        b.run_id === nothing || (w.run_id = b.run_id)
         return ToolResultMessage[]
     end
     return input

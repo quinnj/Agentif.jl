@@ -553,13 +553,15 @@ function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.Abstract
         end
         # Provider adapters can surface a failed stream as AgentErrorEvent plus
         # an AgentState with stop reason :error. This is a failed evaluation even
-        # though the task itself returned normally. An :error turn with no
-        # provider error (an Anthropic refusal) is the model's answer instead.
-        observed = _last_error(ws)
-        if abort_reason === nothing && failure_class === nothing && observed !== nothing &&
+        # though the task itself returned normally. A refusal ends with
+        # :refusal instead: that is the model's answer.
+        if abort_reason === nothing && failure_class === nothing &&
                 result_state isa Agentif.AgentState &&
                 result_state.most_recent_stop_reason === :error
-            primary_error = observed
+            primary_error = something(
+                _last_error(ws),
+                ErrorException("primary evaluation completed with stop reason :error"),
+            )
             status = "failed"
             failure_class = String(classify_eval_failure(primary_error))
             err_text = String(first(sprint(showerror, primary_error), 2000))
