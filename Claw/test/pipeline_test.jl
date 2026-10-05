@@ -1085,6 +1085,74 @@ end
     Claw.shutdown!(a; timeout_s = 5)
 end
 
+@testset "a batch settles all of its events in one write" begin
+    a = Claw.AgentAssistant(":memory:";
+        provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
+        timezone = "UTC", level = :error, pipeline = Claw.PipelineConfig(; FAST...))
+    Claw.CURRENT_ASSISTANT[] = a
+    a._state[] = :running
+    ch = RecordingChannel("settle-lane")
+    a._channels[ch.id] = ch
+    register_test_handler!(a)
+    status(id) = String(event_row(a, id).status)
+    # Fail one member's settle write, as a crash or a failed write between
+    # per-row updates would.
+    fail_settle!(id, to) = Claw.execute_write(a._writer, """
+        CREATE TRIGGER fail_settle BEFORE UPDATE OF status ON claw_events
+        WHEN NEW.id = $id AND NEW.status = '$to'
+        BEGIN SELECT RAISE(ABORT, 'injected settle failure'); END""")
+    allow_settle!() = Claw.execute_write(a._writer, "DROP TRIGGER fail_settle")
+    effects = Ref(0)
+    keys = String[]
+    failing = Ref(false)
+    # A handler with a session: its finished tool must not run again.
+    mark = @tool "Record an effect." mark() = (effects[] += 1; "marked")
+    model = function (f, agent, state, input, abort; kw...)
+        msg = Agentif.AssistantMessage(; provider = "test", api = "test", model = "test")
+        input isa AbstractString ?
+            push!(msg.tool_calls, Agentif.AgentToolCall(; call_id = "mark-$(length(state.messages))", name = "mark", arguments = "{}")) :
+            Agentif.append_text!(msg, "done")
+        Agentif.append_state!(state, input, msg, Agentif.Usage())
+        state.pending_tool_calls = Agentif.pending_tool_calls_from_message(msg)
+        state.most_recent_stop_reason = isempty(msg.tool_calls) ? :stop : :tool_calls
+        return state
+    end
+    push!(a.tools, mark)
+    with_handler(function (assistant, ev, handler; input_key, kwargs...)
+        push!(keys, input_key)
+        failing[] && error("provider overloaded")
+        return Claw._run_event_handler!(assistant, ev, handler; input_key, kwargs..., base_handler = model)
+    end) do
+        # Answered batch: the second "done" write fails, so neither row settles.
+        e1, e2 = Claw.submit_event!(a, PipelineTestEvent("one", ch)), Claw.submit_event!(a, PipelineTestEvent("two", ch))
+        fail_settle!(e2, "done")
+        Claw._process_event_batch!(a, [e1, e2])
+        allow_settle!()
+        @test effects[] == 1
+        @test status(e1) == status(e2) == "running"
+        # A restart reruns the whole batch under its key; the answered run is skipped.
+        Claw._reclaim_crashed_events!(a)
+        Claw._process_event_batch!(a, [e1, e2])
+        @test keys == fill("claw-event:$e1,$e2:pipeline_test_handler", 2)
+        @test effects[] == 1
+        @test status(e1) == status(e2) == "done"
+
+        # Failed batch: the retry write fails for the second row, so neither moves.
+        failing[] = true
+        e3, e4 = Claw.submit_event!(a, PipelineTestEvent("three", ch)), Claw.submit_event!(a, PipelineTestEvent("four", ch))
+        fail_settle!(e4, "pending")
+        Claw._process_event_batch!(a, [e3, e4])
+        allow_settle!()
+        @test status(e3) == status(e4) == "running"
+        Claw._process_event_batch!(a, [e3, e4])     # not pending: nothing runs
+        Claw._reclaim_crashed_events!(a)
+        Claw._process_event_batch!(a, [e3, e4])
+        @test status(e3) == status(e4) == "pending"
+        @test event_row(a, e3).attempts == event_row(a, e4).attempts
+    end
+    Claw.shutdown!(a; timeout_s = 5)
+end
+
 # The crash test runs this script twice, each time in a fresh process: first in
 # "crash" mode, where the `die` tool kills the process mid-run, then in
 # "recover" mode on the same database. The scripted model calls `mark` when asked

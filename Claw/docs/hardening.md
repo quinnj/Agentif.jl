@@ -231,7 +231,11 @@ Added after the Pi Durable comparison (October 2026). The pipeline above recover
 - Events claimed together form a batch (`claw_events.batch`, schema version 6, holds
   the id of the first one). A retry, an abort or a restart runs every pending event of
   the batch together again and nothing else with them, so each handler gets the same
-  events and the same key; events that arrived later run separately. The key still
+  events and the same key; events that arrived later run separately. A batch's events
+  are settled (done, retried, released or dead-lettered) by one write, so a crash or a
+  failed write never leaves part of a batch settled. Rows written by older binaries
+  have no batch, so one such split left before an upgrade can still rerun under a
+  smaller key once. The key still
   covers only the events a handler kept after filtering, so a `:prompt` filter that
   decides differently on a later attempt starts the run over instead of resuming.
 - A tool call that was running when the process died gets an error result saying
