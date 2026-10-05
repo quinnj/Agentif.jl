@@ -1,13 +1,25 @@
 function _handler_snapshot(handler)
     Dict("id"=>handler.id,"prompt"=>handler.prompt,"channel_id"=>handler.channel_id,
         "trust"=>String(_handler_trust(handler)),"tools"=>_handler_tool_names(handler),
-        "filter"=>handler.filter===nothing ? nothing : JSON.parse(JSON.json(handler.filter)))
+        "filter"=>handler.filter===nothing ? nothing : JSON.parse(JSON.json(handler.filter)),
+        "relevance"=>hasproperty(handler,:relevance) && handler.relevance!==nothing ?
+            JSON.parse(JSON.json(_relevance_spec(handler.relevance))) : nothing)
 end
 function _restore_handler(value)
     f=value["filter"]
     filter=f===nothing ? nothing : _decode_filter(f["kind"],get(f,"expr",nothing),get(f,"pattern",nothing))
     (;id=value["id"],prompt=value["prompt"],channel_id=value["channel_id"],trust=Symbol(value["trust"]),
-        tools=value["tools"]===nothing ? nothing : String.(value["tools"]),filter)
+        tools=value["tools"]===nothing ? nothing : String.(value["tools"]),filter,
+        relevance=_decode_relevance(get(value,"relevance",nothing)))
+end
+
+function _guard_source_claims!(db,members,abort=nothing)
+    abort===nothing || Agentif.check_abort(abort)
+    for (row,ev) in members
+        current=_done(db,"SELECT status,claim_token,claim_revision,owner_epoch FROM claw_events WHERE id=?",(row.id,))
+        current!==nothing && current.status=="running" && current.claim_token==row.claim_token &&
+            current.claim_revision==row.claim_revision && current.owner_epoch==row.owner_epoch || throw(StaleInvocation())
+    end
 end
 
 function _bridge_profile(h,handler,ch)
@@ -31,7 +43,8 @@ end
 seam for a source relevance policy. Decisions and exact handler revisions persist
 before submissions; coalescing changes cannot reinterpret an existing batch.
 """
-function _durable_dispatch_group!(a,group,handlers;verdicts=nothing)
+function _durable_dispatch_group!(a,group,handlers;verdicts=nothing,abort=Agentif.Abort())
+    Agentif.check_abort(abort)
     h=a._harness[]
     h===nothing && error("durable runtime is not attached")
     # Divide newly claimed rows by their existing frozen batches. Newly arriving
@@ -50,6 +63,7 @@ function _durable_dispatch_group!(a,group,handlers;verdicts=nothing)
     if !isempty(new)
         key=join((x[1].id for x in new),",")
         frozen=_transition!(h;point=:dispatch_freeze) do db,seq
+            _guard_source_claims!(db,new,abort)
             snapshots=[_handler_snapshot(x) for x in handlers]
             for snapshot in snapshots
                 snapshot["context_prefix"]=build_context_prefix(a.config)
@@ -80,7 +94,7 @@ function _durable_dispatch_group!(a,group,handlers;verdicts=nothing)
             if !any(x->x[1].id==row.id,group)
                 push!(group,(row,ev))
                 lock(a._inflight_lock) do
-                    a._inflight[row.id]=Agentif.Abort()
+                    a._inflight[row.id]=abort
                 end
             end
         end
@@ -92,14 +106,28 @@ function _durable_dispatch_group!(a,group,handlers;verdicts=nothing)
             kept=Any[];decisions=Dict{String,Bool}()
             for (row,ev) in members
                 receipt=_dread(db->_done(db,"SELECT verdict FROM claw_filter_receipts WHERE event_id=? AND handler_hash=?",(row.id,hash)),h)
-                pass=receipt===nothing ? (verdicts===nothing ? _durable_filter!(h,handler,ev,row,hash) : verdicts[(handler.id,row.id)]) : receipt.verdict==1
+                pass=receipt===nothing ? (verdicts===nothing ? _durable_filter!(h,handler,ev,row,hash;abort) : verdicts[(handler.id,row.id)]) : receipt.verdict==1
                 if receipt===nothing
                     _transition!(h;point=:filter_receipt) do db,seq
+                        _guard_source_claims!(db,members,abort)
                         _exec!(db,"INSERT OR IGNORE INTO claw_filter_receipts VALUES(?,?,?)",(row.id,hash,Int(pass)))
                     end
                 end
                 decisions[string(row.id)]=pass
                 pass && push!(kept,(row,ev))
+            end
+            if verdicts===nothing && !isempty(kept)
+                persist_selection = write -> _transition!(h;point=:relevance_receipt) do db,seq
+                    # Fence the source claim as well as the runtime owner. A
+                    # lease can be reclaimed within the same runtime epoch.
+                    _guard_source_claims!(db,members,abort)
+                    write(db)
+                end
+                kept=_select_relevant_events!(a,handler,kept,abort;persist! = persist_selection)
+                selected=Set(row.id for (row,ev) in kept)
+                for (row,ev) in members
+                    decisions[string(row.id)]=row.id in selected
+                end
             end
             if isempty(kept)
                 push!(prepared,(;handler,hash,decisions,submission=nothing))
@@ -118,7 +146,9 @@ function _durable_dispatch_group!(a,group,handlers;verdicts=nothing)
             input=Agentif.UserMessage(raw["context_prefix"]*"\n\n"*make_prompt(handler.prompt,ev))
             push!(prepared,(;handler,hash,decisions,submission=(c,profile,input,route)))
         end
+        Agentif.check_abort(abort)
         _transition!(h;point=:dispatch) do db,seq
+            _guard_source_claims!(db,members,abort)
             for p in prepared
                 id=_did();sid=nothing
                 if p.submission!==nothing

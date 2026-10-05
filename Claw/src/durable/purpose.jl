@@ -17,7 +17,8 @@ end
 
 # A prompt classifier is a durable model-purpose task. Its operation identity,
 # attempt budget, usage and unknown spend survive dispatch retries and restart.
-function _durable_filter!(h,handler,ev,row,hash)
+function _durable_filter!(h,handler,ev,row,hash;abort=Agentif.Abort())
+    Agentif.check_abort(abort)
     filter=handler.filter
     filter===nothing && return true
     filter.kind===:prompt || return passes_filter(h.assistant,handler,ev,row.extra)
@@ -30,11 +31,21 @@ function _durable_filter!(h,handler,ev,row,hash)
     conversation=ensure_conversation!(h;branch_id=key,profile,routing=Dict("post_id"=>get(row.extra,"source_id",nothing)))
     input="CRITERIA: `$(filter.expr)`\n\nEVENT CONTENT:\n"*wrap_untrusted_event_content(event_content(ev))
     id=_transition!(h;point=:filter_prepare) do db,seq
+        _guard_source_claims!(db,[(row,ev)],abort)
         _task_create!(db,seq,conversation.id,"filter",key;input=Dict("profile"=>profile.id,"deadline"=>h.clock()+h.limits.run_timeout),
             checkpoint=Dict("phase"=>"request","prompt"=>EVENT_FILTER_PROMPT,"messages"=>JSON.parse(JSON.json([Agentif.UserMessage(input)]))))
     end
     resume!(h)
     while h.state===:open
+        if Agentif.isaborted(abort)
+            _transition!(h;point=:filter_abort) do db,seq
+                _guard_source_claims!(db,[(row,ev)])
+                _cancel_task!(db,id)
+            end
+            live=lock(()->get(h.live,id,nothing),h.lock)
+            live===nothing || Agentif.abort!(live.context.abort)
+            Agentif.check_abort(abort)
+        end
         t=_task_row(h,id)
         if t.status=="terminal"
             outcome=JSON.parse(t.outcome)

@@ -1533,7 +1533,10 @@ function evaluate(
     _guard_legacy_runtime!(assistant)
     if assistant._durable_parked[] && channel!==nothing
         blocked=execute_write(assistant._writer) do db
-            _done(db,"SELECT t.id FROM claw_tasks t JOIN claw_conversations c ON c.id=t.conversation_id WHERE c.branch_id=? AND t.status!='terminal' LIMIT 1",(String(Agentif.branch_id(channel)),))
+            _done(db,"""SELECT id FROM claw_conversations c WHERE c.branch_id=? AND
+                (EXISTS(SELECT 1 FROM claw_tasks t WHERE t.conversation_id=c.id AND t.status!='terminal') OR
+                 EXISTS(SELECT 1 FROM claw_submissions s WHERE s.conversation_id=c.id AND s.state IN ('queued','placed'))) LIMIT 1""",
+                (String(Agentif.branch_id(channel)),))
         end
         blocked===nothing || error("this branch has parked durable work; resume or settle it before legacy evaluation")
     end

@@ -832,13 +832,14 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
     end
 
     if assistant._harness[] !== nothing
+        abort=Agentif.Abort()
         lock(assistant._inflight_lock) do
             for (row,_) in group
-                assistant._inflight[row.id]=Agentif.Abort()
+                assistant._inflight[row.id]=abort
             end
         end
         try
-            _durable_dispatch_group!(assistant,group,handlers)
+            _durable_dispatch_group!(assistant,group,handlers;abort)
         catch err
             current_rows=EventRow[]
             for (row,ev) in group

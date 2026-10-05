@@ -178,22 +178,54 @@ function _invoke_phase!(ctx,resolved)
     end
 end
 
+function _is_due!(h,key,due)
+    wall=Float64(due)
+    saved=get(h.due_timers,key,nothing)
+    if saved===nothing || saved[1]!=wall
+        saved=(wall,time()+clamp(wall-h.clock(),0,h.limits.max_retry_delay))
+        h.due_timers[key]=saved
+    end
+    # UTC is the restart record; a live monotonic timer prevents a wall-clock
+    # correction from extending a retry indefinitely. Overdue timers run now.
+    h.clock()>=wall || time()>=saved[2]
+end
+
+function _ownership_ready(db,h)
+    live=lock(()->collect(keys(h.live)),h.lock)
+    for t in _drows(db,"SELECT id,status,cancel FROM claw_tasks WHERE status IN ('waiting','completing') OR (cancel=1 AND status!='terminal')")
+        t.cancel==1 && t.status!="completing" && !(t.id in live) && return true
+        if t.status=="completing"
+            _done(db,"SELECT id FROM claw_tasks WHERE owner_task=? AND background=0 AND status!='terminal' LIMIT 1",(t.id,))===nothing && return true
+        elseif t.status=="waiting"
+            waits=_drows(db,"SELECT t.status,t.cancel,t.outcome,w.policy FROM claw_task_waits w JOIN claw_tasks t ON t.id=w.awaited WHERE w.waiter=?",(t.id,))
+            all(w->w.status=="terminal",waits) && return true
+            failed=any(w->w.policy=="failFast" && w.status=="terminal" && get(JSON.parse(something(_dnull(w.outcome),"{}")),"status","")!="completed",waits)
+            failed && any(w->w.status!="terminal" && w.cancel==0,waits) && return true
+        end
+    end
+    false
+end
+
 function _scheduler_loop(h)
     while h.state===:open
         try
             _start_runs!(h)
             time()>=h.supervision_due && _supervise_durable!(h)
-            needs_join=_dread(db->_done(db,"SELECT id FROM claw_tasks WHERE status IN ('waiting','completing') OR (cancel=1 AND status!='terminal') LIMIT 1"),h)
-            needs_dispatch=_dread(db->_done(db,"SELECT id FROM claw_events WHERE status='dispatched' LIMIT 1"),h)
-            if needs_join!==nothing || needs_dispatch!==nothing
+            needs_join=_dread(db->_ownership_ready(db,h),h)
+            needs_dispatch=_dread(db->_done(db,"""SELECT e.id FROM claw_events e WHERE e.status='dispatched' AND NOT EXISTS
+                (SELECT 1 FROM claw_dispatch_members m JOIN claw_event_dispatches d ON d.id=m.dispatch_id
+                 LEFT JOIN claw_submissions s ON s.id=d.submission_id WHERE m.event_id=e.id AND d.result IS NULL
+                 AND (s.state IS NULL OR s.state NOT IN ('answered','unanswered','withdrawn'))) LIMIT 1"""),h)
+            if needs_join || needs_dispatch!==nothing
                 _transition!(h;point=:joins) do db,seq
                     _reconcile_ownership!(db,h,seq)
                     _aggregate_dispatches!(db,h)
                 end
             end
-            tasks=_dread(db->_drows(db,"SELECT * FROM claw_tasks WHERE status='pending' AND cancel=0 AND due_at<=? ORDER BY created_seq,rowid",(h.clock(),)),h)
+            tasks=_dread(db->_drows(db,"SELECT * FROM claw_tasks WHERE status='pending' AND cancel=0 ORDER BY created_seq,rowid"),h)
             for t in tasks
                 h.state===:open || break
+                _is_due!(h,t.id,t.due_at) || continue
                 resolved,reason=_eligibility(h,t)
                 if reason!==nothing
                     if _dnull(t.blocked)!=reason

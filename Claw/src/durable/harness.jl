@@ -17,7 +17,8 @@ function _make_harness(assistant, writer, readers, history, epoch, owner, owns;
     end
     h = Harness(assistant,writer,readers,history,epoch,owner,owns,Dict{String,Agentif.Agent}(),
         Dict{Tuple{String,String},ToolSpec}(),Dict{String,LLMTools.LocalExecutionEnv}(),Dict{String,DeliveryAdapter}(),
-        limits,compaction,stream_fn,clock,fault,:open,ReentrantLock(),Dict{String,Any}(),Any[],nothing,Threads.Event(),nothing,0.0)
+        limits,compaction,stream_fn,clock,fault,:open,ReentrantLock(),Dict{String,Any}(),Any[],nothing,Threads.Event(),nothing,0.0,
+        Dict{String,Tuple{Float64,Float64}}())
     _recover_harness!(h)
     return h
 end

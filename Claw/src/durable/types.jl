@@ -100,6 +100,7 @@ mutable struct Harness
     wake::Threads.Event
     indexer::Union{Nothing,Task}
     supervision_due::Float64
+    due_timers::Dict{String,Tuple{Float64,Float64}}
 end
 
 struct InvocationContext
@@ -142,7 +143,7 @@ _digest(x) = bytes2hex(SHA.sha256(_canonical(x)))
 function _profile_config(value)
     if value isa AbstractDict
         return Dict(String(k)=>_profile_config(v) for (k,v) in value if
-            String(k) in ("maxTokens","max_tokens","max_completion_tokens","contextWindow","reserve_tokens") || !_is_sensitive_integration_key(k))
+            String(k) in ("maxTokens","max_tokens","max_completion_tokens","maxOutputTokens","max_output_tokens","contextWindow","reserve_tokens") || !_is_sensitive_integration_key(k))
     elseif value isa AbstractVector
         return _profile_config.(value)
     end
