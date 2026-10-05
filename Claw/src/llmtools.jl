@@ -194,7 +194,7 @@ function get_tools(es::LLMToolsEventSource)
     append!(tools, _create_pty_tools(es))
     append!(tools, _create_worker_tools(es))
     cfg = es.config
-    cfg.enable_coding && append!(tools, LLMTools.coding_tools(cfg.base_dir))
+    cfg.enable_coding && append!(tools, _register_coding_adapters!(LLMTools.coding_tools(cfg.base_dir)))
     cfg.enable_web && append!(tools, LLMTools.web_tools())
     return tools
 end
@@ -683,7 +683,7 @@ Arguments:
         end,
     )
 
-    return Agentif.AgentTool[start_tool, message_tool, list_tool, kill_tool]
+    return _register_subagent_adapters!(Agentif.AgentTool[start_tool, message_tool, list_tool, kill_tool])
 end
 
 # ─── PTY tools ───
@@ -961,7 +961,7 @@ Arguments:
         end,
     )
 
-    return Agentif.AgentTool[start_tool, write_tool, list_tool, kill_tool]
+    return _register_resource_adapters!(Agentif.AgentTool[start_tool, write_tool, list_tool, kill_tool],"pty")
 end
 
 # ─── Worker tools ───
@@ -1199,5 +1199,5 @@ Arguments:
         end,
     )
 
-    return Agentif.AgentTool[start_tool, eval_tool, list_tool, kill_tool]
+    return _register_resource_adapters!(Agentif.AgentTool[start_tool, eval_tool, list_tool, kill_tool],"worker")
 end

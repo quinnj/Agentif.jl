@@ -334,7 +334,7 @@ and crashed events wait out their leases instead.
 """
 function _acquire_owner_lock(db_path::String)
     (_is_private_memory_path(db_path) || Sys.iswindows()) && return nothing
-    path = (isfile(db_path) ? realpath(db_path) : abspath(db_path)) * ".lock"
+    path = (isfile(db_path) ? realpath(db_path) : joinpath(realpath(dirname(abspath(db_path))), basename(db_path))) * ".lock"
     io = open(path, "w")
     if ccall(:flock, Cint, (Cint, Cint), fd(io), LOCK_EX | LOCK_NB) != 0
         close(io)
@@ -343,7 +343,7 @@ function _acquire_owner_lock(db_path::String)
     return io
 end
 
-const CLAW_SCHEMA_VERSION = 5
+const CLAW_SCHEMA_VERSION = 10
 
 function _is_sensitive_integration_key(key)
     normalized = replace(lowercase(String(key)), r"[^a-z0-9]" => "")
@@ -495,6 +495,7 @@ on one written by an older Claw.
 """
 function _migrate_claw_schema!(db::SQLite.DB)
     current = _get_user_version(db)
+    current <= CLAW_SCHEMA_VERSION || error("Claw: future schema $current; writer supports $CLAW_SCHEMA_VERSION")
     if current == 0
         current = 1
         _set_user_version!(db, current)
@@ -503,8 +504,15 @@ function _migrate_claw_schema!(db::SQLite.DB)
         next = current + 1
         migration = get(CLAW_MIGRATIONS, next, nothing)
         migration === nothing && error("Claw: missing schema migration for version $next")
-        migration(db)
-        _set_user_version!(db, next)
+        SQLite.execute(db, "BEGIN IMMEDIATE")
+        try
+            migration(db)
+            _set_user_version!(db, next)
+            SQLite.execute(db, "COMMIT")
+        catch
+            SQLite.intransaction(db) && SQLite.execute(db, "ROLLBACK")
+            rethrow()
+        end
         current = next
         @debug "Claw: applied schema migration" version = next
     end

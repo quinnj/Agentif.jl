@@ -231,6 +231,8 @@ include("watcher.jl")
 
 # SQLite ownership discipline + pipeline runtime structures (§1.7).
 include("dbwriter.jl")
+include("durable/types.jl")
+include("durable/storage.jl")
 
 struct AgentAssistant
     config::AgentConfig
@@ -273,6 +275,10 @@ struct AgentAssistant
     _health_loop_started::Base.RefValue{Bool}
     # Held by `init!` for the runtime's lifetime; see `_acquire_owner_lock`.
     _owner_lock::Base.RefValue{Union{Nothing, IOStream}}
+    _owner_epoch::Int
+    _harness::Base.RefValue{Any}
+    _legacy_tools_running::Threads.Atomic{Int}
+    _durable_parked::Base.RefValue{Bool}
 end
 
 function _new_agent_assistant(;
@@ -310,6 +316,10 @@ function _new_agent_assistant(;
         _integrations_lock = ReentrantLock(),
         _health_loop_started = Ref(false),
         _owner_lock = Ref{Union{Nothing, IOStream}}(nothing),
+        _owner_epoch = 0,
+        _harness = Ref{Any}(nothing),
+        _legacy_tools_running = Threads.Atomic{Int}(0),
+        _durable_parked = Ref(false),
     )
     return AgentAssistant(
         config,
@@ -346,6 +356,10 @@ function _new_agent_assistant(;
         _integrations_lock,
         _health_loop_started,
         _owner_lock,
+        _owner_epoch,
+        _harness,
+        _legacy_tools_running,
+        _durable_parked,
     )
 end
 
@@ -368,6 +382,8 @@ _tool_snapshot(assistant::AgentAssistant) =
 # ─── SQLite schema ───
 
 function _init_claw_schema!(db::SQLite.DB)
+    _check_future_writer!(db)
+    _validate_shared_database!(db)
     # Pragmas go through `SQLite.execute` (step + reset). `DBInterface.execute`
     # hands back a lazy cursor, and an unconsumed `PRAGMA journal_mode=WAL` cursor
     # keeps holding its exclusive lock, which blocks every other connection to the
@@ -1460,6 +1476,14 @@ function evaluate(
         tools::Union{Nothing, Vector{Agentif.AgentTool}} = nothing,
         kw...,
     )
+    assistant._harness[] === nothing || return _durable_evaluate(assistant,input;channel,tools,kw...)
+    _guard_legacy_runtime!(assistant)
+    if assistant._durable_parked[] && channel!==nothing
+        blocked=execute_write(assistant._writer) do db
+            _done(db,"SELECT t.id FROM claw_tasks t JOIN claw_conversations c ON c.id=t.conversation_id WHERE c.branch_id=? AND t.status!='terminal' LIMIT 1",(String(Agentif.branch_id(channel)),))
+        end
+        blocked===nothing || error("this branch has parked durable work; resume or settle it before legacy evaluation")
+    end
     cfg = assistant.config
     model = Agentif.getModel(cfg.provider, cfg.model_id)
     model === nothing && error("Unknown model: provider=$(cfg.provider) model_id=$(cfg.model_id)")
@@ -1475,7 +1499,12 @@ function evaluate(
     # LLM provider prefix-based prompt caching across turns.
     ctx = build_context_prefix(cfg)
     prefixed_input = input isa String ? string(ctx, "\n\n", input) : input
-    return Agentif.evaluate(observer, agent, prefixed_input;
+    tracking = event -> begin
+        event isa Agentif.ToolExecutionStartEvent && Threads.atomic_add!(assistant._legacy_tools_running,1)
+        event isa Agentif.ToolExecutionEndEvent && Threads.atomic_sub!(assistant._legacy_tools_running,1)
+        observer(event)
+    end
+    return Agentif.evaluate(tracking, agent, prefixed_input;
         session_store = assistant.session_store,
         channel = channel,
         compaction_config = Agentif.CompactionConfig(),
@@ -1488,6 +1517,7 @@ end
 
 function scrub_post!(assistant::AgentAssistant, post_id::String)
     # 1. Mark session entries as deleted (preserves AgentState for prompt caching)
+    assistant._harness[] === nothing || scrub_durable_post!(assistant._harness[],post_id)
     Agentif.scrub_post!(assistant.session_store, post_id)
     # 2. Hard-delete agent data matching this post_id
     lock(AGENT_DATA_WRITE_LOCK) do
@@ -1652,11 +1682,21 @@ function _run_event_handler!(
     end
     input = make_prompt(handler.prompt, ev)
     observed_error = Ref{Union{Nothing, Exception}}(nothing)
-    observer = event -> (event isa Agentif.AgentErrorEvent && (observed_error[] = event.error); nothing)
-    state = if abort === nothing
+    tools_started=Ref(false)
+    observer=event -> begin
+        event isa Agentif.AgentErrorEvent && (observed_error[]=event.error)
+        event isa Agentif.ToolExecutionStartEvent && (tools_started[]=true)
+        nothing
+    end
+    state = try
+    if abort === nothing
         evaluate(assistant, input; channel = ch, level = level, tools = tools, observer, eval_kw...)
     else
         evaluate(assistant, input; channel = ch, level = level, tools = tools, abort = abort, observer, eval_kw...)
+    end
+    catch err
+        pipeline_managed && tools_started[] && throw(SupervisedEvaluationFailure(:unsafe_to_retry,"failed","legacy tools started before evaluation failure"))
+        rethrow()
     end
     @debug "Claw handler evaluate end" handler_id = handler.id event_name = get_name(ev)
     # A provider failure can end the evaluation normally, as an AgentErrorEvent
@@ -1665,6 +1705,7 @@ function _run_event_handler!(
     # provider error (an Anthropic refusal) is the model's answer; retrying
     # would only ask the same question again.
     if pipeline_managed && state.most_recent_stop_reason === :error && observed_error[] !== nothing
+        tools_started[] && throw(SupervisedEvaluationFailure(:unsafe_to_retry,"failed","legacy tools started before provider failure"))
         throw(observed_error[])
     end
     return nothing
@@ -1677,6 +1718,21 @@ include("pipeline.jl")
 # Integration catalog, factory registry and the persisted enabled-set (Tier 1
 # integration enablement).
 include("integrations.jl")
+include("durable/harness.jl")
+include("durable/submissions.jl")
+include("durable/observations.jl")
+include("durable/ownership.jl")
+include("durable/children.jl")
+include("durable/generation.jl")
+include("durable/purpose.jl")
+include("durable/supervision.jl")
+include("durable/tools.jl")
+include("durable/compaction.jl")
+include("durable/delivery.jl")
+include("durable/scheduler.jl")
+include("durable/bridge.jl")
+include("durable/modes.jl")
+include("durable/migrations.jl")
 
 # ─── Constructor ───
 
@@ -1695,17 +1751,25 @@ function AgentAssistant(db_path::String="";
     level::Union{Nothing, LogLevel, Int, Symbol, AbstractString}=nothing,
     watcher::Union{Nothing, WatcherConfig}=nothing,
     pipeline::PipelineConfig=PipelineConfig(),
+    _held_owner_lock = nothing,
+    search_options::NamedTuple = (;),
+    backup_path::Union{Nothing,String} = nothing,
 )
     watcher !== nothing && validate_watcher_config(watcher)
     db_path = _resolve_db_path(db_path, name)
+    owner_lock = _held_owner_lock === nothing ? _acquire_owner_lock(db_path) : _held_owner_lock
     db = SQLite.DB(db_path)
-    _init_claw_schema!(db)
+    writer = nothing
+    session_db = db
+    try
+    _prepare_database!(db;backup_path)
+    epoch = _advance_owner!(db)
     writer = SQLiteWriter(db_path, db)
     # LocalSearch performs a read/embedding/write sequence for each session
     # entry. Bind its mutation-side store to the writer connection so another
     # connection cannot commit between the read snapshot and the write upgrade.
     write_search_store = execute_write(writer) do writer_db
-        LocalSearch.Store(writer_db)
+        LocalSearch.Store(writer_db;search_options...)
     end
 
     # Reads keep a separate connection. A private in-memory database cannot be
@@ -1719,7 +1783,7 @@ function AgentAssistant(db_path::String="";
             session_db = db
         end
     end
-    search_store = session_db === writer.db ? write_search_store : LocalSearch.Store(session_db)
+    search_store = session_db === writer.db ? write_search_store : LocalSearch.Store(session_db;search_options...)
     session_store = Agentif.SQLiteSessionStore(
         session_db,
         search_store;
@@ -1727,6 +1791,7 @@ function AgentAssistant(db_path::String="";
         execute_write = f -> execute_write(f, writer),
     )
     tempus_store = Tempus.SQLiteStore(db)
+    _validate_shared_database!(db)
     scheduler = Tempus.Scheduler(tempus_store)
     config = AgentConfig(; name, provider, model_id, apikey, timezone, base_dir, enable_web, enable_coding)
     log_level = Agentif.resolve_log_level(level)
@@ -1742,7 +1807,16 @@ function AgentAssistant(db_path::String="";
         _writer = writer,
         _readers = ReaderPool(db_path, db),
         _sem = Base.Semaphore(max(1, pipeline.max_concurrent_evals)),
+        _owner_lock = Ref{Union{Nothing, IOStream}}(owner_lock),
+        _owner_epoch = epoch,
     )
+    catch
+        writer === nothing || close_writer!(writer)
+        session_db === db || close(session_db)
+        close(db)
+        owner_lock === nothing || close(owner_lock)
+        rethrow()
+    end
 end
 
 # ─── Lifecycle ───
@@ -1752,6 +1826,9 @@ function init!(
         event_sources = nothing,
         level::Union{Nothing, LogLevel, Int, Symbol, AbstractString} = nothing,
         install_signal_handlers::Bool = !isinteractive(),
+        durable::Bool = false,
+        park_durable::Bool = false,
+        harness_options = (;),
         kwargs...,
     )
     sources = event_sources === nothing ?
@@ -1760,12 +1837,21 @@ function init!(
     db_path = _resolve_db_path(db_path, get(kwargs, :name, nothing))
     owner_lock = _acquire_owner_lock(db_path)
     assistant = try
-        AgentAssistant(db_path; level, kwargs...)
+        AgentAssistant(db_path; level, _held_owner_lock = owner_lock, kwargs...)
     catch
         owner_lock === nothing || close(owner_lock)
         rethrow()
     end
     assistant._owner_lock[] = owner_lock
+    if !durable
+        assistant._durable_parked[]=park_durable
+        try
+            _guard_legacy_runtime!(assistant)
+        catch
+            shutdown!(assistant)
+            rethrow()
+        end
+    end
     CURRENT_ASSISTANT[] = assistant
     # Crash recovery: evals left 'running' by a previous process can never
     # complete; flip them to failed/process_crash for post-crash forensics.
@@ -1775,7 +1861,7 @@ function init!(
             (time(),))
         return nothing
     end
-    owner_lock === nothing || _reclaim_crashed_events!(assistant)
+    owner_lock === nothing || _reclaim_crashed_events!(assistant;durable_upgrade=durable)
     # Purge ephemeral tables (re-populated from EventSources)
     _exec!(assistant.db, "DELETE FROM claw_event_types")
     # Re-seed event types for persisted Tempus jobs: they are only inserted at
@@ -1804,6 +1890,10 @@ function init!(
     # once per boot instead of relying on anyone remembering it. Runs after tools and
     # handlers are registered and before any event can be dispatched.
     _log_trust_exposure(assistant, sources)
+    if durable
+        h = open_harness(assistant;harness_options...)
+        _register_native_delivery!(h,assistant)
+    end
     Tempus.run!(assistant.scheduler)
     assistant._scheduler_started[] = true
     start_event_loop!(assistant; level = assistant.log_level)
@@ -1815,6 +1905,11 @@ function init!(
     _adopt_explicit_integrations!(assistant, regs)
     start_sources!(assistant, sources)
     _reconcile_integrations!(assistant)
+    if durable
+        h = assistant._harness[]
+        _register_default_profile!(h,assistant)
+        resume!(h)
+    end
     install_signal_handlers && install_shutdown_handler!(assistant)
     return assistant
 end
