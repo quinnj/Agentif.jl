@@ -24,6 +24,8 @@ isdefined(@__MODULE__, :attached_fixture) || include("durable_integration_fixtur
                 id=Claw.submit_event!(a,DurableEvent(channel,"source"))
                 Claw._process_event!(a,id)
                 integration_until(()->length(channel.responses)==1)
+                # The adapter emits before the outbox acknowledgement commits.
+                integration_until(()->Claw._dread(db->Claw._scalar(db,"SELECT COUNT(*) FROM claw_evals WHERE fallback_sent=1"),h)==1)
                 @test calls[]==1
                 @test failed_watcher ? occursin("problem",only(channel.responses)) : only(channel.responses)=="I could not finish this event."
                 journal=Claw._dread(db->Claw._done(db,"SELECT * FROM claw_evals ORDER BY id DESC LIMIT 1"),h)
