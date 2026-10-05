@@ -798,6 +798,13 @@ function openai_completions_event_callback(
                 end
             end
         end
+        if choice.finish_reason == "error"
+            # A provider failure reported mid-stream (e.g. OpenRouter): surface it
+            # like any other provider error, with the message it carries.
+            err = get(() -> nothing, JSON.parse(data), "error")
+            msg = err isa AbstractDict ? get(() -> nothing, err, "message") : nothing
+            f(AgentErrorEvent(ErrorException(msg isa AbstractString ? msg : "provider stream ended with finish_reason \"error\"")))
+        end
         return choice.finish_reason !== nothing && (latest_finish[] = choice.finish_reason)
     end
 end

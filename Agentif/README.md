@@ -64,7 +64,9 @@ With a `session_store` and a `channel`, `evaluate` loads the channel's branch of
 - a tool call that was running gets an error result saying it was interrupted and may or may not have taken effect, and it is never re-run automatically;
 - a turn that ended in a provider error or an abort is not saved as an answer.
 
-Pass `input_key` to make running the same input again safe. If the branch already holds an evaluation with that key, `evaluate` continues it from where it stopped instead of appending the input again, or returns without calling the model when it was already answered.
+A refused turn (stop reason `:refusal`) is not saved at all, neither the input it refused nor the refusal: Anthropic asks callers to remove a refused turn before continuing, or later requests are refused too.
+
+Pass `input_key` to make running the same input again safe. If the branch already holds an evaluation with that key, `evaluate` continues it from where it stopped instead of appending the input again, or returns without calling the model when it was already answered. The key stands for that input: a different input under a key the branch already holds is not run.
 
 ```julia
 store = InMemorySessionStore()   # or SQLiteSessionStore(path)

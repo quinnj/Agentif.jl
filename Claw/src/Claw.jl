@@ -1699,14 +1699,11 @@ function _run_event_handler!(
         rethrow()
     end
     @debug "Claw handler evaluate end" handler_id = handler.id event_name = get_name(ev)
-    # A provider failure can end the evaluation normally, as an AgentErrorEvent
-    # plus a stop reason of :error. The pipeline must still see it as a failure,
-    # or the event is marked done and never retried. An :error turn with no
-    # provider error (an Anthropic refusal) is the model's answer; retrying
-    # would only ask the same question again.
-    if pipeline_managed && state.most_recent_stop_reason === :error && observed_error[] !== nothing
+    # Every returned :error or emitted provider error belongs to the retry
+    # policy. Refusals have their own reason. Legacy effects forbid whole-run retry.
+    if pipeline_managed && (state.most_recent_stop_reason===:error || observed_error[]!==nothing)
         tools_started[] && throw(SupervisedEvaluationFailure(:unsafe_to_retry,"failed","legacy tools started before provider failure"))
-        throw(observed_error[])
+        throw(something(observed_error[],ErrorException("evaluation returned :error without an error event")))
     end
     return nothing
 end
@@ -1843,74 +1840,83 @@ function init!(
         rethrow()
     end
     assistant._owner_lock[] = owner_lock
-    if !durable
-        assistant._durable_parked[]=park_durable
-        try
-            _guard_legacy_runtime!(assistant)
-        catch
-            shutdown!(assistant)
-            rethrow()
+    try
+        if !durable
+            assistant._durable_parked[]=park_durable
+            try
+                _guard_legacy_runtime!(assistant)
+            catch
+                shutdown!(assistant)
+                rethrow()
+            end
         end
+        CURRENT_ASSISTANT[] = assistant
+        # Crash recovery: evals left 'running' by a previous process can never
+        # complete; flip them to failed/process_crash for post-crash forensics.
+        _with_busy_retry() do
+            _exec!(assistant.db,
+                "UPDATE claw_evals SET status = 'failed', failure_class = 'process_crash', finished_at = ? WHERE status = 'running'",
+                (time(),))
+            return nothing
+        end
+        owner_lock === nothing || _reclaim_crashed_events!(assistant;durable_upgrade=durable)
+        # Purge ephemeral tables (re-populated from EventSources)
+        _exec!(assistant.db, "DELETE FROM claw_event_types")
+        # Re-seed event types for persisted Tempus jobs: they are only inserted at
+        # add_job time, so the purge above would otherwise orphan them (breaking
+        # list_event_types and add_event_handler validation for those types).
+        for j in Tempus.getJobs(assistant.scheduler.store)
+            et_name = "tempus_job:$(j.name)"
+            _exec!(assistant.db,
+                "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
+                (et_name, "Scheduled job: $(j.name)"))
+        end
+        # Auto-register LLMToolsEventSource if not already provided
+        if !any(es -> es isa LLMToolsEventSource, sources)
+            llm_es = LLMToolsEventSource(assistant.config)
+            push!(sources, llm_es)
+        end
+        regs = Tuple{EventSource, NamedTuple}[]
+        for es in sources
+            push!(regs, (es, _register_event_source_tracked!(assistant, es)))
+        end
+        append!(assistant.tools, MANAGEMENT_TOOLS)
+        append!(assistant.tools, TEMPUS_TOOLS)
+        append!(assistant.tools, DB_TOOLS)
+        append!(assistant.tools, INTEGRATION_TOOLS)
+        # §2.2: the permissive default is the one that persists, so state the exposure
+        # once per boot instead of relying on anyone remembering it. Runs after tools and
+        # handlers are registered and before any event can be dispatched.
+        _log_trust_exposure(assistant, sources)
+        if durable
+            h = open_harness(assistant;harness_options...)
+            _register_native_delivery!(h,assistant)
+        end
+        Tempus.run!(assistant.scheduler)
+        assistant._scheduler_started[] = true
+        start_event_loop!(assistant; level = assistant.log_level)
+        # Crash/stuck-worker recovery before sources start producing new work.
+        _recover_events!(assistant)
+        # Name runner-passed sources under their catalog integrations, then bring up
+        # whatever the persisted enabled-set adds on top of them. Adopt before start
+        # so channels created immediately by a source task are attributed to it.
+        _adopt_explicit_integrations!(assistant, regs)
+        start_sources!(assistant, sources)
+        _reconcile_integrations!(assistant)
+        if durable
+            h = assistant._harness[]
+            _register_default_profile!(h,assistant)
+            resume!(h)
+        end
+        install_signal_handlers && install_shutdown_handler!(assistant)
+    catch
+        try
+            shutdown!(assistant; timeout_s=5)
+        catch err
+            @warn "Claw: cleanup after failed init! failed" exception=(err,catch_backtrace())
+        end
+        rethrow()
     end
-    CURRENT_ASSISTANT[] = assistant
-    # Crash recovery: evals left 'running' by a previous process can never
-    # complete; flip them to failed/process_crash for post-crash forensics.
-    _with_busy_retry() do
-        _exec!(assistant.db,
-            "UPDATE claw_evals SET status = 'failed', failure_class = 'process_crash', finished_at = ? WHERE status = 'running'",
-            (time(),))
-        return nothing
-    end
-    owner_lock === nothing || _reclaim_crashed_events!(assistant;durable_upgrade=durable)
-    # Purge ephemeral tables (re-populated from EventSources)
-    _exec!(assistant.db, "DELETE FROM claw_event_types")
-    # Re-seed event types for persisted Tempus jobs: they are only inserted at
-    # add_job time, so the purge above would otherwise orphan them (breaking
-    # list_event_types and add_event_handler validation for those types).
-    for j in Tempus.getJobs(assistant.scheduler.store)
-        et_name = "tempus_job:$(j.name)"
-        _exec!(assistant.db,
-            "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
-            (et_name, "Scheduled job: $(j.name)"))
-    end
-    # Auto-register LLMToolsEventSource if not already provided
-    if !any(es -> es isa LLMToolsEventSource, sources)
-        llm_es = LLMToolsEventSource(assistant.config)
-        push!(sources, llm_es)
-    end
-    regs = Tuple{EventSource, NamedTuple}[]
-    for es in sources
-        push!(regs, (es, _register_event_source_tracked!(assistant, es)))
-    end
-    append!(assistant.tools, MANAGEMENT_TOOLS)
-    append!(assistant.tools, TEMPUS_TOOLS)
-    append!(assistant.tools, DB_TOOLS)
-    append!(assistant.tools, INTEGRATION_TOOLS)
-    # §2.2: the permissive default is the one that persists, so state the exposure
-    # once per boot instead of relying on anyone remembering it. Runs after tools and
-    # handlers are registered and before any event can be dispatched.
-    _log_trust_exposure(assistant, sources)
-    if durable
-        h = open_harness(assistant;harness_options...)
-        _register_native_delivery!(h,assistant)
-    end
-    Tempus.run!(assistant.scheduler)
-    assistant._scheduler_started[] = true
-    start_event_loop!(assistant; level = assistant.log_level)
-    # Crash/stuck-worker recovery before sources start producing new work.
-    _recover_events!(assistant)
-    # Name runner-passed sources under their catalog integrations, then bring up
-    # whatever the persisted enabled-set adds on top of them. Adopt before start
-    # so channels created immediately by a source task are attributed to it.
-    _adopt_explicit_integrations!(assistant, regs)
-    start_sources!(assistant, sources)
-    _reconcile_integrations!(assistant)
-    if durable
-        h = assistant._harness[]
-        _register_default_profile!(h,assistant)
-        resume!(h)
-    end
-    install_signal_handlers && install_shutdown_handler!(assistant)
     return assistant
 end
 

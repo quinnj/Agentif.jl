@@ -1,6 +1,6 @@
 function _durable_migration_7!(db)
     for (column, definition) in (("claim_token", "TEXT"), ("claim_revision", "INTEGER NOT NULL DEFAULT 0"),
-            ("owner_epoch", "INTEGER NOT NULL DEFAULT 0"))
+            ("owner_epoch", "INTEGER NOT NULL DEFAULT 0"),("durable","INTEGER NOT NULL DEFAULT 0"))
         _column_exists(db, "claw_events", column) || _exec!(db, "ALTER TABLE claw_events ADD COLUMN $column $definition")
     end
     _exec!(db, """CREATE TABLE IF NOT EXISTS claw_runtime_meta
@@ -15,8 +15,8 @@ function _durable_migration_8!(db)
         payload TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('pending','running','dispatched','done','failed','dead')),
         attempts INTEGER NOT NULL DEFAULT 0,lane TEXT NOT NULL,created_at REAL NOT NULL,
         next_attempt_at REAL NOT NULL DEFAULT 0,lease_expires_at REAL,last_error TEXT,
-        claim_token TEXT,claim_revision INTEGER NOT NULL DEFAULT 0,owner_epoch INTEGER NOT NULL DEFAULT 0,batch INTEGER)""")
-    _exec!(db, "INSERT INTO claw_events_new(id,dedup_key,source,name,payload,status,attempts,lane,created_at,next_attempt_at,lease_expires_at,last_error,claim_token,claim_revision,owner_epoch,batch) SELECT id,dedup_key,source,name,payload,status,attempts,lane,created_at,next_attempt_at,lease_expires_at,last_error,claim_token,claim_revision,owner_epoch,batch FROM claw_events")
+        claim_token TEXT,claim_revision INTEGER NOT NULL DEFAULT 0,owner_epoch INTEGER NOT NULL DEFAULT 0,batch INTEGER,durable INTEGER NOT NULL DEFAULT 0)""")
+    _exec!(db, "INSERT INTO claw_events_new(id,dedup_key,source,name,payload,status,attempts,lane,created_at,next_attempt_at,lease_expires_at,last_error,claim_token,claim_revision,owner_epoch,batch,durable) SELECT id,dedup_key,source,name,payload,status,attempts,lane,created_at,next_attempt_at,lease_expires_at,last_error,claim_token,claim_revision,owner_epoch,batch,durable FROM claw_events")
     _exec!(db, "DROP TABLE claw_events")
     _exec!(db, "ALTER TABLE claw_events_new RENAME TO claw_events")
     _exec!(db, "CREATE INDEX idx_claw_events_claim ON claw_events(status,next_attempt_at)")
@@ -170,11 +170,4 @@ function _entry!(db, h, seq, c, messages; run = nothing, task = nothing, audit =
         (entry.id,run,task,stop,audit === nothing ? nothing : JSON.json(audit),isempty(messages) ? 0 : 1,seq))
     _exec!(db, "INSERT INTO claw_index_jobs(entry_id,state) VALUES(?,'pending')", (entry.id,))
     return entry.id
-end
-
-if !haskey(CLAW_MIGRATIONS,6)
-    CLAW_MIGRATIONS[6]=db->begin
-        _column_exists(db,"claw_events","batch") || _exec!(db,"ALTER TABLE claw_events ADD COLUMN batch INTEGER")
-        _exec!(db,"CREATE INDEX IF NOT EXISTS idx_claw_events_batch ON claw_events(batch)")
-    end
 end

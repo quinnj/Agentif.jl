@@ -417,7 +417,7 @@ tool_results(state) = [m for m in state.messages if m isa ToolResultMessage]
     @test Agentif.openai_completions_stop_reason("stop", calls) == :tool_calls
     @test Agentif.openai_completions_stop_reason("tool_calls", none) == :tool_calls
     @test Agentif.anthropic_stop_reason("max_tokens", calls) == :length
-    @test Agentif.anthropic_stop_reason("refusal", calls) == :error
+    @test Agentif.anthropic_stop_reason("refusal", calls) == :refusal
     @test Agentif.anthropic_stop_reason("error", calls) == :error
     @test Agentif.anthropic_stop_reason("end_turn", calls) == :tool_calls
     # A paused turn still owes the results of the client calls it made.
@@ -426,6 +426,10 @@ tool_results(state) = [m for m in state.messages if m isa ToolResultMessage]
     @test Agentif.google_stop_reason("MAX_TOKENS", calls) == :length
     @test Agentif.google_stop_reason("SAFETY", calls) == :safety
     @test Agentif.google_stop_reason("STOP", calls) == :tool_calls
+    @test Agentif.google_stop_reason(nothing, calls) == :tool_calls
+    for reason in ("OTHER", "SPII", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
+        @test Agentif.google_stop_reason(reason, calls) == :other
+    end
 end
 
 @testset "tool_call_middleware runs tools only after a normal turn" begin
@@ -448,6 +452,12 @@ end
     @test isempty(tool_results(state))
     @test isempty(state.pending_tool_calls)
     @test state.most_recent_stop_reason == :error
+
+    # So does a refused one.
+    state = tool_call_middleware(scripted_turn_handler(calls, :refusal))(identity, agent, AgentState(), "go", Abort())
+    @test runs[] == 0
+    @test isempty(tool_results(state))
+    @test state.most_recent_stop_reason == :refusal
 
     state = tool_call_middleware(scripted_turn_handler(calls, :tool_calls))(identity, agent, AgentState(), "go", Abort())
     @test runs[] == 1
@@ -478,10 +488,15 @@ function completions_tool_call_sse(name::String, finish_reason::String)
     )
 end
 
-@testset "completions stream: a provider error ends the turn as :error" begin
-    server = HTTP.serve!("127.0.0.1", 0) do req
-        return HTTP.Response(500, ["Content-Type" => "application/json"], JSON.json(Dict("error" => Dict("message" => "overloaded"))))
-    end
+@testset "completions stream: a provider error ends the turn as :error ($label)" for (label, response) in [
+        ("HTTP 500", () -> HTTP.Response(500, ["Content-Type" => "application/json"],
+            JSON.json(Dict("error" => Dict("message" => "overloaded"))))),
+        # Some providers (e.g. OpenRouter) report a failure mid-stream instead.
+        ("mid-stream", () -> HTTP.Response(200, ["Content-Type" => "text/event-stream"], completions_sse(
+            (; choices = [(; index = 0, delta = (; content = "Partial"), finish_reason = nothing)]),
+            (; error = (; message = "overloaded"), choices = [(; index = 0, delta = (; content = ""), finish_reason = "error")])))),
+    ]
+    server = HTTP.serve!(req -> response(), "127.0.0.1", 0)
     try
         model = Model(; id = "m", name = "m", api = "openai-completions", provider = "test",
             baseUrl = "http://127.0.0.1:$(test_server_port(server))", reasoning = false, input = ["text"],
@@ -2184,6 +2199,202 @@ end
     end
 end
 
+# Serves a different summary text for each compaction call, in order.
+function counting_summary_server(texts::Vector{String})
+    hits = Ref(0)
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        hits[] += 1
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], summary_sse_body(texts[min(hits[], end)]))
+    end
+    return server, test_server_port(server), hits
+end
+
+has_summary(state, text) = any(m -> m isa CompactionSummaryMessage && m.summary == text, state.messages)
+mentions(state, text) = any(m -> occursin(text, message_text(m)), state.messages)
+
+@testset "scrubbing a run keeps a summary of older history only ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    # m3 compacts before its first call, so its summary covers m1/m2 only.
+    server, port, hits = counting_summary_server(["OLDER-SUMMARY"])
+    try
+        store = make_store()
+        agent = Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 300), apikey = "k")
+        config = CompactionConfig(; enabled = true, reserve_tokens = 100, keep_recent_tokens = 100)
+        handler = scripted_handler()
+        run_eval(id, input) = evaluate(agent, input; session_store = store, base_handler = handler,
+            compaction_config = config, channel = SessionTestChannel("chan:scrub-older", nothing, id))
+        run_eval("m1", "A"^400); run_eval("m2", "B"^400); run_eval("m3", "private m3 question")
+        @test hits[] == 1
+        scrub_post!(store, "m3")
+        loaded = load_branch(store, "chan:scrub-older")
+        @test !mentions(loaded, "private m3")
+        @test has_summary(loaded, "OLDER-SUMMARY")
+    finally
+        close(server)
+    end
+
+    # m2's tool results fill the keep budget mid-run, so its summary covers m2's
+    # own question: scrubbing m2 must remove that summary too.
+    server, port, hits = counting_summary_server(["SUMMARY-OF-SECRET"])
+    try
+        store = make_store()
+        tool = @tool "Echo text." echo_back(text::String) = "SECRET-RESULT " * "Z"^800
+        agent = Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 1000), apikey = "k", tools = [tool])
+        config = CompactionConfig(; enabled = true, reserve_tokens = 200, keep_recent_tokens = 100)
+        handler = scripted_handler(; usage_inputs = [100, 100, 900, 100], tool_turns = Set([2, 3]))
+        run_eval(id, input) = evaluate(agent, input; session_store = store, base_handler = handler,
+            compaction_config = config, channel = SessionTestChannel("chan:scrub-own", nothing, id))
+        run_eval("m1", "A"^400); run_eval("m2", "SECRET-QUESTION")
+        loaded = load_branch(store, "chan:scrub-own")
+        @test has_summary(loaded, "SUMMARY-OF-SECRET")
+        @test !any(m -> message_text(m) == "SECRET-QUESTION", loaded.messages)
+        @test !isempty(Agentif.search_sessions(store, "SECRET"))
+        scrub_post!(store, "m2")
+        @test !mentions(load_branch(store, "chan:scrub-own"), "SECRET")
+        @test isempty(Agentif.search_sessions(store, "SECRET"))
+    finally
+        close(server)
+    end
+end
+
+@testset "a second compaction over a run's kept messages is scrubbed with the run ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    # The first compaction (call 4) summarizes m1a only and keeps m2's first
+    # tool round; the second (call 5) summarizes that round, m2's question included.
+    server, port, hits = counting_summary_server(["OLDER-SUMMARY", "SUMMARY-WITH-SECRET"])
+    try
+        store = make_store()
+        outputs = Ref(0)
+        tool = @tool "Echo text." echo_back(text::String) = (outputs[] += 1; outputs[] == 1 ? "SECRET-SMALL" : "SECRET-BIG " * "Z"^880)
+        agent = Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 1000), apikey = "k", tools = [tool])
+        config = CompactionConfig(; enabled = true, reserve_tokens = 200, keep_recent_tokens = 200)
+        handler = scripted_handler(; usage_inputs = [100, 100, 900, 900, 100], tool_turns = Set([3, 4]))
+        run_eval(id, input) = evaluate(agent, input; session_store = store, base_handler = handler,
+            compaction_config = config, channel = SessionTestChannel("chan:scrub-twice", nothing, id))
+        run_eval("m1a", "A"^800); run_eval("m1b", "B"^800); run_eval("m2", "SECRET-QUESTION")
+        @test hits[] == 2
+        @test has_summary(load_branch(store, "chan:scrub-twice"), "SUMMARY-WITH-SECRET")
+        scrub_post!(store, "m2")
+        @test !mentions(load_branch(store, "chan:scrub-twice"), "SECRET")
+        @test isempty(Agentif.search_sessions(store, "SECRET"))
+    finally
+        close(server)
+    end
+end
+
+@testset "copies of kept messages are scrubbed with the post they came from ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    text_reply(text) = AssistantMessage(; provider = "test", api = "test", model = "test",
+        content = Agentif.AssistantContentBlock[Agentif.TextContent(text)])
+    # One stored entry holds two exchanges; the new run's compaction cuts inside
+    # it, so the kept exchange is copied under the new compaction.
+    function compact_inside_older_entry()
+        store = make_store()
+        append_entry!(store, SessionEntry(; id = "older-combined", run_id = "older-run", post_id = "older-post",
+            messages = AgentMessage[UserMessage("D"^400), text_reply("discarded older reply"),
+                UserMessage("K"^400), text_reply("kept older reply plugh")]))
+        set_branch_leaf!(store, "chan:copies", "older-combined")
+        server, port, hits = counting_summary_server(["OLDER-SUMMARY"])
+        try
+            handler = (f, agent, state, input, abort; kw...) ->
+                (Agentif.append_state!(state, input, text_reply("new reply"), Usage()); state.most_recent_stop_reason = :stop; state)
+            evaluate(Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 280), apikey = "k"), "new private input";
+                session_store = store, channel = SessionTestChannel("chan:copies", nothing, "new-post"), base_handler = handler,
+                compaction_config = CompactionConfig(; enabled = true, reserve_tokens = 100, keep_recent_tokens = 100))
+            @test hits[] == 1
+        finally
+            close(server)
+        end
+        @test mentions(load_branch(store, "chan:copies"), "kept older reply")
+        return store
+    end
+
+    # Scrubbing the new run keeps the older summary and the older kept exchange.
+    store = compact_inside_older_entry()
+    scrub_post!(store, "new-post")
+    loaded = load_branch(store, "chan:copies")
+    @test !mentions(loaded, "new private input")
+    @test has_summary(loaded, "OLDER-SUMMARY")
+    @test mentions(loaded, "kept older reply")
+
+    # Deleting the older post removes its copy too, from the branch and from search.
+    store = compact_inside_older_entry()
+    scrub_post!(store, "older-post")
+    loaded = load_branch(store, "chan:copies")
+    @test !mentions(loaded, "kept older reply")
+    @test isempty(Agentif.search_sessions(store, "plugh"))
+    @test mentions(loaded, "new reply")
+
+    # A cut inside the run's own first entry copies the run's own messages:
+    # scrubbing the run removes those copies and the summary of its question.
+    server, port, hits = counting_summary_server(["SUMMARY-OF-SECRET"])
+    try
+        store = make_store()
+        tool = @tool "Echo text." echo_back(text::String) = "SECRET-RESULT " * "Z"^800
+        agent = Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 1000), apikey = "k", tools = [tool])
+        handler = scripted_handler(; usage_inputs = [100, 900, 100], tool_turns = Set([2]))
+        run_eval(id, input) = evaluate(agent, input; session_store = store, base_handler = handler,
+            compaction_config = CompactionConfig(; enabled = true, reserve_tokens = 200, keep_recent_tokens = 100),
+            channel = SessionTestChannel("chan:own-copies", nothing, id))
+        run_eval("m1", "A"^400); run_eval("m2", "SECRET-QUESTION")
+        loaded = load_branch(store, "chan:own-copies")
+        @test mentions(loaded, "SECRET-RESULT") && !any(m -> message_text(m) == "SECRET-QUESTION", loaded.messages)
+        scrub_post!(store, "m2")
+        @test !mentions(load_branch(store, "chan:own-copies"), "SECRET")
+        @test isempty(Agentif.search_sessions(store, "SECRET"))
+    finally
+        close(server)
+    end
+end
+
+@testset "a refused turn leaves nothing in the session ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    refusing = Ref(false)
+    lookup = @tool "Look something up." lookup() = "lookup result"
+    agent = Agent(; prompt = "p", model = dummy_model(), apikey = "k", tools = [lookup])
+    handler = function (f, agent, state, input, abort; kw...)
+        msg = AssistantMessage(; provider = "test", api = "test", model = "test")
+        if refusing[]
+            Agentif.append_text!(msg, "I can't help with that.")
+        elseif input == "use the tool" && !any(m -> m isa ToolResultMessage, state.messages)
+            push!(msg.tool_calls, AgentToolCall(; call_id = "c1", name = "lookup", arguments = "{}"))
+        else
+            Agentif.append_text!(msg, "fine")
+        end
+        Agentif.append_state!(state, input, msg, Usage())
+        state.pending_tool_calls = Agentif.pending_tool_calls_from_message(msg)
+        state.most_recent_stop_reason = refusing[] ? :refusal : isempty(msg.tool_calls) ? :stop : :tool_calls
+        refusing[] = refusing[] || input == "use the tool"
+        return state
+    end
+    run_eval(id, input) = evaluate(agent, input; session_store = store, compaction_config = nothing,
+        channel = SessionTestChannel("chan:refused", nothing, id), base_handler = handler)
+    run_eval("m1", "hello")
+    @test run_eval("m2", "do the disallowed thing").most_recent_stop_reason == :stop
+    refusing[] = true
+    @test run_eval("m3", "do the disallowed thing again").most_recent_stop_reason == :refusal
+    @test message_signatures(load_branch(store, "chan:refused"))[end - 1:end] ==
+        [(UserMessage, "do the disallowed thing"), (AssistantMessage, "fine")]
+    # Refused after a tool round: the round is kept, the refusal is not.
+    refusing[] = false
+    @test run_eval("m4", "use the tool").most_recent_stop_reason == :refusal
+    @test message_signatures(load_branch(store, "chan:refused"))[end - 2:end] ==
+        [(UserMessage, "use the tool"), (AssistantMessage, ""), (ToolResultMessage, "lookup result")]
+end
+
+@testset "scrubbing a resumed reply reaches what was saved before the interruption ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    store = make_store()
+    lookup = @tool "Look something up." lookup() = "SECRET TOOL OUTPUT"
+    agent = Agent(; prompt = "p", model = dummy_model(), apikey = "k", tools = [lookup])
+    handler = resume_test_handler(Dict{Int, Any}(1 => ["lookup"], 2 => :crash))
+    # A proactive run: entries carry the reply's post id, which changes when the
+    # run is resumed by a new process.
+    run_eval(post) = evaluate(agent, "private job prompt"; session_store = store, compaction_config = nothing,
+        channel = ProactiveSessionTestChannel("chan:resumed-reply", post), base_handler = handler, input_key = "job-1")
+    @test_throws ErrorException run_eval("post-1")
+    run_eval("post-2")
+    @test message_signatures(load_branch(store, "chan:resumed-reply"))[end] == (AssistantMessage, "answer-3")
+    scrub_post!(store, "post-2")
+    @test isempty(load_branch(store, "chan:resumed-reply").messages)
+end
+
 @testset "skills_middleware" begin
     meta = SkillMetadata(
         "demo",
@@ -2729,7 +2940,7 @@ end
     end
 end
 
-@testset "anthropic stream maps refusal to error stop reason" begin
+@testset "anthropic stream maps refusal to its own stop reason" begin
     seen_events = Agentif.AgentEvent[]
 
     server = HTTP.serve!("127.0.0.1", 0) do req
@@ -2767,7 +2978,7 @@ end
         )
 
         result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Do the thing", Abort())
-        @test result.most_recent_stop_reason == :error
+        @test result.most_recent_stop_reason == :refusal
         @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
     finally
         close(server)

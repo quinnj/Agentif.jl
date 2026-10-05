@@ -177,14 +177,12 @@ function google_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{A
         return :content_filter
     elseif reason == "SAFETY" || reason == "BLOCKLIST" || reason == "PROHIBITED_CONTENT"
         return :safety
-    elseif !isempty(tool_calls)
-        return :tool_calls
-    elseif reason == "STOP"
-        return :stop
-    elseif reason == "OTHER"
-        return :other
+    elseif reason === nothing || reason == "STOP"
+        return isempty(tool_calls) ? :stop : :tool_calls
     end
-    return :stop
+    # OTHER, SPII, MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL, ...: the turn
+    # ended abnormally, so its calls must not run either.
+    return :other
 end
 
 const google_generative_stop_reason = google_stop_reason
