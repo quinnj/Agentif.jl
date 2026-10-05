@@ -549,6 +549,32 @@ function _reap_idle_lanes!(assistant::AgentAssistant)
     return reaped
 end
 
+function _collect_lane_batch!(assistant::AgentAssistant, lane::Lane, item)
+    items = [item]
+    limit = max(assistant.pipeline.max_coalesce, 1)
+    # Queue time counts toward the window. A backed-up lane does not add another
+    # window after a slow evaluation. New arrivals never extend the deadline.
+    remaining = max(0.0, assistant.pipeline.coalesce_window_s - max(0.0, time() - item[2]))
+    deadline = time_ns() + UInt64(round(Int, remaining * 1e9))
+    while length(items) < limit && assistant._state[] === :running
+        remaining > 0 && time_ns() >= deadline && break
+        if isready(lane.queue)
+            extra = try
+                take!(lane.queue)
+            catch
+                break
+            end
+            Threads.atomic_sub!(lane.depth, 1)
+            push!(items, extra)
+        elseif time_ns() < deadline && isopen(lane.queue)
+            sleep(min(0.01, max(0.0, Float64(Int128(deadline) - time_ns()) / 1e9)))
+        else
+            break
+        end
+    end
+    return items
+end
+
 function _lane_loop(assistant::AgentAssistant, lane::Lane)
     Agentif.with_log_level(assistant.log_level) do
         while true
@@ -562,27 +588,20 @@ function _lane_loop(assistant::AgentAssistant, lane::Lane)
                 _clear_wakeup!(assistant, item[1])
                 break
             end
-            # Coalesce: drain whatever else is already queued on this lane (up to
-            # max_coalesce), so a burst that piled up behind a slow evaluation is
-            # handled as one demarcated batch instead of N sequential evaluations.
-            # Only this worker consumes the queue, so isready/take! cannot race.
-            items = [item]
-            max_coalesce = max(assistant.pipeline.max_coalesce, 1)
-            while length(items) < max_coalesce && isready(lane.queue)
-                extra = try
-                    take!(lane.queue)
-                catch
-                    break
-                end
-                Threads.atomic_sub!(lane.depth, 1)
-                push!(items, extra)
+            # Keep the lane alive while collecting. Waiting consumes neither an
+            # event claim nor a model slot; only this worker consumes this queue.
+            lane.busy[] = true
+            waited = time() - item[2]
+            items = _collect_lane_batch!(assistant, lane, item)
+            if assistant._state[] !== :running
+                foreach(x -> _clear_wakeup!(assistant, x[1]), items)
+                lane.busy[] = false
+                break
             end
-            waited = time() - items[1][2]
             if waited > assistant.pipeline.lane_backlog_warn_s
                 @warn "Claw: lane backlog" lane = lane.key wait_s = round(waited; digits = 2) queue_depth = lane.depth[] drained = length(items)
             end
             ids = [id for (id, _) in items]
-            lane.busy[] = true
             Base.acquire(assistant._sem)
             try
                 _process_event_batch!(assistant, ids)
@@ -819,17 +838,18 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
     streamed = Base.IdSet{Any}()
     try
         for handler in handlers
-            kept = Event[]
-            kept_ids = Int[]
+            filtered = Tuple{EventRow, Event}[]
             for (row, ev) in group
                 # Filter errors (e.g. a :prompt filter that cannot reach the model)
                 # propagate: the group rides the retry ladder rather than the event
                 # being silently dropped or spuriously delivered.
                 if passes_filter(assistant, handler, ev, row.extra)
-                    push!(kept, ev)
-                    push!(kept_ids, row.id)
+                    push!(filtered, (row, ev))
                 end
             end
+            selected = _select_relevant_events!(assistant, handler, filtered, abort)
+            kept = Event[ev for (_, ev) in selected]
+            kept_ids = Int[row.id for (row, _) in selected]
             if isempty(kept)
                 @debug "Claw: filter matched no events" handler_id = handler.id event_name = name group_size = length(group)
                 continue

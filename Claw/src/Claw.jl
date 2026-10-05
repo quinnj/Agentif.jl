@@ -17,6 +17,7 @@ using TimeZones
 import Base64
 import SHA
 import Sockets
+import JevSDK
 
 export EventSource, Event, ChannelEvent, EventType, EventHandler, EventFilter
 export AgentConfig, AgentAssistant
@@ -134,6 +135,7 @@ end
 
 # Subscription filters (EventFilter is a field of EventHandler below).
 include("filters.jl")
+include("relevance.jl")
 
 # ─── Core types ───
 
@@ -183,6 +185,10 @@ set). Trust filtering applies on top: naming a denied tool does not grant it to 
 
 `filter` optionally narrows *which events* fire the handler — see [`EventFilter`](@ref).
 `nothing` (the default) fires on every event of the subscribed types.
+
+`relevance` optionally adds a contextual [`EventRelevancePolicy`](@ref) after the
+existing filter. Jev receives data only through an explicitly configured client
+and approved source tags. The policy never changes `trust`, `tools` or permissions.
 """
 struct EventHandler
     id::String
@@ -192,6 +198,7 @@ struct EventHandler
     tools::Union{Nothing, Vector{String}}
     trust::Symbol
     filter::Union{Nothing, EventFilter}
+    relevance::Union{Nothing, EventRelevancePolicy}
 end
 
 function EventHandler(id::AbstractString, event_types, prompt::AbstractString,
@@ -199,6 +206,7 @@ function EventHandler(id::AbstractString, event_types, prompt::AbstractString,
         tools::Union{Nothing, AbstractVector} = nothing,
         trust::Symbol = :owner,
         filter::Union{Nothing, EventFilter} = nothing,
+        relevance::Union{Nothing, EventRelevancePolicy} = nothing,
     )
     trust in TRUST_TIERS || throw(ArgumentError(
         "EventHandler trust must be one of $(collect(TRUST_TIERS)), got :$trust"))
@@ -210,8 +218,15 @@ function EventHandler(id::AbstractString, event_types, prompt::AbstractString,
         tools === nothing ? nothing : String[String(t) for t in tools],
         trust,
         filter,
+        relevance,
     )
 end
+
+# Preserve the previous positional constructor as well as the keyword API.
+EventHandler(id::String, event_types::Vector{String}, prompt::String,
+    channel_id::Union{Nothing, String}, tools::Union{Nothing, Vector{String}},
+    trust::Symbol, filter::Union{Nothing, EventFilter}) =
+    EventHandler(id, event_types, prompt, channel_id; tools, trust, filter)
 
 Base.@kwdef struct AgentConfig
     name::Union{Nothing, String} = nothing
@@ -246,6 +261,7 @@ struct AgentAssistant
     log_level::Union{Nothing, LogLevel}
     watcher::Union{Nothing, WatcherConfig}
     pipeline::PipelineConfig
+    jev::Union{Nothing, JevConfig}
     _writer::SQLiteWriter
     _readers::ReaderPool
     # Live event objects for the hot path: a freshly-arrived event still holds its
@@ -287,6 +303,7 @@ function _new_agent_assistant(;
         log_level = nothing,
         watcher = nothing,
         pipeline = PipelineConfig(),
+        jev = nothing,
         _writer,
         _readers,
         _live_events = Dict{Int, Event}(),
@@ -323,6 +340,7 @@ function _new_agent_assistant(;
         log_level,
         watcher,
         pipeline,
+        jev,
         _writer,
         _readers,
         _live_events,
@@ -461,6 +479,7 @@ function _init_claw_schema!(db::SQLite.DB)
     # mechanism, so it stays idempotent CREATE IF NOT EXISTS); everything after is
     # applied through the PRAGMA user_version ladder.
     _migrate_claw_schema!(db)
+    _init_relevance_schema!(db)
     return nothing
 end
 
@@ -568,6 +587,7 @@ function _upsert_event_handler!(db::SQLite.DB, eh::EventHandler)
     fk, fe, fp = _encode_filter(eh.filter)
     _exec!(db, "INSERT OR REPLACE INTO claw_event_handlers (id, prompt, channel_id, trust, tools, filter_kind, filter_expr, filter_pattern) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (eh.id, eh.prompt, eh.channel_id, String(eh.trust), _encode_handler_tools(eh.tools), fk, fe, fp))
+    _upsert_handler_relevance!(db, eh)
     # Insert new subscriptions before deleting stale ones so a partial upsert can
     # never leave the handler with zero event types (a dead automation);
     # worst case is a transient union of old+new until the next upsert.
@@ -596,6 +616,7 @@ function unregister_event_handler!(assistant::AgentAssistant, handler_id::String
     _writer_txn(assistant) do db
         _exec!(db, "DELETE FROM claw_handler_event_types WHERE handler_id = ?", (handler_id,))
         _exec!(db, "DELETE FROM claw_event_handlers WHERE id = ?", (handler_id,))
+        _exec!(db, "DELETE FROM claw_handler_relevance WHERE handler_id = ?", (handler_id,))
         return nothing
     end
     return nothing
@@ -905,11 +926,13 @@ Returns one entry per handler with: ID, subscribed event types (marked "(inactiv
         tool_note = h.tools === nothing ? "" : " [tools: $(join(h.tools, ", "))]"
         filter_note = h.filter === nothing ? "" :
             " [filter: $(h.filter.kind) $(repr(h.filter.expr))$(h.filter.pattern === nothing ? "" : " ~ $(repr(h.filter.pattern))")]"
+        relevance_note = h.relevance === nothing ? "" :
+            " [Jev: $(h.relevance.mode), policy $(relevance_policy_version(h.relevance)), in-batch dedup: $(h.relevance.deduplicate)]"
         # Mark subscriptions to event types with no active source (e.g. a disabled
         # integration): the handler stays registered but cannot fire until the
         # source is enabled again.
         ets = [t in active_types ? t : "$t (inactive)" for t in h.event_types]
-        push!(lines, "- $(h.id) [events: $(join(ets, ", "))] [channel: $ch_id] [trust: $(h.trust)]$tool_note$filter_note\n  prompt: $prompt_preview")
+        push!(lines, "- $(h.id) [events: $(join(ets, ", "))] [channel: $ch_id] [trust: $(h.trust)]$tool_note$filter_note$relevance_note\n  prompt: $prompt_preview")
     end
     isempty(lines) ? "No event handlers registered" : join(lines, "\n")
 end
@@ -969,6 +992,23 @@ Optional subscription filter (narrows which events fire the handler; omit all th
 - filter_expr (String, required with filter_type): the pattern/path/criteria.
 - filter_pattern (String, optional): only for "jsonpath" — regex applied to extracted values.
 
+Optional contextual Jev relevance policy for high-volume external sources:
+- relevance_interests (String, optional): Preserve the user's stated interests.
+- relevance_policy (String, required with relevance_interests): Craft contextual criteria
+  from those interests at subscription setup. Include relevant repositories, topics,
+  people and changes, positive examples and clear irrelevant examples. Preserve
+  uncertain relevance, new reviews/comments/status changes, and information that
+  merely shares a PR or issue. This is a relevance decision, never action permission.
+- relevance_mode (String, optional): "enforce" (default) or "shadow" (audit proposed
+  drops while passing all events). No additional full-model policy-generation call.
+- relevance_deduplicate (Bool, optional): true (default) checks information only
+  within the coalesced batch. It never checks prior batches or completed work.
+
+Jev data transmission requires an operator-configured client and approved sources.
+This tool cannot grant that permission. Without them, uncertain events pass to the
+full model; exact in-batch copies may still be folded locally. Existing filters
+retain their own semantics. Do not add a per-event "prompt" filter to save LLM cost.
+
 Examples:
   add_event_handler("email-triage", "jmap_new_email", "Triage this email: if spam or marketing, archive it. If important, summarize it.", "mm-general")
   add_event_handler("github-log", "github_push", "Summarize this push event and store a log entry.")
@@ -977,7 +1017,8 @@ Examples:
 Gotchas:
 - Fails if event_type_names contains unknown event types (use list_event_types first).
 - Fails if channel_id is provided but is not a registered channel (use list_channels first).
-- If an id already exists, it will be replaced (upsert behavior).""" function add_event_handler(id::String, event_type_names::String, prompt::String, channel_id::Union{Nothing, String} = nothing, filter_type::Union{Nothing, String} = nothing, filter_expr::Union{Nothing, String} = nothing, filter_pattern::Union{Nothing, String} = nothing)
+- If an id already exists, it will be replaced (upsert behavior). Omitted relevance
+  arguments remove its active policy; policy history and raw events remain.""" function add_event_handler(id::String, event_type_names::String, prompt::String, channel_id::Union{Nothing, String} = nothing, filter_type::Union{Nothing, String} = nothing, filter_expr::Union{Nothing, String} = nothing, filter_pattern::Union{Nothing, String} = nothing, relevance_interests::Union{Nothing, String} = nothing, relevance_policy::Union{Nothing, String} = nothing, relevance_mode::String = "enforce", relevance_deduplicate::Bool = true)
     a = get_current_assistant()
     a === nothing && return "No assistant initialized"
     cid = channel_id === nothing ? nothing : strip(channel_id)
@@ -1007,7 +1048,19 @@ Gotchas:
             return "Invalid filter: $(sprint(showerror, e))"
         end
     end
-    eh = EventHandler(id, names, prompt, cid; filter)
+    relevance = if relevance_interests === nothing && relevance_policy === nothing
+        nothing
+    elseif relevance_interests === nothing || relevance_policy === nothing
+        return "relevance_interests and relevance_policy must be supplied together."
+    else
+        try
+            EventRelevancePolicy(relevance_interests, relevance_policy;
+                mode=Symbol(relevance_mode), deduplicate=relevance_deduplicate)
+        catch e
+            return "Invalid relevance policy: $(sprint(showerror, e))"
+        end
+    end
+    eh = EventHandler(id, names, prompt, cid; filter, relevance)
     register_event_handler!(a, eh)
     filter_note = filter === nothing ? "" : " [filter: $(filter.kind)]"
     cid === nothing ? "Event handler '$id' registered (no channel — evaluate only)$filter_note" : "Event handler '$id' registered for channel '$cid'$filter_note"
@@ -1538,9 +1591,11 @@ function _event_handlers_for(assistant::AgentAssistant, event_name::String)
         handlers = NamedTuple[]
         for row in SQLite.DBInterface.execute(assistant.db, """
             SELECT eh.id, eh.prompt, eh.channel_id, eh.trust, eh.tools,
-                   eh.filter_kind, eh.filter_expr, eh.filter_pattern
+                   eh.filter_kind, eh.filter_expr, eh.filter_pattern, rp.spec AS relevance_spec
             FROM claw_event_handlers eh
             JOIN claw_handler_event_types het ON eh.id = het.handler_id
+            LEFT JOIN claw_handler_relevance hr ON eh.id = hr.handler_id
+            LEFT JOIN claw_relevance_policies rp ON hr.policy_version = rp.version
             WHERE het.event_type_name = ?
         """, (event_name,))
             handler_id = row.id === missing ? "" : String(row.id)
@@ -1550,7 +1605,8 @@ function _event_handlers_for(assistant::AgentAssistant, event_name::String)
             trust = _decode_handler_trust(row.trust)
             tools = _decode_handler_tools(row.tools)
             filter = _decode_filter(row.filter_kind, row.filter_expr, row.filter_pattern)
-            push!(handlers, (; id=handler_id, prompt, channel_id, trust, tools, filter))
+            relevance = _decode_relevance(row.relevance_spec)
+            push!(handlers, (; id=handler_id, prompt, channel_id, trust, tools, filter, relevance))
         end
         return handlers
     end
@@ -1567,7 +1623,11 @@ function _all_event_handlers(assistant::AgentAssistant)
         handlers = NamedTuple[]
         rows = NamedTuple[]
         for row in SQLite.DBInterface.execute(assistant.db,
-                "SELECT id, prompt, channel_id, trust, tools, filter_kind, filter_expr, filter_pattern FROM claw_event_handlers")
+                """SELECT eh.id, eh.prompt, eh.channel_id, eh.trust, eh.tools,
+                    eh.filter_kind, eh.filter_expr, eh.filter_pattern, rp.spec AS relevance_spec
+                    FROM claw_event_handlers eh
+                    LEFT JOIN claw_handler_relevance hr ON eh.id = hr.handler_id
+                    LEFT JOIN claw_relevance_policies rp ON hr.policy_version = rp.version""")
             id = row.id === missing ? "" : String(row.id)
             isempty(id) && continue
             push!(rows, (; id,
@@ -1575,7 +1635,8 @@ function _all_event_handlers(assistant::AgentAssistant)
                 channel_id = row.channel_id === missing ? nothing : String(row.channel_id),
                 trust = _decode_handler_trust(row.trust),
                 tools = _decode_handler_tools(row.tools),
-                filter = _decode_filter(row.filter_kind, row.filter_expr, row.filter_pattern)))
+                filter = _decode_filter(row.filter_kind, row.filter_expr, row.filter_pattern),
+                relevance = _decode_relevance(row.relevance_spec)))
         end
         for r in rows
             event_types = String[]
@@ -1694,8 +1755,11 @@ function AgentAssistant(db_path::String="";
     level::Union{Nothing, LogLevel, Int, Symbol, AbstractString}=nothing,
     watcher::Union{Nothing, WatcherConfig}=nothing,
     pipeline::PipelineConfig=PipelineConfig(),
+    jev::Union{Nothing, JevConfig}=nothing,
 )
     watcher !== nothing && validate_watcher_config(watcher)
+    isfinite(pipeline.coalesce_window_s) && 0 <= pipeline.coalesce_window_s <= 2 ||
+        throw(ArgumentError("coalesce_window_s must be finite and between 0 and 2 seconds"))
     db_path = _resolve_db_path(db_path, name)
     db = SQLite.DB(db_path)
     _init_claw_schema!(db)
@@ -1738,6 +1802,7 @@ function AgentAssistant(db_path::String="";
         log_level,
         watcher,
         pipeline,
+        jev,
         _writer = writer,
         _readers = ReaderPool(db_path, db),
         _sem = Base.Semaphore(max(1, pipeline.max_concurrent_evals)),
