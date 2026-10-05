@@ -104,6 +104,7 @@ end
 @omit_null @kwarg struct Candidate
     content::Union{Nothing, Content} = nothing
     finishReason::Union{Nothing, String} = nothing
+    finishMessage::Union{Nothing, String} = nothing
 end
 
 @omit_null @kwarg struct UsageMetadata
