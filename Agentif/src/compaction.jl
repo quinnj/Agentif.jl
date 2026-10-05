@@ -195,7 +195,7 @@ function generate_summary(
     )
     result = stream(identity, summary_agent, AgentState(), summary_input, abort)
     stop_reason = result.most_recent_stop_reason
-    if stop_reason === :error || stop_reason === :aborted
+    if stop_reason === :error || stop_reason === :aborted || stop_reason === :refusal
         @warn "Compaction summary call did not complete, skipping compaction" stop_reason
         return nothing
     end
