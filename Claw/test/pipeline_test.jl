@@ -770,8 +770,9 @@ end
 
     try
         with_handler(runner) do
-            Claw.start_event_loop!(recovered)
+            # Recover before the background scanner can enqueue the same row.
             @test Claw._recover_events!(recovered) >= 1
+            Claw.start_event_loop!(recovered)
             @test timedwait(() -> length(seen) == 1, 20.0) == :ok
             @test timedwait(() -> event_row(recovered, id).status == "done", 20.0) == :ok
         end
