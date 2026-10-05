@@ -551,8 +551,11 @@ end
 function anthropic_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
     if reason == "max_tokens" || reason == "model_context_window_exceeded"
         return :length
-    elseif reason == "refusal" || reason == "error"
-        # "error" is synthesized by the stream driver on HTTP errors.
+    elseif reason == "refusal"
+        # The model declined: an answer, not a failure to retry.
+        return :refusal
+    elseif reason == "error"
+        # Synthesized by the stream driver on HTTP errors.
         return :error
     elseif !isempty(tool_calls) || reason == "tool_use"
         # A paused turn with client tool calls still owes us their results.

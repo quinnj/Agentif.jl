@@ -36,8 +36,8 @@ function tool_call_middleware(agent_handler::AgentHandler)
             try
                 current_state = agent_handler(f, agent, current_state, next_input, abort; kw...)
                 stop_reason = current_state.most_recent_stop_reason
-                # A failed or aborted turn ends the evaluation; its calls never run.
-                if stop_reason === :error || stop_reason === :aborted
+                # A failed, aborted or refused turn ends the evaluation; its calls never run.
+                if stop_reason === :error || stop_reason === :aborted || stop_reason === :refusal
                     empty!(current_state.pending_tool_calls)
                 end
 

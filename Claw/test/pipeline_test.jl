@@ -547,11 +547,23 @@ function soft_error_handler(f, agent, state, input, abort; kw...)
     return state
 end
 
-@testset "unwatched provider failure retries the event instead of finishing it" begin
+# Same failure without the AgentErrorEvent. Every adapter should emit one, but
+# a stop reason of :error alone must still not finish the event.
+function silent_error_handler(f, agent, state, input, abort; kw...)
+    msg = Agentif.AssistantMessage(; provider = "test", api = "test", model = "test")
+    Agentif.append_state!(state, input, msg, Agentif.Usage())
+    state.most_recent_stop_reason = :error
+    return state
+end
+
+@testset "unwatched provider failure retries the event instead of finishing it ($label)" for (label, base_handler, reported) in [
+        ("with a provider error", soft_error_handler, "overloaded"),
+        ("without a provider error", silent_error_handler, "stop reason :error"),
+    ]
     a = Claw.AgentAssistant(":memory:";
         provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
         timezone = "UTC", level = :error,
-        pipeline = Claw.PipelineConfig(; retry_backoff_s = [0.05], max_attempts = 2,
+        pipeline = Claw.PipelineConfig(; retry_backoff_s = [0.05], max_attempts = 2, unknown_max_attempts = 2,
             min_refire_gap_s = 0.05, scan_interval_s = 0.05, lane_backlog_warn_s = 5.0))
     Claw.CURRENT_ASSISTANT[] = a
     ch = RecordingChannel("soft-error")
@@ -561,18 +573,18 @@ end
     local id
     with_handler(function (assistant, ev, handler; kwargs...)
         Threads.atomic_add!(runs, 1)
-        return Claw._run_event_handler!(assistant, ev, handler; kwargs..., base_handler = soft_error_handler)
+        return Claw._run_event_handler!(assistant, ev, handler; kwargs..., base_handler)
     end) do
         Claw.start_event_loop!(a)
         id = Claw.submit_event!(a, PipelineTestEvent("hello", ch))
         @test timedwait(() -> event_row(a, id).status == "dead", 20.0) == :ok
     end
     @test runs[] == 2                           # retried instead of marked done
-    @test occursin("overloaded", String(event_row(a, id).last_error))
+    @test occursin(reported, String(event_row(a, id).last_error))
     Claw.shutdown!(a; timeout_s = 5)
 end
 
-@testset "a refusal (an :error turn with no provider error) is not retried" begin
+@testset "a refusal is the model's answer, not a failure to retry" begin
     a = Claw.AgentAssistant(":memory:";
         provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
         timezone = "UTC", level = :error,
@@ -586,7 +598,7 @@ end
         msg = Agentif.AssistantMessage(; provider = "test", api = "test", model = "test")
         Agentif.append_text!(msg, "I can't help with that.")
         Agentif.append_state!(state, input, msg, Agentif.Usage())
-        state.most_recent_stop_reason = :error
+        state.most_recent_stop_reason = :refusal
         return state
     end
     runs = Threads.Atomic{Int}(0)
@@ -601,6 +613,43 @@ end
     end
     @test runs[] == 1
     Claw.shutdown!(a; timeout_s = 5)
+end
+
+@testset "a provider error reported mid-stream retries the event (real Completions stream)" begin
+    # OpenRouter reports some failures as a final chunk with finish_reason "error".
+    body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Partial\"},\"finish_reason\":null}]}\n\n" *
+        "data: {\"error\":{\"message\":\"Provider disconnected\"},\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n" *
+        "data: [DONE]\n\n"
+    requests = Threads.Atomic{Int}(0)
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        Threads.atomic_add!(requests, 1)
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], body)
+    end
+    try
+        Agentif.registerModel!(Agentif.Model(
+            id = "midstream-error-model", name = "midstream-error-model", api = "openai-completions",
+            provider = "midstream-error", baseUrl = "http://127.0.0.1:$(HTTP.port(server))", reasoning = false,
+            input = ["text"], cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 100000, maxTokens = 4096))
+        a = Claw.AgentAssistant(":memory:";
+            provider = "midstream-error", model_id = "midstream-error-model", apikey = "test-key",
+            timezone = "UTC", level = :error,
+            pipeline = Claw.PipelineConfig(; retry_backoff_s = [0.05], unknown_max_attempts = 2,
+                min_refire_gap_s = 0.05, scan_interval_s = 0.05, lane_backlog_warn_s = 5.0))
+        Claw.CURRENT_ASSISTANT[] = a
+        ch = RecordingChannel("midstream-error")
+        a._channels[ch.id] = ch
+        register_test_handler!(a)
+        Claw.start_event_loop!(a)
+        id = Claw.submit_event!(a, PipelineTestEvent("hello", ch))
+        @test timedwait(() -> event_row(a, id).status in ("done", "dead"), 30.0) == :ok
+        @test event_row(a, id).status == "dead"
+        @test requests[] == 2
+        @test occursin("Provider disconnected", String(event_row(a, id).last_error))
+        Claw.shutdown!(a; timeout_s = 5)
+    finally
+        close(server)
+    end
 end
 
 @testset ":auth failure dead-letters without retrying" begin

@@ -417,7 +417,7 @@ tool_results(state) = [m for m in state.messages if m isa ToolResultMessage]
     @test Agentif.openai_completions_stop_reason("stop", calls) == :tool_calls
     @test Agentif.openai_completions_stop_reason("tool_calls", none) == :tool_calls
     @test Agentif.anthropic_stop_reason("max_tokens", calls) == :length
-    @test Agentif.anthropic_stop_reason("refusal", calls) == :error
+    @test Agentif.anthropic_stop_reason("refusal", calls) == :refusal
     @test Agentif.anthropic_stop_reason("error", calls) == :error
     @test Agentif.anthropic_stop_reason("end_turn", calls) == :tool_calls
     # A paused turn still owes the results of the client calls it made.
@@ -426,6 +426,10 @@ tool_results(state) = [m for m in state.messages if m isa ToolResultMessage]
     @test Agentif.google_stop_reason("MAX_TOKENS", calls) == :length
     @test Agentif.google_stop_reason("SAFETY", calls) == :safety
     @test Agentif.google_stop_reason("STOP", calls) == :tool_calls
+    @test Agentif.google_stop_reason(nothing, calls) == :tool_calls
+    for reason in ("OTHER", "SPII", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL")
+        @test Agentif.google_stop_reason(reason, calls) == :other
+    end
 end
 
 @testset "tool_call_middleware runs tools only after a normal turn" begin
@@ -448,6 +452,12 @@ end
     @test isempty(tool_results(state))
     @test isempty(state.pending_tool_calls)
     @test state.most_recent_stop_reason == :error
+
+    # So does a refused one.
+    state = tool_call_middleware(scripted_turn_handler(calls, :refusal))(identity, agent, AgentState(), "go", Abort())
+    @test runs[] == 0
+    @test isempty(tool_results(state))
+    @test state.most_recent_stop_reason == :refusal
 
     state = tool_call_middleware(scripted_turn_handler(calls, :tool_calls))(identity, agent, AgentState(), "go", Abort())
     @test runs[] == 1
@@ -478,10 +488,15 @@ function completions_tool_call_sse(name::String, finish_reason::String)
     )
 end
 
-@testset "completions stream: a provider error ends the turn as :error" begin
-    server = HTTP.serve!("127.0.0.1", 0) do req
-        return HTTP.Response(500, ["Content-Type" => "application/json"], JSON.json(Dict("error" => Dict("message" => "overloaded"))))
-    end
+@testset "completions stream: a provider error ends the turn as :error ($label)" for (label, response) in [
+        ("HTTP 500", () -> HTTP.Response(500, ["Content-Type" => "application/json"],
+            JSON.json(Dict("error" => Dict("message" => "overloaded"))))),
+        # Some providers (e.g. OpenRouter) report a failure mid-stream instead.
+        ("mid-stream", () -> HTTP.Response(200, ["Content-Type" => "text/event-stream"], completions_sse(
+            (; choices = [(; index = 0, delta = (; content = "Partial"), finish_reason = nothing)]),
+            (; error = (; message = "overloaded"), choices = [(; index = 0, delta = (; content = ""), finish_reason = "error")])))),
+    ]
+    server = HTTP.serve!(req -> response(), "127.0.0.1", 0)
     try
         model = Model(; id = "m", name = "m", api = "openai-completions", provider = "test",
             baseUrl = "http://127.0.0.1:$(test_server_port(server))", reasoning = false, input = ["text"],
@@ -2729,7 +2744,7 @@ end
     end
 end
 
-@testset "anthropic stream maps refusal to error stop reason" begin
+@testset "anthropic stream maps refusal to its own stop reason" begin
     seen_events = Agentif.AgentEvent[]
 
     server = HTTP.serve!("127.0.0.1", 0) do req
@@ -2767,7 +2782,7 @@ end
         )
 
         result = stream(ev -> (push!(seen_events, ev); ev), agent, AgentState(), "Do the thing", Abort())
-        @test result.most_recent_stop_reason == :error
+        @test result.most_recent_stop_reason == :refusal
         @test !any(ev -> ev isa Agentif.AgentErrorEvent, seen_events)
     finally
         close(server)
