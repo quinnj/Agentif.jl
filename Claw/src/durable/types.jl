@@ -111,6 +111,7 @@ struct InvocationContext
     revision::Base.RefValue{Int}
     abort::Agentif.Abort
     deadline::Float64
+    monotonic_deadline::Float64
     lock::ReentrantLock
     last_progress::Base.RefValue{Float64}
     heartbeat::Base.RefValue{Float64}
@@ -132,6 +133,7 @@ Agentif.get_entry(s::DurableSessionReader, id::String) = with_read(s.readers) do
 end
 
 _did() = string(Agentif.UID8())
+_dmono() = time_ns()/1e9
 _dnull(x) = x === missing || x === nothing ? nothing : x
 function _canonical(x)
     x isa AbstractDict && return "{" * join((JSON.json(String(k)) * ":" * _canonical(x[k]) for k in sort!(collect(keys(x)); by = String)), ",") * "}"

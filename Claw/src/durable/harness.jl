@@ -190,7 +190,7 @@ function ensure_conversation!(h::Harness; branch_id::String, profile::Union{Noth
 end
 
 function close_harness!(h::Harness; mode::Symbol=:suspend,grace_s::Real=30)
-    deadline=time()+grace_s
+    deadline=_dmono()+grace_s
     mode in (:suspend,:abort) || throw(ArgumentError("invalid close mode"))
     mode === :abort && foreach(c -> abort_conversation!(h,c.id;include_background=true),
         _dread(db -> _drows(db,"SELECT id FROM claw_conversations"),h))
@@ -198,9 +198,9 @@ function close_harness!(h::Harness; mode::Symbol=:suspend,grace_s::Real=30)
     notify(h.wake)
     live = lock(() -> collect(values(h.live)),h.lock)
     foreach(x -> Agentif.abort!(x.context.abort),live)
-    drained = timedwait(() -> lock(() -> isempty(h.live),h.lock),max(0.0,deadline-time());pollint=.02) === :ok
+    drained = timedwait(() -> lock(() -> isempty(h.live),h.lock),max(0.0,deadline-_dmono());pollint=.02) === :ok
     drained || return (;status=:draining,reason=:noncooperative_invocation)
-    indexed=h.indexer===nothing || timedwait(()->istaskdone(h.indexer),max(0.0,deadline-time());pollint=.02)===:ok
+    indexed=h.indexer===nothing || timedwait(()->istaskdone(h.indexer),max(0.0,deadline-_dmono());pollint=.02)===:ok
     indexed || return (;status=:draining,reason=:indexer_draining)
     stopped=h.scheduler === nothing || timedwait(() -> istaskdone(h.scheduler),1.0;pollint=.01)===:ok
     stopped || return (;status=:draining,reason=:scheduler_draining)

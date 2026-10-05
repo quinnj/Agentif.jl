@@ -6,13 +6,20 @@ mutable struct ConversationWatch
     closed::Bool
 end
 
+_checkpoint_phase(value)=try
+    parsed=JSON.parse(value)
+    parsed isa AbstractDict ? get(parsed,"phase","unknown") : "corrupt"
+catch
+    "corrupt"
+end
+
 function _snapshot(db,cid)
     c = _done(db,"SELECT * FROM claw_conversations WHERE id=?",(cid,))
     c === nothing && throw(ArgumentError("unknown conversation"))
     seq = _done(db,"SELECT seq FROM claw_runtime_meta WHERE id=1").seq
     tasks = _drows(db,"SELECT id,owner_task,kind,status,checkpoint,blocked,due_at,cancel,outcome,progress FROM claw_tasks WHERE conversation_id=? ORDER BY created_seq,rowid",(cid,))
     graph = [(;id=t.id,owner=_dnull(t.owner_task),kind=t.kind,status=t.status,
-        phase=get(JSON.parse(t.checkpoint),"phase","unknown"),blocked=_dnull(t.blocked),due_at=t.due_at,
+        phase=_checkpoint_phase(t.checkpoint),blocked=_dnull(t.blocked),due_at=t.due_at,
         cancel=t.cancel==1,outcome=_dnull(t.outcome),progress=_dnull(t.progress)) for t in tasks]
     receipts = _drows(db,"SELECT id,request_id,mode,state,run_id,answer_entry,reason FROM claw_submissions WHERE conversation_id=? ORDER BY admitted_seq,rowid",(cid,))
     deliveries = _drows(db,"SELECT id,state,receipt,error FROM claw_outbox WHERE conversation_id=?",(cid,))
@@ -33,8 +40,8 @@ function live_activity(h::Harness,cid::Union{String,ConversationRef})
     s=snapshot(h,cid)
     ids=Set(t.id for t in s.tasks)
     lock(h.lock) do
-        [(;task=id,group=x.group,idle_s=max(0,time()-x.context.heartbeat[]),
-            overdue=time()>x.context.deadline,abort_requested=Agentif.isaborted(x.context.abort)) for (id,x) in h.live if id in ids]
+        [(;task=id,group=x.group,idle_s=max(0,_dmono()-x.context.heartbeat[]),
+            overdue=_dmono()>x.context.monotonic_deadline,abort_requested=Agentif.isaborted(x.context.abort)) for (id,x) in h.live if id in ids]
     end
 end
 _task_row(h::Harness,id::String) = _dread(db -> _done(db,"SELECT * FROM claw_tasks WHERE id=?",(id,)),h)
@@ -45,7 +52,7 @@ function inspect_task(h::Harness,id::String;include_payload::Bool=false)
     t=_task_row(h,id)
     t===nothing && return nothing
     include_payload && return t
-    merge(t,(;input_json="{}",checkpoint=JSON.json(Dict("phase"=>get(JSON.parse(t.checkpoint),"phase","unknown"))),progress=nothing))
+    merge(t,(;input_json="{}",checkpoint=JSON.json(Dict("phase"=>_checkpoint_phase(t.checkpoint))),progress=nothing))
 end
 
 """Committed snapshot subscription. Frames are snapshots, with explicit overflow
@@ -120,44 +127,54 @@ Affected work is cancelled before context required for execution is erased.
 """
 function scrub_durable_post!(h::Harness,post_id::String)
     erased_profiles=String[]
+    affected=Set{String}()
+    erased_events=Set{Int}()
     _transition!(h;point=:redaction) do db,seq
         entries=_drows(db,"SELECT entry_id,parent_id,post_id,entry FROM session_entries")
         tainted=Set(String(e.entry_id) for e in entries if _dnull(e.post_id)==post_id)
-        affected=Set{String}()
-        for c in _drows(db,"SELECT id,routing FROM claw_conversations")
+        union!(tainted,[r.entry_id for r in _drows(db,"SELECT entry_id FROM claw_platform_entries WHERE platform_id=?",(post_id,))])
+        conversations=_drows(db,"SELECT c.*,b.leaf_entry_id,t.conversation_id AS owner_conversation FROM claw_conversations c LEFT JOIN session_branches b ON b.branch_id=c.branch_id LEFT JOIN claw_tasks t ON t.id=c.owner_task")
+        submissions=_drows(db,"SELECT * FROM claw_submissions")
+        events=_drows(db,"SELECT id,dedup_key,payload FROM claw_events")
+        links=_drows(db,"SELECT m.event_id,d.submission_id FROM claw_dispatch_members m JOIN claw_event_dispatches d ON d.id=m.dispatch_id")
+        outbox=_drows(db,"SELECT conversation_id,logical_key FROM claw_outbox")
+        for c in conversations
             string(get(JSON.parse(c.routing),"post_id",""))==post_id && push!(affected,c.id)
         end
-        for s in _drows(db,"SELECT * FROM claw_submissions")
-            get(JSON.parse(s.origin),"post_id",nothing)==post_id || continue
-            push!(affected,s.conversation_id)
-            for e in _drows(db,"SELECT entry_id FROM claw_entry_runtime WHERE seq=? AND (run_id=? OR run_id IS NULL)",(_dnull(s.placed_seq),_dnull(s.run_id)))
-                push!(tainted,e.entry_id)
-            end
+        for e in events
+            _,_,extra=_decode_payload(e.payload)
+            string(get(extra,"source_id",""))==post_id && push!(erased_events,Int(e.id))
         end
         # Descendant entries used the source context, including summary entries
-        # and history shared by a fork. Older independent memory is preserved.
-        changed=true
-        while changed
-            changed=false
-            for e in entries
-                copied=get(JSON.parse(e.entry),"copied_from",nothing)
-                if (_dnull(e.parent_id) in tainted || copied in tainted) && !(e.entry_id in tainted)
-                    push!(tainted,e.entry_id);changed=true
-                end
-            end
-        end
-        for c in _drows(db,"SELECT c.id,b.leaf_entry_id FROM claw_conversations c LEFT JOIN session_branches b ON b.branch_id=c.branch_id")
-            _dnull(c.leaf_entry_id) in tainted && push!(affected,c.id)
-        end
+        # and forks. Owned-child notifications are source events too, so follow
+        # their committed outbox/dispatch links before removing payloads.
         derived=Set{String}()
         changed=true
         while changed
-            changed=false
-            for c in _drows(db,"SELECT c.*,t.conversation_id AS owner_conversation FROM claw_conversations c LEFT JOIN claw_tasks t ON t.id=c.owner_task")
-                if !(c.id in affected) && _dnull(c.owner_conversation) in affected
-                    push!(affected,c.id);push!(derived,c.id);changed=true
+            before=(length(tainted),length(affected),length(derived),length(erased_events))
+            keys=Set(o.logical_key for o in outbox if o.conversation_id in affected)
+            union!(erased_events,[Int(e.id) for e in events if _dnull(e.dedup_key) in keys])
+            selected=Set(l.submission_id for l in links if l.event_id in erased_events)
+            for s in submissions
+                get(JSON.parse(s.origin),"post_id",nothing)==post_id || s.id in selected || s.conversation_id in derived || continue
+                push!(affected,s.conversation_id)
+                for e in _drows(db,"SELECT entry_id FROM claw_entry_runtime WHERE seq=? AND (run_id=? OR run_id IS NULL)",(_dnull(s.placed_seq),_dnull(s.run_id)))
+                    push!(tainted,e.entry_id)
                 end
             end
+            for e in entries
+                copied=get(JSON.parse(e.entry),"copied_from",nothing)
+                if (_dnull(e.parent_id) in tainted || copied in tainted) && !(e.entry_id in tainted)
+                    push!(tainted,e.entry_id)
+                end
+            end
+            for c in conversations
+                _dnull(c.leaf_entry_id) in tainted && push!(affected,c.id)
+                if _dnull(c.owner_conversation) in affected
+                    push!(affected,c.id);push!(derived,c.id)
+                end
+            end
+            changed=before!=(length(tainted),length(affected),length(derived),length(erased_events))
         end
         for cid in derived
             for e in _drows(db,"SELECT e.entry_id FROM claw_entry_runtime e JOIN claw_runs r ON r.id=e.run_id WHERE r.conversation_id=?",(cid,))
@@ -173,11 +190,30 @@ function scrub_durable_post!(h::Harness,post_id::String)
         end
         for cid in affected
             _cancel_conversation!(db,h,cid,true)
-            _exec!(db,"UPDATE claw_submissions SET input_json=?,origin='{}',reason='redacted' WHERE conversation_id=?",
+            _exec!(db,"UPDATE claw_submissions SET input_json=?,origin='{}',routing='{}',reason='redacted' WHERE conversation_id=?",
                 (JSON.json(Agentif.UserMessage("[redacted]")),cid))
+            _exec!(db,"UPDATE claw_conversations SET routing='{}',context_revision=context_revision+1 WHERE id=?",(cid,))
+            _exec!(db,"UPDATE claw_runs SET routing='{}' WHERE conversation_id=?",(cid,))
             _exec!(db,"UPDATE claw_tasks SET input_json='{}',checkpoint='{}',progress=NULL,outcome=NULL,blocked='redacted' WHERE conversation_id=?",(cid,))
             _exec!(db,"UPDATE claw_tool_executions SET args='{}',result=NULL,effect_state='redacted' WHERE conversation_id=?",(cid,))
             _exec!(db,"UPDATE claw_outbox SET body='',error=NULL,receipt=NULL,state='redacted' WHERE conversation_id=?",(cid,))
+            _exec!(db,"UPDATE claw_managed_resources SET details='{}' WHERE conversation_id=?",(cid,))
+            for alias in _drows(db,"SELECT event_type FROM claw_child_aliases WHERE conversation_id=? OR child_id=?",(cid,cid))
+                _dnull(alias.event_type)===nothing && continue
+                _exec!(db,"UPDATE claw_event_handlers SET prompt='[redacted child completion]' WHERE id=?",(alias.event_type,))
+                for g in _drows(db,"SELECT * FROM claw_dispatch_groups")
+                    handlers=JSON.parse(g.handlers)
+                    any(r->r["id"]==alias.event_type,handlers) || continue
+                    for raw in handlers
+                        raw["id"]==alias.event_type && (raw["prompt"]="[redacted child completion]")
+                    end
+                    _exec!(db,"UPDATE claw_dispatch_groups SET handlers=? WHERE group_key=?",(JSON.json(handlers),g.group_key))
+                end
+                for d in _drows(db,"SELECT id,handler_snapshot FROM claw_event_dispatches WHERE handler_id=?",(alias.event_type,))
+                    raw=JSON.parse(d.handler_snapshot);raw["prompt"]="[redacted child completion]"
+                    _exec!(db,"UPDATE claw_event_dispatches SET handler_snapshot=? WHERE id=?",(JSON.json(raw),d.id))
+                end
+            end
         end
         for id in tainted
             old=JSON.parse(_done(db,"SELECT entry FROM session_entries WHERE entry_id=?",(id,)).entry,Agentif.SessionEntry)
@@ -187,16 +223,33 @@ function scrub_durable_post!(h::Harness,post_id::String)
             _exec!(db,"INSERT INTO claw_index_jobs(entry_id,revision,state) VALUES(?,1,'redacted') ON CONFLICT(entry_id) DO UPDATE SET revision=revision+1,state='redacted'",(id,))
         end
         # Frozen source payloads and classifier contexts are also durable copies.
-        for e in _drows(db,"SELECT id,payload FROM claw_events")
+        for e in events
+            e.id in erased_events || continue
             cid,content,extra=_decode_payload(e.payload)
-            string(get(extra,"source_id",""))==post_id || continue
+            minimal=Dict{String,Any}("redacted"=>true)
+            haskey(extra,"source_id") && (minimal["source_id"]=extra["source_id"])
             _exec!(db,"UPDATE claw_events SET payload=?,status='dead',last_error='redacted',claim_token=NULL,claim_revision=claim_revision+1 WHERE id=?",
-                (JSON.json(Dict("channel_id"=>cid,"content"=>"[redacted]","extra"=>extra)),e.id))
+                (JSON.json(Dict("channel_id"=>cid,"content"=>"[redacted]","extra"=>minimal)),e.id))
         end
     end
-    lock(h.lock) do
+    live=lock(h.lock) do
         foreach(id->delete!(h.agents,id),erased_profiles)
-        foreach(x -> Agentif.abort!(x.context.abort),values(h.live))
+        collect(values(h.live))
+    end
+    for x in live
+        _task_row(h,x.context.task_id).conversation_id in affected && Agentif.abort!(x.context.abort)
+    end
+    if h.assistant!==nothing
+        a=h.assistant
+        lock(a._live_lock) do
+            foreach(id->delete!(a._live_events,id),erased_events)
+        end
+        lock(a._inflight_lock) do
+            for id in erased_events
+                abort=get(a._inflight,id,nothing)
+                abort===nothing || Agentif.abort!(abort)
+            end
+        end
     end
     nothing
 end

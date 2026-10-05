@@ -105,8 +105,8 @@ end
 
 function _model_progress!(ctx,event,last_write)
     h=ctx.harness
-    ctx.heartbeat[]=time()
-    h.clock()-last_write[]>=h.limits.progress_interval || event isa Agentif.MessageEndEvent || return
+    ctx.heartbeat[]=_dmono()
+    _dmono()-last_write[]>=h.limits.progress_interval || event isa Agentif.MessageEndEvent || return
     event isa Union{Agentif.MessageUpdateEvent,Agentif.MessageEndEvent} || return
     message=hasproperty(event,:message) ? getproperty(event,:message) : nothing
     message isa Agentif.AssistantMessage || return
@@ -114,13 +114,13 @@ function _model_progress!(ctx,event,last_write)
     _transition!(h;context=ctx,point=:partial) do db,seq
         _exec!(db,"UPDATE claw_tasks SET progress=? WHERE id=?",(_bounded_json(Dict("text"=>text),h.limits.progress_bytes),ctx.task_id))
     end
-    last_write[]=h.clock()
+    last_write[]=_dmono()
 end
 
 function _model_request!(ctx,t,resolved;summary=false,purpose=false)
     h=ctx.harness
     cp=JSON.parse(t.checkpoint)
-    expired=h.clock()>get(JSON.parse(t.input_json),"deadline",Inf)
+    expired=h.clock()>get(JSON.parse(t.input_json),"deadline",Inf) || _dmono()>ctx.monotonic_deadline
     if t.attempt>=h.limits.attempts || expired
         return _transition!(h;context=ctx,point=:attempt_exhausted) do db,seq
             c=_done(db,"SELECT * FROM claw_conversations WHERE id=?",(t.conversation_id,))

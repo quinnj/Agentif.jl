@@ -108,8 +108,7 @@ function create_owned_child!(ctx::InvocationContext;creation_key::String,name::S
         end
         parent=JSON.parse(_done(db,"SELECT payload FROM claw_agent_profiles WHERE id=?",(JSON.parse(owner.input_json)["profile"],)).payload)
         child=JSON.parse(_done(db,"SELECT payload FROM claw_agent_profiles WHERE id=?",(profile.id,)).payload)
-        parent_names=Set(t["name"] for t in parent["tools"])
-        all(t -> t["name"] in parent_names,child["tools"]) || throw(ArgumentError("child tools exceed inherited policy"))
+        all(t -> any(p->p==t,parent["tools"]),child["tools"]) || throw(ArgumentError("child tool contracts exceed inherited policy"))
         parent["trust"]=="owner" || child["trust"]=="untrusted" || throw(ArgumentError("child trust exceeds parent"))
         child["env"]==parent["env"] || throw(ArgumentError("child environment exceeds inherited policy"))
         old=_done(db,"SELECT * FROM claw_child_aliases WHERE conversation_id=? AND name=?",(owner.conversation_id,name))

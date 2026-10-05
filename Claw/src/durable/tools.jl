@@ -59,13 +59,13 @@ function report_progress!(ctx::InvocationContext,value)
             epoch=_done(db,"SELECT owner_epoch FROM claw_runtime_meta WHERE id=1").owner_epoch
             ctx.harness.state===:open && epoch==ctx.epoch && task!==nothing && task.status=="running" && task.token==ctx.token && task.revision==ctx.revision[] && task.cancel==0 || throw(StaleInvocation())
         end
-        ctx.heartbeat[]=time()
-        ctx.harness.clock()-ctx.last_progress[] >= ctx.harness.limits.progress_interval || return
+        ctx.heartbeat[]=_dmono()
+        _dmono()-ctx.last_progress[] >= ctx.harness.limits.progress_interval || return
         text=_bounded_json(_sanitize_integration_value(value),ctx.harness.limits.progress_bytes)
         _transition!(ctx.harness;context=ctx,point=:tool_progress) do db,seq
             _exec!(db,"UPDATE claw_tasks SET progress=? WHERE id=?",(text,ctx.task_id))
         end
-        ctx.last_progress[]=ctx.harness.clock()
+        ctx.last_progress[]=_dmono()
     end
 end
 
@@ -122,7 +122,7 @@ end
 
 function _verify_invocation!(ctx)
     Agentif.check_abort(ctx.abort)
-    time()<=ctx.deadline || throw(Agentif.AbortEvaluation())
+    _dmono()<=ctx.monotonic_deadline || throw(Agentif.AbortEvaluation())
     _dread(ctx.harness) do db
         t=_done(db,"SELECT status,token,epoch,revision,cancel FROM claw_tasks WHERE id=?",(ctx.task_id,))
         epoch=_done(db,"SELECT owner_epoch FROM claw_runtime_meta WHERE id=1").owner_epoch

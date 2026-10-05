@@ -35,7 +35,7 @@ function _eligibility(h,t)
     t.kind in ("generation","compaction","filter","watcher","tool","delivery","child") || return nothing,"unknown task definition $(t.kind)"
     cp=try JSON.parse(t.checkpoint) catch; return nothing,"corrupt task checkpoint" end
     input=try JSON.parse(t.input_json) catch; return nothing,"corrupt task input" end
-    t.kind=="watcher" && h.clock()>get(input,"deadline",Inf) && return (;),nothing
+    t.kind=="watcher" && _watcher_expired!(h,t) && return (;),nothing
     if t.kind=="delivery"
         o=_dread(db->_done(db,"SELECT * FROM claw_outbox WHERE id=?",(get(input,"outbox",""),)),h)
         o===nothing && return nothing,"missing outbox intent"
@@ -71,7 +71,7 @@ end
 function _reserve!(h,t)
     lock(()->haskey(h.live,t.id),h.lock) && return nothing
     group=t.kind in ("tool","delivery") ? :tool : t.kind in ("generation","compaction","filter","watcher") && get(JSON.parse(t.checkpoint),"phase","")=="request" ? :model : :local
-    t.kind=="watcher" && h.clock()>get(JSON.parse(t.input_json),"deadline",Inf) && (group=:local)
+    t.kind=="watcher" && _watcher_expired!(h,t) && (group=:local)
     active=lock(()->count(x->x.group==group,values(h.live)),h.lock)
     group==:model && active>=h.limits.models && return nothing
     group==:tool && active>=h.limits.tools && return nothing
@@ -84,8 +84,12 @@ function _reserve!(h,t)
     end
     timeout=group==:tool ? h.limits.tool_timeout : h.limits.request_timeout
     issued=JSON.parse(t.input_json)
-    remaining=get(issued,"deadline",h.clock()+timeout)-h.clock()
-    ctx=InvocationContext(h,t.id,h.epoch,token,Ref(revision),Agentif.Abort(),time()+min(timeout,max(0,remaining)),ReentrantLock(),Ref(-Inf),Ref(time()))
+    run_key="deadline:"*something(_dnull(t.run_id),t.id)
+    maximum=t.kind=="watcher" ? get(issued,"timeout",h.limits.request_timeout) : h.limits.run_timeout
+    end_at=_deadline_timer!(h,run_key,get(issued,"deadline",h.clock()+timeout),maximum)
+    remaining=min(timeout,max(0,end_at-_dmono()))
+    ctx=InvocationContext(h,t.id,h.epoch,token,Ref(revision),Agentif.Abort(),time()+remaining,_dmono()+remaining,
+        ReentrantLock(),Ref(-Inf),Ref(_dmono()))
     return ctx,group
 end
 
@@ -178,16 +182,27 @@ function _invoke_phase!(ctx,resolved)
     end
 end
 
-function _is_due!(h,key,due)
+function _deadline_timer!(h,key,due,maximum_delay)
     wall=Float64(due)
-    saved=get(h.due_timers,key,nothing)
-    if saved===nothing || saved[1]!=wall
-        saved=(wall,time()+clamp(wall-h.clock(),0,h.limits.max_retry_delay))
-        h.due_timers[key]=saved
+    lock(h.lock) do
+        saved=get(h.due_timers,key,nothing)
+        if saved===nothing || saved[1]!=wall
+            saved=(wall,_dmono()+clamp(wall-h.clock(),0,maximum_delay))
+            h.due_timers[key]=saved
+        end
+        saved[2]
     end
+end
+function _is_due!(h,key,due)
+    end_at=_deadline_timer!(h,key,due,h.limits.max_retry_delay)
     # UTC is the restart record; a live monotonic timer prevents a wall-clock
     # correction from extending a retry indefinitely. Overdue timers run now.
-    h.clock()>=wall || time()>=saved[2]
+    h.clock()>=due || _dmono()>=end_at
+end
+function _watcher_expired!(h,t)
+    issued=JSON.parse(t.input_json)
+    due=get(issued,"deadline",Inf)
+    _dmono()>=_deadline_timer!(h,"deadline:"*t.id,due,get(issued,"timeout",h.limits.request_timeout))
 end
 
 function _ownership_ready(db,h)
@@ -210,7 +225,7 @@ function _scheduler_loop(h)
     while h.state===:open
         try
             _start_runs!(h)
-            time()>=h.supervision_due && _supervise_durable!(h)
+            _dmono()>=h.supervision_due && _supervise_durable!(h)
             needs_join=_dread(db->_ownership_ready(db,h),h)
             needs_dispatch=_dread(db->_done(db,"""SELECT e.id FROM claw_events e WHERE e.status='dispatched' AND NOT EXISTS
                 (SELECT 1 FROM claw_dispatch_members m JOIN claw_event_dispatches d ON d.id=m.dispatch_id
@@ -223,6 +238,16 @@ function _scheduler_loop(h)
                 end
             end
             tasks=_dread(db->_drows(db,"SELECT * FROM claw_tasks WHERE status='pending' AND cancel=0 ORDER BY created_seq,rowid"),h)
+            if length(h.due_timers)>256
+                ongoing=_dread(db->_drows(db,"SELECT id,run_id FROM claw_tasks WHERE status!='terminal'"),h)
+                keep=Set{String}()
+                for t in ongoing
+                    push!(keep,t.id,"deadline:"*something(_dnull(t.run_id),t.id),"supervision:"*t.id,"abort:"*t.id)
+                end
+                lock(h.lock) do
+                    filter!(p->p.first in keep,h.due_timers)
+                end
+            end
             for t in tasks
                 h.state===:open || break
                 _is_due!(h,t.id,t.due_at) || continue
@@ -249,7 +274,7 @@ function _scheduler_loop(h)
                 notify(gate)
             end
             for live in lock(()->collect(values(h.live)),h.lock)
-                time()>live.context.deadline && Agentif.abort!(live.context.abort)
+                _dmono()>live.context.monotonic_deadline && Agentif.abort!(live.context.abort)
             end
             if h.assistant!==nothing && (h.indexer===nothing || istaskdone(h.indexer))
                 job=_dread(db->_done(db,"SELECT entry_id FROM claw_index_jobs WHERE state IN ('pending','redacted') AND due_at<=? LIMIT 1",(h.clock(),)),h)
