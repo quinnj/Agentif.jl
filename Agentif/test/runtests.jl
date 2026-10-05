@@ -4411,3 +4411,5 @@ end
             content = [Agentif.TextContent(; text = "ok")], is_error = false)], model)
     @test only(m.reasoning_details for m in compacted_messages if m.role == "assistant") == current_details
 end
+
+include("turn_test.jl")

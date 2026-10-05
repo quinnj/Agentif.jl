@@ -51,6 +51,13 @@ function set_branch_leaf! end
 function lock_branch end
 function with_session_write end
 
+"""Append a batch and advance its leaf in the caller's existing SQLite transaction.
+
+No transaction, embedding, or observer is started here. Durable hosts enqueue
+index work in their same transaction. Requires the SQLite extension.
+"""
+function append_session_batch! end
+
 # ─── InMemorySessionStore implementations ───
 
 function append_entry!(store::InMemorySessionStore, entry::SessionEntry)

@@ -111,6 +111,20 @@ end
 
 # ─── Store method implementations ───
 
+function Agentif.append_session_batch!(db::SQLite.DB, branch_id::String, entries::Vector{Agentif.SessionEntry})
+    SQLite.intransaction(db) || throw(ArgumentError("session batch requires a caller-owned transaction"))
+    for entry in entries
+        SQLite.execute(db, """INSERT INTO session_entries
+            (entry_id,parent_id,created_at,entry,is_compaction,first_kept_entry_id,is_deleted,
+             user_id,channel_id,search_channel_id,channel_flags,post_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (entry.id,entry.parent_id,entry.created_at,JSON.json(entry),
+            Int(entry.is_compaction),entry.first_kept_entry_id,Int(entry.is_deleted),entry.user_id,
+            entry.channel_id,entry.search_channel_id,entry.channel_flags,entry.post_id))
+    end
+    isempty(entries) || _set_branch_leaf!(db, branch_id, last(entries).id)
+    return nothing
+end
+
 function _write_transaction(f::Function, store::SQLiteSessionStore)
     return lock(store.write_lock) do
         return store.execute_write() do db
