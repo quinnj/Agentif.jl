@@ -35,6 +35,11 @@ function tool_call_middleware(agent_handler::AgentHandler)
             f(TurnStartEvent(turn_id))
             try
                 current_state = agent_handler(f, agent, current_state, next_input, abort; kw...)
+                stop_reason = current_state.most_recent_stop_reason
+                # A failed, aborted or refused turn ends the evaluation; its calls never run.
+                if stop_reason === :error || stop_reason === :aborted || stop_reason === :refusal
+                    empty!(current_state.pending_tool_calls)
+                end
 
                 if isempty(current_state.pending_tool_calls)
                     # Warn on empty responses (no text, no tool calls) which may indicate API issues
@@ -49,8 +54,7 @@ function tool_call_middleware(agent_handler::AgentHandler)
                 @debug "Agent requested tool calls" turn_id tool_call_count = length(current_state.pending_tool_calls) tool_names = [tc.name for tc in current_state.pending_tool_calls]
                 for tc in current_state.pending_tool_calls
                     check_abort(abort)
-                    tool = findtool(agent.tools, tc.name)
-                    push!(futures, call_function_tool!(f, tool, tc))
+                    push!(futures, start_tool_call!(f, agent.tools, tc, stop_reason))
                 end
                 empty!(current_state.pending_tool_calls) # pending have been moved to futures, empty
                 empty!(tool_results) # empty tool_results before we wait on futures

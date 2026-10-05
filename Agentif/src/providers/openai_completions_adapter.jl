@@ -431,18 +431,16 @@ function openai_completions_usage_from_response(u::Union{Nothing, OpenAICompleti
     return Usage(; input = billable_input, output = total_output, cacheRead = cached, total)
 end
 
+# Failure, truncation and filtering outrank tool calls: a cut-off turn can
+# carry cut-off arguments, so its calls must not look executable. "error" is set
+# by the stream driver on HTTP errors and sent mid-stream by some providers
+# (e.g. OpenRouter).
 function openai_completions_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
-    if !isempty(tool_calls)
+    reason == "error" && return :error
+    reason == "length" && return :length
+    reason == "content_filter" && return :content_filter
+    if !isempty(tool_calls) || reason == "tool_calls" || reason == "function_call"
         return :tool_calls
-    end
-    if reason == "tool_calls" || reason == "function_call"
-        return :tool_calls
-    elseif reason == "length"
-        return :length
-    elseif reason == "stop"
-        return :stop
-    elseif reason == "content_filter"
-        return :content_filter
     end
     return :stop
 end
@@ -799,6 +797,13 @@ function openai_completions_event_callback(
                     end
                 end
             end
+        end
+        if choice.finish_reason == "error"
+            # A provider failure reported mid-stream (e.g. OpenRouter): surface it
+            # like any other provider error, with the message it carries.
+            err = get(() -> nothing, JSON.parse(data), "error")
+            msg = err isa AbstractDict ? get(() -> nothing, err, "message") : nothing
+            f(AgentErrorEvent(ErrorException(msg isa AbstractString ? msg : "provider stream ended with finish_reason \"error\"")))
         end
         return choice.finish_reason !== nothing && (latest_finish[] = choice.finish_reason)
     end

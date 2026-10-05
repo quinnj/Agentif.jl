@@ -24,7 +24,7 @@ function findtool(tools, name)
     for tool in tools
         tool.name == name && return tool
     end
-    throw(ArgumentError("invalid tool for agent: `$name`"))
+    return nothing
 end
 
 function extract_function_args(func_expr::Expr)

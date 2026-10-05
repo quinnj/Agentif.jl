@@ -470,7 +470,6 @@ function openai_codex_event_callback(
                 call = AgentToolCall(; call_id = compound_id, name = name, arguments = args)
                 push!(assistant_message.tool_calls, call)
                 push!(assistant_message.content, ToolCallContent(; id = compound_id, name, arguments = parse_tool_arguments(args)))
-                findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc))
             end

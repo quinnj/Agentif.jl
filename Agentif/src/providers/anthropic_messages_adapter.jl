@@ -546,27 +546,28 @@ function anthropic_should_resubmit_paused(reason::Union{Nothing, String}, attemp
     return isempty(assistant_message.tool_calls)
 end
 
+# Truncation and failure outrank tool calls: a cut-off turn can carry cut-off
+# arguments, so its calls must not look executable.
 function anthropic_stop_reason(reason::Union{Nothing, String}, tool_calls::Vector{AgentToolCall})
-    if !isempty(tool_calls)
-        return :tool_calls
-    end
-    if reason == "tool_use"
-        return :tool_calls
-    elseif reason == "max_tokens" || reason == "model_context_window_exceeded"
+    if reason == "max_tokens" || reason == "model_context_window_exceeded"
         return :length
+    elseif reason == "refusal"
+        # The model declined: an answer, not a failure to retry.
+        return :refusal
+    elseif reason == "error"
+        # Synthesized by the stream driver on HTTP errors.
+        return :error
+    elseif !isempty(tool_calls) || reason == "tool_use"
+        # A paused turn with client tool calls still owes us their results.
+        return :tool_calls
     elseif reason == "stop_sequence"
         return :stop
     elseif reason == "end_turn"
         return :stop
-    elseif reason == "refusal"
-        return :error
     elseif reason == "pause_turn"
         # The stream driver resubmits paused turns (bounded). Reaching here means the
         # turn is still incomplete, so never report it as a successful stop.
         return :length
-    elseif reason == "error"
-        # Synthesized by the stream driver on HTTP errors.
-        return :error
     end
     return :stop
 end
@@ -736,7 +737,6 @@ function anthropic_event_callback(
                 block.arguments = args
                 call = AgentToolCall(; call_id = block.id, name = block.name, arguments = JSON.json(args))
                 push!(assistant_message.tool_calls, call)
-                findtool(agent.tools, call.name)
                 ptc = PendingToolCall(; call_id = call.call_id, name = call.name, arguments = call.arguments)
                 f(ToolCallRequestEvent(ptc))
                 stop_on_tool_call && throw(StopStreaming("tool call arguments complete"))
