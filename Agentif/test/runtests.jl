@@ -2280,6 +2280,70 @@ end
     end
 end
 
+@testset "copies of kept messages are scrubbed with the post they came from ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
+    text_reply(text) = AssistantMessage(; provider = "test", api = "test", model = "test",
+        content = Agentif.AssistantContentBlock[Agentif.TextContent(text)])
+    # One stored entry holds two exchanges; the new run's compaction cuts inside
+    # it, so the kept exchange is copied under the new compaction.
+    function compact_inside_older_entry()
+        store = make_store()
+        append_entry!(store, SessionEntry(; id = "older-combined", run_id = "older-run", post_id = "older-post",
+            messages = AgentMessage[UserMessage("D"^400), text_reply("discarded older reply"),
+                UserMessage("K"^400), text_reply("kept older reply plugh")]))
+        set_branch_leaf!(store, "chan:copies", "older-combined")
+        server, port, hits = counting_summary_server(["OLDER-SUMMARY"])
+        try
+            handler = (f, agent, state, input, abort; kw...) ->
+                (Agentif.append_state!(state, input, text_reply("new reply"), Usage()); state.most_recent_stop_reason = :stop; state)
+            evaluate(Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 280), apikey = "k"), "new private input";
+                session_store = store, channel = SessionTestChannel("chan:copies", nothing, "new-post"), base_handler = handler,
+                compaction_config = CompactionConfig(; enabled = true, reserve_tokens = 100, keep_recent_tokens = 100))
+            @test hits[] == 1
+        finally
+            close(server)
+        end
+        @test mentions(load_branch(store, "chan:copies"), "kept older reply")
+        return store
+    end
+
+    # Scrubbing the new run keeps the older summary and the older kept exchange.
+    store = compact_inside_older_entry()
+    scrub_post!(store, "new-post")
+    loaded = load_branch(store, "chan:copies")
+    @test !mentions(loaded, "new private input")
+    @test has_summary(loaded, "OLDER-SUMMARY")
+    @test mentions(loaded, "kept older reply")
+
+    # Deleting the older post removes its copy too, from the branch and from search.
+    store = compact_inside_older_entry()
+    scrub_post!(store, "older-post")
+    loaded = load_branch(store, "chan:copies")
+    @test !mentions(loaded, "kept older reply")
+    @test isempty(Agentif.search_sessions(store, "plugh"))
+    @test mentions(loaded, "new reply")
+
+    # A cut inside the run's own first entry copies the run's own messages:
+    # scrubbing the run removes those copies and the summary of its question.
+    server, port, hits = counting_summary_server(["SUMMARY-OF-SECRET"])
+    try
+        store = make_store()
+        tool = @tool "Echo text." echo_back(text::String) = "SECRET-RESULT " * "Z"^800
+        agent = Agent(; prompt = "p", model = compaction_test_model(port; contextWindow = 1000), apikey = "k", tools = [tool])
+        handler = scripted_handler(; usage_inputs = [100, 900, 100], tool_turns = Set([2]))
+        run_eval(id, input) = evaluate(agent, input; session_store = store, base_handler = handler,
+            compaction_config = CompactionConfig(; enabled = true, reserve_tokens = 200, keep_recent_tokens = 100),
+            channel = SessionTestChannel("chan:own-copies", nothing, id))
+        run_eval("m1", "A"^400); run_eval("m2", "SECRET-QUESTION")
+        loaded = load_branch(store, "chan:own-copies")
+        @test mentions(loaded, "SECRET-RESULT") && !any(m -> message_text(m) == "SECRET-QUESTION", loaded.messages)
+        scrub_post!(store, "m2")
+        @test !mentions(load_branch(store, "chan:own-copies"), "SECRET")
+        @test isempty(Agentif.search_sessions(store, "SECRET"))
+    finally
+        close(server)
+    end
+end
+
 @testset "a refused turn leaves nothing in the session ($label)" for (label, make_store) in SESSION_STORE_FACTORIES
     store = make_store()
     refusing = Ref(false)

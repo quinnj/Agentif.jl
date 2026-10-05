@@ -266,7 +266,7 @@ end
 Append every message of `state` the store does not hold yet as one entry on
 the branch and move the branch leaf to it. When compaction ran since the last
 save, that entry hangs off a new compaction entry (and, if the cut fell inside
-a stored entry, a copy of the kept messages). A trailing assistant message
+a stored entry, copies of the kept messages). A trailing assistant message
 from a turn that ended in `:error` or `:aborted` is not persisted: that turn
 is retried, not replayed. A turn that ended in `:refusal` leaves nothing it
 added, neither its input nor the refusal: Anthropic asks callers to remove a
@@ -324,8 +324,10 @@ function persist_session!(w::SessionWriter, state::AgentState; final::Bool = fal
             end
         end
         # With no entry to point at, the kept messages the store holds are
-        # written again under the new compaction. They belong to earlier
-        # evaluations, so they carry no input key.
+        # written again under the new compaction, one copy per entry they came
+        # from. A copy keeps that entry's post, run and input key, so scrubs
+        # follow the content: deleting the copied entry's post removes the copy
+        # too, and scrubbing this run leaves another run's copy alone.
         resaved = first_kept_eid === nothing ? kept_persisted : 0
         first_kept_eid === nothing && (kept_persisted = 0)
         push!(entries, new_entry(; key = nothing, run = summarizes_run ? w.run_id : nothing,
@@ -342,11 +344,24 @@ function persist_session!(w::SessionWriter, state::AgentState; final::Bool = fal
                 push!(boundaries, EntryBoundary(b.entry_id, b.message_start - shift, b.message_end - shift, b.input_key, b.run_id))
             end
         end
-        if resaved > 0
-            push!(entries, new_entry(; key = nothing, id = _unique_entry_id(w.store, string(UID8())),
-                parent_id = entries[end].id, messages = state.messages[2:(resaved + 1)], post_id = platform_post_id))
-            push!(boundaries, EntryBoundary(entries[end].id, 2, resaved + 1, nothing, w.run_id))
+        pos = 2
+        for b in (resaved > 0 ? w.boundaries : EntryBoundary[])
+            lo = max(b.message_start, state.persisted_prefix_start)
+            hi = min(b.message_end, state.persisted_prefix_start + resaved - 1)
+            lo <= hi || continue
+            source = get_entry(w.store, b.entry_id)
+            upto = pos + hi - lo
+            push!(entries, SessionEntry(; id = _unique_entry_id(w.store, string(UID8())),
+                parent_id = entries[end].id, messages = state.messages[pos:upto], copied_from = source.id,
+                user_id = source.user_id, channel_id = source.channel_id, search_channel_id = source.search_channel_id,
+                channel_flags = source.channel_flags, post_id = source.post_id,
+                input_key = source.input_key, run_id = source.run_id))
+            push!(boundaries, EntryBoundary(entries[end].id, pos, upto, source.input_key, source.run_id))
+            pos = upto + 1
         end
+        # Every stored message belongs to exactly one entry, so the copies hold
+        # all kept messages.
+        @assert pos == resaved + 2
         # Skip the summary (1) plus the kept messages already stored or re-saved.
         first_new = kept_persisted + resaved + 2
         state.last_compaction = nothing
