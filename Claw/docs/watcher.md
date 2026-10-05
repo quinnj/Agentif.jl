@@ -70,7 +70,8 @@ event → handler → supervised_evaluate(assistant, ev, handler)
 using provider error shapes (HTTP status where available, message heuristics
 otherwise). A provider can report failure either by throwing or by returning an
 `AgentState` with stop reason `:error` after emitting an `AgentErrorEvent`; both paths
-are classified and journaled. Tool exceptions never reach the classifier — tool
+are classified and journaled. A refusal (stop reason `:refusal`) is the model's answer,
+not a failure. Tool exceptions never reach the classifier — tool
 execution converts them to error tool results inside the eval. The class is given to
 the watcher model so its note can be specific ("hit the provider's rate limit", not
 "something went wrong").
