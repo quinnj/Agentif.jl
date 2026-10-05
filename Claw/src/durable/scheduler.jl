@@ -35,6 +35,8 @@ function _eligibility(h,t)
     t.kind in ("generation","compaction","filter","watcher","tool","delivery","child") || return nothing,"unknown task definition $(t.kind)"
     cp=try JSON.parse(t.checkpoint) catch; return nothing,"corrupt task checkpoint" end
     input=try JSON.parse(t.input_json) catch; return nothing,"corrupt task input" end
+    cp isa AbstractDict || return nothing,"corrupt task checkpoint"
+    input isa AbstractDict || return nothing,"corrupt task input"
     t.kind=="watcher" && _watcher_expired!(h,t) && return (;),nothing
     if t.kind=="delivery"
         o=_dread(db->_done(db,"SELECT * FROM claw_outbox WHERE id=?",(get(input,"outbox",""),)),h)

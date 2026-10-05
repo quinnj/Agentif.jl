@@ -36,6 +36,14 @@ end
             @test last(Claw._eligibility(h,Claw._task_row(h,broken)))=="corrupt task checkpoint"
             @test JSON.parse(Claw.inspect_task(h,broken).checkpoint)["phase"]=="corrupt"
             @test only(filter(t->t.id==broken,Claw.snapshot(h,c).tasks)).phase=="corrupt"
+            Claw._dread(db->Claw._exec!(db,"UPDATE claw_tasks SET checkpoint='[]' WHERE id=?",(broken,)),h)
+            @test last(Claw._eligibility(h,Claw._task_row(h,broken)))=="corrupt task checkpoint"
+            @test JSON.parse(Claw.inspect_task(h,broken).checkpoint)["phase"]=="corrupt"
+            Claw._dread(db->Claw._exec!(db,"UPDATE claw_tasks SET checkpoint=?,input_json='[]' WHERE id=?",(JSON.json(Dict("phase"=>"execute")),broken)),h)
+            @test last(Claw._eligibility(h,Claw._task_row(h,broken)))=="corrupt task input"
+            valid=Claw.submit!(h,c,"unrelated work";request_id="compatible",mode=:write)
+            @test Claw.wait_submission(valid;timeout_s=20).reason=="passive_write"
+            @test h.state===:open
         finally Claw.close_harness!(h) end
     end
 end
