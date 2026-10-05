@@ -271,6 +271,8 @@ struct AgentAssistant
     _integrations::Dict{String, IntegrationState}
     _integrations_lock::ReentrantLock
     _health_loop_started::Base.RefValue{Bool}
+    # Held by `init!` for the runtime's lifetime; see `_acquire_owner_lock`.
+    _owner_lock::Base.RefValue{Union{Nothing, IOStream}}
 end
 
 function _new_agent_assistant(;
@@ -307,6 +309,7 @@ function _new_agent_assistant(;
         _integrations = Dict{String, IntegrationState}(),
         _integrations_lock = ReentrantLock(),
         _health_loop_started = Ref(false),
+        _owner_lock = Ref{Union{Nothing, IOStream}}(nothing),
     )
     return AgentAssistant(
         config,
@@ -342,6 +345,7 @@ function _new_agent_assistant(;
         _integrations,
         _integrations_lock,
         _health_loop_started,
+        _owner_lock,
     )
 end
 
@@ -1675,6 +1679,9 @@ include("integrations.jl")
 
 # ─── Constructor ───
 
+_resolve_db_path(db_path::String, name) =
+    isempty(db_path) ? joinpath(pwd(), "$(something(name, "claw")).sqlite") : db_path
+
 function AgentAssistant(db_path::String="";
     name::Union{Nothing, String}=nothing,
     provider::String=get(ENV, "CLAW_AGENT_PROVIDER", ""),
@@ -1689,7 +1696,7 @@ function AgentAssistant(db_path::String="";
     pipeline::PipelineConfig=PipelineConfig(),
 )
     watcher !== nothing && validate_watcher_config(watcher)
-    db_path = isempty(db_path) ? joinpath(pwd(), "$(something(name, "claw")).sqlite") : db_path
+    db_path = _resolve_db_path(db_path, name)
     db = SQLite.DB(db_path)
     _init_claw_schema!(db)
     writer = SQLiteWriter(db_path, db)
@@ -1749,56 +1756,77 @@ function init!(
     sources = event_sources === nothing ?
         lock(() -> collect(EVENT_SOURCES), EVENT_SOURCES_LOCK) :
         collect(event_sources)
-    assistant = AgentAssistant(db_path; level, kwargs...)
-    CURRENT_ASSISTANT[] = assistant
-    # Crash recovery: evals left 'running' by a previous process can never
-    # complete; flip them to failed/process_crash for post-crash forensics.
-    _with_busy_retry() do
-        _exec!(assistant.db,
-            "UPDATE claw_evals SET status = 'failed', failure_class = 'process_crash', finished_at = ? WHERE status = 'running'",
-            (time(),))
-        return nothing
+    db_path = _resolve_db_path(db_path, get(kwargs, :name, nothing))
+    owner_lock = _acquire_owner_lock(db_path)
+    assistant = try
+        AgentAssistant(db_path; level, kwargs...)
+    catch
+        owner_lock === nothing || close(owner_lock)
+        rethrow()
     end
-    # Purge ephemeral tables (re-populated from EventSources)
-    _exec!(assistant.db, "DELETE FROM claw_event_types")
-    # Re-seed event types for persisted Tempus jobs: they are only inserted at
-    # add_job time, so the purge above would otherwise orphan them (breaking
-    # list_event_types and add_event_handler validation for those types).
-    for j in Tempus.getJobs(assistant.scheduler.store)
-        et_name = "tempus_job:$(j.name)"
-        _exec!(assistant.db,
-            "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
-            (et_name, "Scheduled job: $(j.name)"))
+    assistant._owner_lock[] = owner_lock
+    try
+        CURRENT_ASSISTANT[] = assistant
+        # Crash recovery: evals left 'running' by a previous process can never
+        # complete; flip them to failed/process_crash for post-crash forensics.
+        _with_busy_retry() do
+            _exec!(assistant.db,
+                "UPDATE claw_evals SET status = 'failed', failure_class = 'process_crash', finished_at = ? WHERE status = 'running'",
+                (time(),))
+            return nothing
+        end
+        owner_lock === nothing || _reclaim_crashed_events!(assistant)
+        # Purge ephemeral tables (re-populated from EventSources)
+        _exec!(assistant.db, "DELETE FROM claw_event_types")
+        # Re-seed event types for persisted Tempus jobs: they are only inserted at
+        # add_job time, so the purge above would otherwise orphan them (breaking
+        # list_event_types and add_event_handler validation for those types).
+        for j in Tempus.getJobs(assistant.scheduler.store)
+            et_name = "tempus_job:$(j.name)"
+            _exec!(assistant.db,
+                "INSERT OR IGNORE INTO claw_event_types (name, description) VALUES (?, ?)",
+                (et_name, "Scheduled job: $(j.name)"))
+        end
+        # Auto-register LLMToolsEventSource if not already provided
+        if !any(es -> es isa LLMToolsEventSource, sources)
+            llm_es = LLMToolsEventSource(assistant.config)
+            push!(sources, llm_es)
+        end
+        regs = Tuple{EventSource, NamedTuple}[]
+        for es in sources
+            push!(regs, (es, _register_event_source_tracked!(assistant, es)))
+        end
+        append!(assistant.tools, MANAGEMENT_TOOLS)
+        append!(assistant.tools, TEMPUS_TOOLS)
+        append!(assistant.tools, DB_TOOLS)
+        append!(assistant.tools, INTEGRATION_TOOLS)
+        # §2.2: the permissive default is the one that persists, so state the exposure
+        # once per boot instead of relying on anyone remembering it. Runs after tools and
+        # handlers are registered and before any event can be dispatched.
+        _log_trust_exposure(assistant, sources)
+        Tempus.run!(assistant.scheduler)
+        assistant._scheduler_started[] = true
+        start_event_loop!(assistant; level = assistant.log_level)
+        # Crash/stuck-worker recovery before sources start producing new work.
+        _recover_events!(assistant)
+        # Name runner-passed sources under their catalog integrations, then bring up
+        # whatever the persisted enabled-set adds on top of them. Adopt before start
+        # so channels created immediately by a source task are attributed to it.
+        _adopt_explicit_integrations!(assistant, regs)
+        start_sources!(assistant, sources)
+        _reconcile_integrations!(assistant)
+        install_signal_handlers && install_shutdown_handler!(assistant)
+    catch
+        # Release what this call took, the owner lock included, so a later
+        # `init!` can open the database instead of being told another process
+        # owns it.
+        try
+            shutdown!(assistant; timeout_s = 5)
+        catch e
+            @warn "Claw: cleanup after a failed init! failed" exception = (e, catch_backtrace())
+        end
+        rethrow()
     end
-    # Auto-register LLMToolsEventSource if not already provided
-    if !any(es -> es isa LLMToolsEventSource, sources)
-        llm_es = LLMToolsEventSource(assistant.config)
-        push!(sources, llm_es)
-    end
-    regs = Tuple{EventSource, NamedTuple}[]
-    for es in sources
-        push!(regs, (es, _register_event_source_tracked!(assistant, es)))
-    end
-    append!(assistant.tools, MANAGEMENT_TOOLS)
-    append!(assistant.tools, TEMPUS_TOOLS)
-    append!(assistant.tools, DB_TOOLS)
-    append!(assistant.tools, INTEGRATION_TOOLS)
-    # §2.2: the permissive default is the one that persists, so state the exposure
-    # once per boot instead of relying on anyone remembering it. Runs after tools and
-    # handlers are registered and before any event can be dispatched.
-    _log_trust_exposure(assistant, sources)
-    Tempus.run!(assistant.scheduler)
-    assistant._scheduler_started[] = true
-    start_event_loop!(assistant; level = assistant.log_level)
-    # Crash/stuck-worker recovery before sources start producing new work.
-    _recover_events!(assistant)
-    # Name runner-passed sources under their catalog integrations, then bring up
-    # whatever the persisted enabled-set adds on top of them. Adopt before start
-    # so channels created immediately by a source task are attributed to it.
-    _adopt_explicit_integrations!(assistant, regs)
-    start_sources!(assistant, sources)
-    _reconcile_integrations!(assistant)
-    install_signal_handlers && install_shutdown_handler!(assistant)
     return assistant
 end
 

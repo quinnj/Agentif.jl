@@ -65,7 +65,8 @@ WHERE id=? AND status='pending'
 
 A claim that updates zero rows means someone else took it — skip. On boot, rows in
 `pending`, or in `running` with an expired lease, are re-enqueued; that is crash
-recovery and stuck-worker recovery in one rule.
+recovery and stuck-worker recovery in one rule. (`init!` now also returns every
+`running` row at once when it holds the database's owner lock; see §1.9.)
 
 **Ack ordering.** Sources must persist *before* acknowledging upstream. Slack's
 envelope ack, GitHub's 200, and JMAP's cursor advance all move to after the insert
@@ -97,7 +98,8 @@ Consequences we accept explicitly:
   are sent with `send_message` rather than streamed.
 - Events whose handler side effects already partially happened (crash *after* an
   external send) can duplicate that send. At-least-once means handlers should be
-  idempotent where it matters; we do not attempt exactly-once.
+  idempotent where it matters; we do not attempt exactly-once. (Narrowed by §1.9:
+  a resumed handler no longer repeats tool calls whose results were saved.)
 
 This is the honest cost of durability and is worth stating in the PR rather than
 discovering in production.
@@ -212,6 +214,49 @@ migration mechanism at all, so any column change silently breaks existing databa
   process is down is picked up, instead of seeding fresh at every startup.
 - **PTY exit codes**: report the real exit status instead of the hardcoded `0` that
   currently tells the agent a failing build succeeded.
+
+## 1.9 Resuming an evaluation after a crash
+
+Added after the Pi Durable comparison (October 2026). The pipeline above recovers
+*events*; this recovers progress *inside* an evaluation.
+
+- Agentif saves the session while the tool loop runs: a model turn that requests
+  tools is saved before any of them starts, and each tool result as soon as it is
+  known. A turn that ends in a provider error or an abort is not saved as an answer.
+- Each handler run passes `input_key = "claw-event:<event ids>:<handler id>"`. When
+  the same events reach the same handler again, the evaluation continues from its
+  last saved step instead of re-sending the prompt, or is skipped if it already
+  answered. A failed handler therefore never makes another handler on the same event
+  redo finished work.
+- Events claimed together form a batch (`claw_events.batch`, schema version 6, holds
+  the id of the first one). A retry, an abort or a restart runs every pending event of
+  the batch together again and nothing else with them, so each handler gets the same
+  events and the same key; events that arrived later run separately. A batch's events
+  are settled (done, retried, released or dead-lettered) by one write, so a crash or a
+  failed write never leaves part of a batch settled. Rows written by older binaries
+  have no batch, so one such split left before an upgrade can still rerun under a
+  smaller key once. The key still
+  covers only the events a handler kept after filtering, so a `:prompt` filter that
+  decides differently on a later attempt starts the run over instead of resuming.
+- A tool call that was running when the process died gets an error result saying
+  it was interrupted and may or may not have taken effect. It is never re-run
+  automatically; the model decides what to check and retry.
+- `init!` takes an exclusive `flock` on `<db>.lock` (released by the OS however the
+  process exits), so every `running` row belongs to a dead process and is returned to
+  `pending` at once instead of after its 900 s lease. A second process on the same
+  database fails fast. A row that has already used `unknown_max_attempts` attempts
+  (counting every attempt, not only crashes) is dead-lettered rather than retried, so
+  an event that kills the process cannot crash-loop it; no dead-letter notice is sent
+  for it, because channels are not up yet at that point. If `init!` itself fails, it
+  shuts down what it started and releases the lock before rethrowing. Windows has no
+  `flock`; there, crashed events still wait out their leases.
+
+Not covered: a model call interrupted mid-stream is sent again (possible double
+spend), an answer interrupted while streaming can be posted twice, and subagents,
+PTYs and Julia workers are process-local and lost on crash. A tool call still running
+in the background after an abort (parallel calls the loop stopped waiting for) can
+overlap the resumed run, which reports it as interrupted. `shutdown!` releases the
+lock after its drain timeout even if such work is still running in this process.
 
 ---
 
