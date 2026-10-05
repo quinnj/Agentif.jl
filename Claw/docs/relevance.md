@@ -175,9 +175,12 @@ requests may have incurred provider cost even when usage is unavailable. The
 request cap and timeouts bound this stage; they are separate from durable handler
 model/effect budgets and receipts.
 
-The PR27 legacy path has an existing limitation: changing coalesced membership
-or handler/filter configuration on retry can create a different handler input
-key and repeat work. Exact-batch Jev snapshots do not remove that limitation.
+The updated PR27 path persists claimed batch membership and settles each group
+atomically, so newly queued follow-ups remain separate on retry. Already-split
+legacy state, individually corrupt/dead-lettered members, changed prompt-filter
+verdicts or handler configuration can still change the kept-ID input key.
+Exact-batch Jev snapshots stabilize its own selection for identical inputs;
+they do not freeze existing prompt-filter verdicts or handler revisions.
 The durable dispatch bridge must freeze handler policy/revision, batch membership
 and final selected IDs alongside its existing filter/dispatch receipts before
 creating a handler run. Do not treat relevance journaling as an effect receipt.
