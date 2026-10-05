@@ -652,6 +652,42 @@ end
     end
 end
 
+@testset "a failed Gemini generation retries the event (real Google stream)" begin
+    # An empty candidate with finish reason MALFORMED_FUNCTION_CALL: generation
+    # failed, so the event must not be finished as if it had been answered.
+    body = "data: {\"candidates\":[{\"content\":{\"parts\":[],\"role\":\"model\"},\"finishReason\":\"MALFORMED_FUNCTION_CALL\",\"index\":0}]}\n\n"
+    requests = Threads.Atomic{Int}(0)
+    server = HTTP.serve!("127.0.0.1", 0) do req
+        Threads.atomic_add!(requests, 1)
+        return HTTP.Response(200, ["Content-Type" => "text/event-stream"], body)
+    end
+    try
+        Agentif.registerModel!(Agentif.Model(
+            id = "gemini-failed-generation", name = "gemini-failed-generation", api = "google-generative-ai",
+            provider = "google-failed-generation", baseUrl = "http://127.0.0.1:$(HTTP.port(server))", reasoning = false,
+            input = ["text"], cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+            contextWindow = 100000, maxTokens = 4096))
+        a = Claw.AgentAssistant(":memory:";
+            provider = "google-failed-generation", model_id = "gemini-failed-generation", apikey = "test-key",
+            timezone = "UTC", level = :error,
+            pipeline = Claw.PipelineConfig(; retry_backoff_s = [0.05], unknown_max_attempts = 2,
+                min_refire_gap_s = 0.05, scan_interval_s = 0.05, lane_backlog_warn_s = 5.0))
+        Claw.CURRENT_ASSISTANT[] = a
+        ch = RecordingChannel("gemini-failed")
+        a._channels[ch.id] = ch
+        register_test_handler!(a)
+        Claw.start_event_loop!(a)
+        id = Claw.submit_event!(a, PipelineTestEvent("hello", ch))
+        @test timedwait(() -> event_row(a, id).status in ("done", "dead"), 30.0) == :ok
+        @test event_row(a, id).status == "dead"
+        @test requests[] == 2
+        @test occursin("MALFORMED_FUNCTION_CALL", String(event_row(a, id).last_error))
+        Claw.shutdown!(a; timeout_s = 5)
+    finally
+        close(server)
+    end
+end
+
 @testset ":auth failure dead-letters without retrying" begin
     a = make_assistant(":memory:";
         retry_backoff_s = [0.05], max_attempts = 5, min_refire_gap_s = 0.05,
@@ -973,7 +1009,10 @@ init_test_assistant(path) = Claw.init!(path; search_options=(embed=nothing,),
     pipeline = Claw.PipelineConfig(; FAST...),
 )
 
-@testset "init! owns its database until shutdown!" begin
+# The owner lock is a POSIX `flock` and the crash test kills its child with
+# SIGKILL. On Windows `init!` takes no lock and does not reclaim at boot, so
+# these tests do not apply there (not run on Windows in CI).
+Sys.iswindows() || @testset "init! owns its database until shutdown!" begin
     path = tempname() * ".sqlite"
     a = init_test_assistant(path)
     try
@@ -993,7 +1032,7 @@ init_test_assistant(path) = Claw.init!(path; search_options=(embed=nothing,),
     end
 end
 
-@testset "init! returns a dead process's claims at once and dead-letters crash loops" begin
+Sys.iswindows() || @testset "init! returns a dead process's claims at once and dead-letters crash loops" begin
     path = tempname() * ".sqlite"
     seed = make_assistant(path; FAST...)
     Claw.CURRENT_ASSISTANT[] = seed
@@ -1236,7 +1275,7 @@ Claw.shutdown!(a; timeout_s = 5)
 exit(ok == :ok ? 0 : 2)
 """
 
-@testset "a handler killed mid-run resumes after restart without re-running tools" begin
+Sys.iswindows() || @testset "a handler killed mid-run resumes after restart without re-running tools" begin
     dir = mktempdir()
     path = joinpath(dir, "claw.sqlite")
     marker = joinpath(dir, "marker.txt")

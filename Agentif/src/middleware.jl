@@ -269,11 +269,11 @@ save, that entry hangs off a new compaction entry (and, if the cut fell inside
 a stored entry, copies of the kept messages). A trailing assistant message
 from a turn that ended in `:error` or `:aborted` is not persisted: that turn
 is retried, not replayed. A turn that ended in `:refusal` leaves nothing it
-added, neither its input nor the refusal: Anthropic asks callers to remove a
-refused turn before continuing, or later requests are refused too. The `final`
-save of an evaluation takes the platform post id as its entry id, so a fork
-from that post (e.g. a thread reply) sees the whole exchange; earlier saves get
-fresh ids.
+added, neither its input nor the refusal, so later turns do not carry the
+refused request (a local choice; a tool round saved before the refusal stays).
+The `final` save of an evaluation takes the platform post id as its entry id,
+so a fork from that post (e.g. a thread reply) sees the whole exchange; earlier
+saves get fresh ids.
 """
 function persist_session!(w::SessionWriter, state::AgentState; final::Bool = false)
     compacted = state.last_compaction !== nothing
