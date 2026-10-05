@@ -19,6 +19,9 @@ using Test,JSON
                 process=Base.run(pipeline(cmd;stdout=io,stderr=io);wait=false)
                 timedwait(()->isfile(marker)||process_exited(process),100;pollint=.05)
                 if isfile(marker)
+                    if scenario=="summary" && cut=="after_compaction_prepare"
+                        @test !isfile(counter)
+                    end
                     kill(process,Base.SIGKILL);wait(process);crashed=process.termsignal==9
                 else
                     process_running(process) && kill(process,Base.SIGKILL)
