@@ -56,8 +56,10 @@ jev = Claw.JevConfig(client; allowed_sources=["github", "slack", "msteams"])
 # Pass jev=jev to Claw.init! or Claw.AgentAssistant.
 ```
 
-The repository pins JevSDK v1.0.0's verified release commit in its project sources
-and portable manifest. Its required HTTP/JSON versions replace the older manifest
+The repository pins the verified JevSDK main commit 5050431 in its project sources
+and portable manifest. Its package version remains 1.0.0; the published v1.0.0
+tag still points to the earlier aebbed release tree. This is an exact source
+snapshot pin, not a 1.0.1 release. Its required HTTP/JSON versions replace the older manifest
 pins; unrelated package versions are preserved. Before registry availability,
 use the repository environment's source pins rather than guessing a registered
 package version.
@@ -139,11 +141,12 @@ SDK connect and request timeouts must each be at most two seconds. There are no
 SDK retries in this stage. Cancellation is checked before and after the call;
 an in-progress transport ends according to its SDK timeouts.
 
-The adapter validates raw probability tokens before typed decoding: the released
-JevSDK v1 JSON conversion accepts a boolean as a float, which could otherwise
-turn malformed output into a confident exclusion. It uses the release-pinned
-SDK's `_validate` and `_request` helpers for that guard and preserves the SDK's
-transport/credential behavior. Upgrading the SDK requires reviewing this internal
+The adapter validates raw probability tokens before typed decoding. The original
+JevSDK v1.0.0 release accepts a boolean as a float, which could turn malformed
+output into a confident exclusion. The pinned main snapshot now rejects Boolean
+numeric tokens upstream; Claw retains its own fail-open raw guard for compatibility
+with the original release. It uses the pinned SDK's `_validate` and `_request`
+helpers and preserves the SDK's transport/credential behavior. Upgrading the SDK requires reviewing this internal
 API coupling; a strict decoder or supported raw-response hook upstream would
 remove it. Boolean probabilities and confidence pass through as failures.
 
