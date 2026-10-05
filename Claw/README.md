@@ -2,6 +2,10 @@
 
 `Claw` is the event-driven assistant app layer built on top of `Agentif` and `LLMTools`.
 
+Opt-in `durable=true` adds committed input receipts, model/tool recovery, owned
+children, compaction and outbound delivery. See [the durable runtime guide](docs/durable.md)
+for APIs, migration, operator recovery and guarantees.
+
 It combines:
 
 - SQLite-backed assistant/session state
