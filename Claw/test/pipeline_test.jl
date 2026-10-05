@@ -1005,7 +1005,10 @@ init_test_assistant(path) = Claw.init!(path;
     pipeline = Claw.PipelineConfig(; FAST...),
 )
 
-@testset "init! owns its database until shutdown!" begin
+# The owner lock is a POSIX `flock` and the crash test kills its child with
+# SIGKILL. On Windows `init!` takes no lock and does not reclaim at boot, so
+# these tests do not apply there (not run on Windows in CI).
+Sys.iswindows() || @testset "init! owns its database until shutdown!" begin
     path = tempname() * ".sqlite"
     a = init_test_assistant(path)
     try
@@ -1025,7 +1028,7 @@ init_test_assistant(path) = Claw.init!(path;
     end
 end
 
-@testset "init! returns a dead process's claims at once and dead-letters crash loops" begin
+Sys.iswindows() || @testset "init! returns a dead process's claims at once and dead-letters crash loops" begin
     path = tempname() * ".sqlite"
     seed = make_assistant(path; FAST...)
     Claw.CURRENT_ASSISTANT[] = seed
@@ -1266,7 +1269,7 @@ Claw.shutdown!(a; timeout_s = 5)
 exit(ok == :ok ? 0 : 2)
 """
 
-@testset "a handler killed mid-run resumes after restart without re-running tools" begin
+Sys.iswindows() || @testset "a handler killed mid-run resumes after restart without re-running tools" begin
     dir = mktempdir()
     path = joinpath(dir, "claw.sqlite")
     marker = joinpath(dir, "marker.txt")
