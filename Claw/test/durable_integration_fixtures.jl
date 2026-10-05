@@ -36,10 +36,10 @@ Claw.get_channel(e::DurableEvent)=e.channel
 Claw.event_content(e::DurableEvent)=e.text
 Claw.event_extra(e::DurableEvent)=Dict{String,Any}("source_id"=>e.channel.post)
 
-function attached_fixture(path;stream=durable_stream,embed=nothing,watcher=nothing,limits=Claw.HarnessLimits(;retry_delays=[.01,.01,.01,.01]))
+function attached_fixture(path;stream=durable_stream,embed=nothing,watcher=nothing,jev=nothing,limits=Claw.HarnessLimits(;retry_delays=[.01,.01,.01,.01]))
     Agentif.registerModel!(durable_model())
     a=Claw.AgentAssistant(path;provider="test",model_id="durable-test",apikey="secret-test-key",
-        base_dir=dirname(path),search_options=(;embed),level=:error,watcher)
+        base_dir=dirname(path),search_options=(;embed),level=:error,watcher,jev)
     h=Claw.open_harness(a;stream_fn=stream,limits,compaction=Agentif.CompactionConfig(;enabled=false))
     Claw._register_native_delivery!(h,a)
     a,h
