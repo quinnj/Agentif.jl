@@ -50,6 +50,12 @@ else
     end
     stream=(f,a,s,input,abort;kw...)->begin
         msg=if a.prompt==Agentif.COMPACTION_SUMMARY_PROMPT
+            # The scheduler may discover the committed child before the parent's
+            # post-prepare fault callback runs. Hold this synthetic provider at
+            # the request boundary until SIGKILL so this cut precedes any summary.
+            if mode=="crash" && cut=="after_compaction_prepare"
+                while true;sleep(.05);end
+            end
             graph_counter("summary");durable_message(a,"committed summary")
         elseif a.prompt=="child"
             graph_counter("child");durable_message(a,"child answer")
