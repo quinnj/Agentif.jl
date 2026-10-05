@@ -39,6 +39,8 @@ Base.@kwdef struct PipelineConfig
     lane_backlog_warn_s::Float64 = 2.0
     "Max events one lane drain coalesces into a single evaluation (1 disables)."
     max_coalesce::Int = 8
+    "Burst collection window in seconds (0 preserves opportunistic draining; at most 2)."
+    coalesce_window_s::Float64 = 0.0
     "Retire an idle lane (and its worker task) after this long with no work."
     lane_idle_timeout_s::Float64 = 300.0
     "Emit at most one PTY output event per this interval."
