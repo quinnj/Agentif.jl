@@ -310,13 +310,6 @@ function close_readers!(p::ReaderPool)
     return nothing
 end
 
-# ─── Schema migrations (PRAGMA user_version) ───
-#
-# Version 1 == the implicit schema that shipped before this file existed. Any
-# database opened by an older Claw is at user_version 0 and is stamped to 1 after
-# the baseline tables are (idempotently) created, so the ladder below is the only
-# thing that ever has to change a live database.
-
 # ─── Runtime ownership ───
 
 const LOCK_EX = Cint(2)
@@ -337,13 +330,22 @@ function _acquire_owner_lock(db_path::String)
     path = (isfile(db_path) ? realpath(db_path) : abspath(db_path)) * ".lock"
     io = open(path, "w")
     if ccall(:flock, Cint, (Cint, Cint), fd(io), LOCK_EX | LOCK_NB) != 0
+        err = Libc.errno()
         close(io)
+        err == Libc.EAGAIN || systemerror("Claw: cannot lock $(path)", err)
         error("Claw: another process is already running on $(db_path) (lock file $(path))")
     end
     return io
 end
 
-const CLAW_SCHEMA_VERSION = 5
+# ─── Schema migrations (PRAGMA user_version) ───
+#
+# Version 1 == the implicit schema that shipped before this file existed. Any
+# database opened by an older Claw is at user_version 0 and is stamped to 1 after
+# the baseline tables are (idempotently) created, so the ladder below is the only
+# thing that ever has to change a live database.
+
+const CLAW_SCHEMA_VERSION = 6
 
 function _is_sensitive_integration_key(key)
     normalized = replace(lowercase(String(key)), r"[^a-z0-9]" => "")
@@ -484,8 +486,19 @@ function _migration_5!(db::SQLite.DB)
     return nothing
 end
 
+# Events claimed together carry the first one's id in `batch`, so a retry or a
+# restart runs exactly those events together again: same handler input, same
+# resume key (see `_process_event_batch!`). NULL until a row is first claimed.
+function _migration_6!(db::SQLite.DB)
+    _column_exists(db, "claw_events", "batch") ||
+        _exec!(db, "ALTER TABLE claw_events ADD COLUMN batch INTEGER")
+    _exec!(db, "CREATE INDEX IF NOT EXISTS idx_claw_events_batch ON claw_events(batch)")
+    return nothing
+end
+
 const CLAW_MIGRATIONS = Dict{Int, Function}(
-    2 => _migration_2!, 3 => _migration_3!, 4 => _migration_4!, 5 => _migration_5!)
+    2 => _migration_2!, 3 => _migration_3!, 4 => _migration_4!, 5 => _migration_5!,
+    6 => _migration_6!)
 
 """
     _migrate_claw_schema!(db)

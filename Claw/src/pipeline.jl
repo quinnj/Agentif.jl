@@ -415,17 +415,18 @@ function _writer_txn(f::Function, assistant::AgentAssistant)
 end
 
 """
-    _claim_event!(assistant, id) -> Union{Nothing, EventRow}
+    _claim_event!(assistant, id; batch = nothing) -> Union{Nothing, EventRow}
 
 Conditional claim. `nothing` means the row was not `pending` — another worker took
-it, or it already finished.
+it, or it already finished. A row claimed for the first time joins `batch`, the
+group it runs with from now on (see `_process_event_batch!`).
 """
-function _claim_event!(assistant::AgentAssistant, id::Int)
+function _claim_event!(assistant::AgentAssistant, id::Int; batch::Union{Nothing, Int} = nothing)
     lease = time() + assistant.pipeline.lease_duration_s
     return _writer_txn(assistant) do db
         _exec!(db,
-            "UPDATE claw_events SET status='running', attempts=attempts+1, lease_expires_at=? WHERE id=? AND status='pending'",
-            (lease, id))
+            "UPDATE claw_events SET status='running', attempts=attempts+1, lease_expires_at=?, batch=COALESCE(batch, ?) WHERE id=? AND status='pending'",
+            (lease, batch, id))
         Int(_scalar(db, "SELECT changes()")) == 0 && return nothing
         result = nothing
         for row in SQLite.DBInterface.execute(db,
@@ -656,21 +657,27 @@ end
 """
     _process_event_batch!(assistant, ids)
 
-Claim and process one lane drain. Event ids are split into runs of
-consecutive rows with the same event name. Each run is claimed only when the
-prior run is complete, so it does not spend its lease waiting for another event
-type. Its events go through the group's handler filters individually, and the
-survivors are folded into a single coalesced evaluation per handler.
+Claim and process one lane drain. Event ids are split into runs of consecutive
+rows with the same event name and the same batch. Each run is claimed only when
+the prior run is complete, so it does not spend its lease waiting for another
+event type. Its events go through the group's handler filters individually, and
+the survivors are folded into a single coalesced evaluation per handler.
+
+Rows claimed together form a batch (`claw_events.batch`) and keep it. A retry
+or a restart runs every pending row of the batch together again, and nothing
+else with them, so each handler gets the same events and the same resume key
+(`input_key` in `_process_claimed_group!`) instead of starting over.
 """
-function _pending_event_name(assistant::AgentAssistant, id::Int)
+function _pending_event_group(assistant::AgentAssistant, id::Int)
     return try
         with_read(assistant._readers) do db
-            name = nothing
+            group = nothing
             for row in SQLite.DBInterface.execute(db,
-                    "SELECT name, status FROM claw_events WHERE id = ?", (id,))
-                String(row.status) == "pending" && (name = String(row.name))
+                    "SELECT name, status, batch FROM claw_events WHERE id = ?", (id,))
+                String(row.status) == "pending" &&
+                    (group = (String(row.name), row.batch === missing ? nothing : Int(row.batch)))
             end
-            return name
+            return group
         end
     catch e
         @error "Claw: failed to resolve event name" event_id = id exception = (e, catch_backtrace())
@@ -678,15 +685,21 @@ function _pending_event_name(assistant::AgentAssistant, id::Int)
     end
 end
 
-function _process_event_run!(assistant::AgentAssistant, ids::Vector{Int})
+_pending_batch_members(assistant::AgentAssistant, batch::Int) = with_read(assistant._readers) do db
+    [Int(r.id) for r in SQLite.DBInterface.execute(db,
+        "SELECT id FROM claw_events WHERE batch = ? AND status = 'pending' ORDER BY id", (batch,))]
+end
+
+function _process_event_run!(assistant::AgentAssistant, ids::Vector{Int}, batch::Union{Nothing, Int} = nothing)
     if assistant._state[] !== :running
         foreach(id -> _clear_wakeup!(assistant, id), ids)
         return nothing
     end
+    batch === nothing || (ids = sort!(union(ids, _pending_batch_members(assistant, batch))))
     claimed = Tuple{EventRow, Event}[]
     for id in ids
         row = try
-            _claim_event!(assistant, id)
+            _claim_event!(assistant, id; batch = something(batch, id))
         catch e
             @error "Claw: claim failed" event_id = id exception = (e, catch_backtrace())
             nothing
@@ -695,6 +708,8 @@ function _process_event_run!(assistant::AgentAssistant, ids::Vector{Int})
             _clear_wakeup!(assistant, id)
             continue
         end
+        # The first row this run claims names its batch.
+        batch === nothing && (batch = row.id)
 
         ev = lock(assistant._live_lock) do
             get(assistant._live_events, id, nothing)
@@ -735,21 +750,21 @@ end
 
 function _process_event_batch!(assistant::AgentAssistant, ids::Vector{Int})
     run = Int[]
-    run_name = nothing
+    run_group = nothing
     for id in ids
-        name = _pending_event_name(assistant, id)
-        if name === nothing
+        group = _pending_event_group(assistant, id)
+        if group === nothing
             _clear_wakeup!(assistant, id)
             continue
         end
-        if run_name !== nothing && name != run_name
-            _process_event_run!(assistant, run)
+        if run_group !== nothing && group != run_group
+            _process_event_run!(assistant, run, run_group[2])
             empty!(run)
         end
-        run_name = name
+        run_group = group
         push!(run, id)
     end
-    isempty(run) || _process_event_run!(assistant, run)
+    isempty(run) || _process_event_run!(assistant, run, run_group[2])
     return nothing
 end
 
@@ -967,8 +982,10 @@ end
 Boot recovery under the owner lock: every `running` row was claimed by a process
 that has since died, so return it to `pending` now instead of waiting out its
 lease. Its handlers resume from their session checkpoints (see `input_key` in
-`_process_claimed_group!`). A row that has used up its attempts is dead-lettered
-instead, so an event that kills the process cannot crash-loop it.
+`_process_claimed_group!`). A row that has already used `unknown_max_attempts`
+attempts (of any kind, not only crashes) is dead-lettered instead, so an event
+that kills the process cannot crash-loop it. No dead-letter notice is sent for
+it: channels are not available this early in `init!`.
 """
 function _reclaim_crashed_events!(assistant::AgentAssistant)
     now = time()
@@ -977,9 +994,10 @@ function _reclaim_crashed_events!(assistant::AgentAssistant)
         _exec!(db, """
             UPDATE claw_events
             SET status = 'dead', lease_expires_at = NULL,
-                last_error = 'process_crash: the process died while handling this event ' || attempts || ' times'
+                last_error = 'process_crash: the process stopped while handling this event, after ' ||
+                    attempts || ' attempts (limit ' || ? || ')'
             WHERE status = 'running' AND attempts >= ?
-        """, (max_attempts,))
+        """, (max_attempts, max_attempts))
         _exec!(db, """
             UPDATE claw_events SET status = 'pending', lease_expires_at = NULL, next_attempt_at = ?
             WHERE status = 'running'

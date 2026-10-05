@@ -1027,10 +1027,70 @@ end
     end
 end
 
+struct BrokenSource <: Claw.EventSource end
+Claw.get_channels(::BrokenSource) = error("broken source")
+
+@testset "a failed init! releases the database" begin
+    path = tempname() * ".sqlite"
+    try
+        @test_throws ErrorException Claw.init!(path;
+            event_sources = Claw.EventSource[BrokenSource()],
+            provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
+            level = :error, install_signal_handlers = false, pipeline = Claw.PipelineConfig(; FAST...))
+        a = init_test_assistant(path)
+        @test a._state[] == :running
+        Claw.shutdown!(a; timeout_s = 5)
+    finally
+        remove_db(path)
+    end
+end
+
+@testset "events claimed together stay together on a retry or restart" begin
+    a = make_assistant(":memory:"; FAST...)
+    Claw.CURRENT_ASSISTANT[] = a
+    a._state[] = :running
+    ch = RecordingChannel("batch-lane")
+    a._channels[ch.id] = ch
+    register_test_handler!(a)
+    keys = String[]
+    submit(text) = Claw.submit_event!(a, PipelineTestEvent(text, ch))
+    batch_of(id) = Claw._fetch_one(a.db, "SELECT batch FROM claw_events WHERE id = ?", (id,)).batch
+    # Rows a previous attempt claimed together and then lost (crash, failure, abort).
+    interrupted!(ids...) = Claw.execute_write(a._writer,
+        "UPDATE claw_events SET status = 'pending', batch = ? WHERE id IN ($(join(ids, ",")))", (first(ids),))
+    key(ids...) = "claw-event:$(join(ids, ",")):pipeline_test_handler"
+    with_handler((assistant, ev, handler; input_key, kwargs...) -> (push!(keys, input_key); nothing)) do
+        # Fresh rows in one drain run together and become one batch.
+        e1, e2 = submit("one"), submit("two")
+        Claw._process_event_batch!(a, [e1, e2])
+        @test keys == [key(e1, e2)]
+        @test batch_of(e1) == batch_of(e2) == e1
+
+        # An interrupted single event does not absorb a queued follow-up.
+        empty!(keys)
+        e3, e4 = submit("three"), submit("four")
+        interrupted!(e3)
+        Claw._process_event_batch!(a, [e3, e4])
+        @test keys == [key(e3), key(e4)]
+
+        # An interrupted pair keeps its key next to a new event, even when the
+        # drain holds only part of the pair.
+        empty!(keys)
+        e5, e6, e7 = submit("five"), submit("six"), submit("seven")
+        interrupted!(e5, e6)
+        Claw._process_event_batch!(a, [e5, e7])
+        Claw._process_event_batch!(a, [e6])
+        @test keys == [key(e5, e6), key(e7)]
+    end
+    Claw.shutdown!(a; timeout_s = 5)
+end
+
 # The crash test runs this script twice, each time in a fresh process: first in
 # "crash" mode, where the `die` tool kills the process mid-run, then in
-# "recover" mode on the same database. The scripted model calls `mark`, then
-# `die`, then answers once it has two tool results.
+# "recover" mode on the same database. The scripted model calls `mark` when asked
+# to "do the work", then `die`, then answers once it has two tool results; any
+# other request gets "ok". In crash mode `mark` also queues a follow-up event on
+# the same lane, so recovery must not fold it into the interrupted run.
 const CRASH_TEST_SCRIPT = raw"""
 using Agentif, Claw
 
@@ -1048,17 +1108,27 @@ Claw.get_name(::CrashTestEvent) = "crash_test_event"
 Claw.event_content(ev::CrashTestEvent) = ev.content
 
 note(line) = open(io -> println(io, line), MARKER, "a")
-const MARK = @tool "Record a mark." mark() = (note("mark"); "marked")
+const MARK = @tool "Record a mark." mark() = begin
+    note("mark")
+    MODE == "crash" && Claw.submit_event!(Claw.CURRENT_ASSISTANT[], CrashTestEvent("and then the follow-up"))
+    "marked"
+end
 const DIE = MODE == "crash" ?
     (@tool "Die." die() = (ccall(:kill, Cint, (Cint, Cint), getpid(), 9); "unreachable")) :
     (@tool "Die." die() = (note("die"); "died"))
 
 function scripted_model(f, agent, state, input, abort; kw...)
     msg = Agentif.AssistantMessage(; provider = "test", api = "test", model = "test")
-    n = count(m -> m isa Agentif.ToolResultMessage, state.messages)
-    if n < 2
-        name = n == 0 ? "mark" : "die"
-        push!(msg.tool_calls, Agentif.AgentToolCall(; call_id = "call-$name", name, arguments = "{}"))
+    last_user = something(findlast(m -> m isa Agentif.UserMessage, state.messages), 0)
+    n = count(m -> m isa Agentif.ToolResultMessage, state.messages[(last_user + 1):end])
+    if input isa AbstractString
+        if occursin("do the work", input)
+            push!(msg.tool_calls, Agentif.AgentToolCall(; call_id = "call-mark-$(length(state.messages))", name = "mark", arguments = "{}"))
+        else
+            Agentif.append_text!(msg, "ok")
+        end
+    elseif n < 2
+        push!(msg.tool_calls, Agentif.AgentToolCall(; call_id = "call-die-$(length(state.messages))", name = "die", arguments = "{}"))
     else
         Agentif.append_text!(msg, "recovered")
     end
@@ -1086,7 +1156,7 @@ if MODE == "crash"
     sleep(120)  # the `die` tool kills the process long before this
     exit(1)
 end
-done() = Claw._fetch_one(a.db, "SELECT status FROM claw_events").status == "done"
+done() = Int(Claw._fetch_one(a.db, "SELECT COUNT(*) AS n FROM claw_events WHERE status != 'done'").n) == 0
 ok = timedwait(done, 60.0)
 Claw.shutdown!(a; timeout_s = 5)
 exit(ok == :ok ? 0 : 2)
@@ -1100,7 +1170,7 @@ exit(ok == :ok ? 0 : 2)
     write(script, CRASH_TEST_SCRIPT)
     log = joinpath(dir, "child.log")
     run_script(mode) = Base.run(Base.pipeline(
-        ignorestatus(`$(Base.julia_cmd()) --project=$(Base.active_project()) --startup-file=no $script $mode $path $marker`);
+        ignorestatus(`$(Base.julia_cmd()) --threads=1 --project=$(Base.active_project()) --startup-file=no $script $mode $path $marker`);
         stdout = log, stderr = log, append = true))
 
     crashed = run_script("crash")
@@ -1108,7 +1178,8 @@ exit(ok == :ok ? 0 : 2)
     @test readlines(marker) == ["mark"]
 
     # A fresh process recovers under the default 900 s lease: the event is
-    # reclaimed at boot and its handler resumes from the session checkpoints.
+    # reclaimed at boot and its handler resumes from the session checkpoints,
+    # and the follow-up queued before the crash then runs on its own.
     recovered = run_script("recover")
     @test recovered.exitcode == 0
     recovered.exitcode == 0 || println(read(log, String))
@@ -1117,11 +1188,14 @@ exit(ok == :ok ? 0 : 2)
 
     store = Agentif.SQLiteSessionStore(path; embed = nothing)
     history = Agentif.load_branch(store, "handler:crash-test").messages
-    @test [typeof(m) for m in history] ==
-        [UserMessage, AssistantMessage, ToolResultMessage, AssistantMessage, ToolResultMessage, AssistantMessage]
+    @test [typeof(m) for m in history] == [UserMessage, AssistantMessage, ToolResultMessage, AssistantMessage,
+        ToolResultMessage, AssistantMessage, UserMessage, AssistantMessage]
+    @test occursin("do the work", message_text(history[1]))
     @test message_text(history[3]) == "marked"
     @test history[5].is_error && occursin("tool_call_interrupted", message_text(history[5]))
-    @test message_text(history[end]) == "recovered"
+    @test message_text(history[6]) == "recovered"
+    @test occursin("and then the follow-up", message_text(history[7])) && !occursin("do the work", message_text(history[7]))
+    @test message_text(history[8]) == "ok"
     close(store.db)
 end
 
