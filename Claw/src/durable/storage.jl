@@ -89,19 +89,27 @@ function _durable_migration_10!(db)
 end
 merge!(CLAW_MIGRATIONS, Dict(7 => _durable_migration_7!, 8 => _durable_migration_8!, 9 => _durable_migration_9!, 10 => _durable_migration_10!))
 
+struct TransitionBatch{F<:Function}
+    apply::F
+    context::Union{Nothing,InvocationContext}
+    point::Symbol
+end
+
 """Internal mutation boundary. Only deterministic SQL belongs in its callback.
 
 Commit outcome/adoption uncertainty poisons the harness. A known rolled-back
 precommit rejection can be retried. Progress/final callbacks share the same fence.
 """
 function _transition!(f::Function, h::Harness; context = nothing, point::Symbol = :transition)
+    batch=TransitionBatch(f,context,point)
     context === nothing || return lock(context.lock) do
-        _transition_unlocked!(f, h, context, point)
+        _transition_unlocked!(batch, h)
     end
-    return _transition_unlocked!(f, h, nothing, point)
+    return _transition_unlocked!(batch, h)
 end
 
-function _transition_unlocked!(f, h, ctx, point)
+function _transition_unlocked!(batch::TransitionBatch, h)
+    f,ctx,point=batch.apply,batch.context,batch.point
     h.state === :poisoned && throw(HarnessPoisoned())
     h.state === :closed && error("harness is closed")
     committed = Ref(false)

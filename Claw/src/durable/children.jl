@@ -70,6 +70,26 @@ function _register_subagent_adapters!(tools)
     tools
 end
 
+function _child_notification!(h,parent,resolved,name,prompt)
+    h.assistant===nothing && return nothing
+    event_type="subagent:$(parent.conversation_id):$name"
+    route=_dread(db->JSON.parse(_done(db,"SELECT routing FROM claw_conversations WHERE id=?",(parent.conversation_id,)).routing),h)
+    _dread(h) do db
+        _exec!(db,"INSERT OR IGNORE INTO claw_event_types(name,description) VALUES(?,?)",(event_type,"Durable child completion: $name"))
+    end
+    register_event_handler!(h.assistant,EventHandler(event_type,[event_type],prompt,get(route,"channel_id",nothing);
+        trust=Symbol(resolved.profile["trust"]),tools=String[m["name"] for m in resolved.profile["tools"]]))
+    event_type
+end
+
+function _restore_child_event_types!(h)
+    _dread(h) do db
+        for a in _drows(db,"SELECT name,event_type FROM claw_child_aliases WHERE event_type IS NOT NULL")
+            _exec!(db,"INSERT OR IGNORE INTO claw_event_types(name,description) VALUES(?,?)",(a.event_type,"Durable child completion: $(a.name)"))
+        end
+    end
+end
+
 function _subagent_operation!(operation,args,ctx)
     h=ctx.harness
     parent=_task_row(h,ctx.task_id)
@@ -82,14 +102,7 @@ function _subagent_operation!(operation,args,ctx)
         profile=register_profile!(h,child;specs,environment=resolved.env,trust=Symbol(resolved.profile["trust"]),
             credential_ref=resolved.profile["credential_ref"])
         sync=args.run_sync===true
-        event_type=h.assistant===nothing ? nothing : "subagent:$(parent.conversation_id):$(args.name)"
-        if event_type!==nothing && !sync
-            route=_dread(db->JSON.parse(_done(db,"SELECT routing FROM claw_conversations WHERE id=?",(parent.conversation_id,)).routing),h)
-            prompt=something(args.prompt,"Sub-agent '$(args.name)' output")
-            handler=EventHandler(event_type,[event_type],prompt,get(route,"channel_id",nothing);
-                trust=Symbol(resolved.profile["trust"]),tools=String[m["name"] for m in resolved.profile["tools"]])
-            register_event_handler!(h.assistant,handler)
-        end
+        event_type=sync ? nothing : _child_notification!(h,parent,resolved,args.name,something(args.prompt,"Sub-agent '$(args.name)' output"))
         created=create_owned_child!(ctx;creation_key="launch:$(ctx.task_id)",name=args.name,profile,input=args.input_message,
             event_type=sync ? nothing : event_type,owner_task=sync ? nothing : _dnull(parent.owner_task))
         return sync ? OwnedToolWait(created.task,"Sub-agent '$(args.name)' completed.") :
@@ -98,13 +111,16 @@ function _subagent_operation!(operation,args,ctx)
         alias=_dread(db->_done(db,"SELECT * FROM claw_child_aliases WHERE conversation_id=? AND name=?",(parent.conversation_id,args.name)),h)
         alias===nothing && throw(ArgumentError("unknown child alias"))
         sync=args.run_sync===true
+        mode=Symbol(args.mode)
+        mode in (:followup,:steer) || throw(ArgumentError("child message mode must be followup or steer"))
+        event_type=sync ? nothing : _child_notification!(h,parent,resolved,args.name,"Sub-agent '$(args.name)' output")
         wrapper=_transition!(h;context=ctx,point=:child_followup) do db,seq
             c=_done(db,"SELECT * FROM claw_conversations WHERE id=?",(alias.child_id,))
-            receipt=_admit!(db,seq,c,Agentif.UserMessage(args.input_message),"message:$(ctx.task_id)",:followup,Dict("owner"=>ctx.task_id),c.profile_id)
+            receipt=_admit!(db,seq,c,Agentif.UserMessage(args.input_message),"message:$(ctx.task_id)",mode,Dict("owner"=>ctx.task_id),c.profile_id)
             wrapper=_task_create!(db,seq,parent.conversation_id,"child","message:$(ctx.task_id)";owner=sync ? ctx.task_id : _dnull(parent.owner_task),
                 input=Dict("profile"=>c.profile_id,"child"=>c.id),checkpoint=Dict("phase"=>"join","submission"=>receipt))
             _exec!(db,"UPDATE claw_conversations SET owner_task=? WHERE id=?",(wrapper,c.id))
-            _exec!(db,"UPDATE claw_child_aliases SET task_id=? WHERE conversation_id=? AND name=?",(wrapper,parent.conversation_id,args.name))
+            _exec!(db,"UPDATE claw_child_aliases SET task_id=?,event_type=? WHERE conversation_id=? AND name=?",(wrapper,event_type,parent.conversation_id,args.name))
             wrapper
         end
         return sync ? OwnedToolWait(wrapper,"Sub-agent '$(args.name)' responded.") : Agentif.ToolOutcome("Message queued for durable sub-agent '$(args.name)'.")

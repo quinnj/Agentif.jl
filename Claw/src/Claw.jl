@@ -1958,6 +1958,7 @@ function init!(
         _log_trust_exposure(assistant, sources)
         if durable
             h = open_harness(assistant;harness_options...)
+            _restore_child_event_types!(h)
             _register_native_delivery!(h,assistant)
         end
         Tempus.run!(assistant.scheduler)
