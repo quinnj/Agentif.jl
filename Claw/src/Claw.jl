@@ -1647,12 +1647,21 @@ function _run_event_handler!(
         return nothing
     end
     input = make_prompt(handler.prompt, ev)
-    if abort === nothing
-        evaluate(assistant, input; channel = ch, level = level, tools = tools, eval_kw...)
+    observed_error = Ref{Union{Nothing, Exception}}(nothing)
+    observer = event -> (event isa Agentif.AgentErrorEvent && (observed_error[] = event.error); nothing)
+    state = if abort === nothing
+        evaluate(assistant, input; channel = ch, level = level, tools = tools, observer, eval_kw...)
     else
-        evaluate(assistant, input; channel = ch, level = level, tools = tools, abort = abort, eval_kw...)
+        evaluate(assistant, input; channel = ch, level = level, tools = tools, abort = abort, observer, eval_kw...)
     end
     @debug "Claw handler evaluate end" handler_id = handler.id event_name = get_name(ev)
+    # A provider failure can end the evaluation normally, with a stop reason of
+    # :error (usually after an AgentErrorEvent). The pipeline must still see it
+    # as a failure, or the event is marked done and never retried. A refusal
+    # ends with :refusal instead: that is the model's answer.
+    if pipeline_managed && state.most_recent_stop_reason === :error
+        throw(something(observed_error[], ErrorException("evaluation ended with stop reason :error")))
+    end
     return nothing
 end
 
