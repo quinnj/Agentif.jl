@@ -27,6 +27,7 @@ struct EntryBoundary
     message_start::Int  # 1-based index into state.messages
     message_end::Int
     input_key::Union{Nothing, String}
+    run_id::Union{Nothing, String}
 end
 
 mutable struct InMemorySessionStore <: SessionStore
@@ -195,7 +196,7 @@ function load_branch_with_boundaries(store::SessionStore, branch_id::String)
         apply_session_entry!(state, entry)
         end_idx = length(state.messages)
         if end_idx >= start_idx
-            push!(boundaries, EntryBoundary(entry.id, start_idx, end_idx, entry.input_key))
+            push!(boundaries, EntryBoundary(entry.id, start_idx, end_idx, entry.input_key, entry.run_id))
         end
     end
     return state, boundaries
@@ -287,16 +288,23 @@ end
 saves its progress as a chain of entries sharing one `run_id`, and only the
 last of them may carry the post id a scrub is asked for (a reply whose own post
 id is known only once it streams), so scrubbing that post must reach the whole
-chain. `lookup(entry_id)` returns the stored entry or `nothing`.
+chain. A compaction the evaluation ran is part of the chain only when its
+summary covers the evaluation's own messages; one that summarized only older
+history has no `run_id` and is passed over, not returned.
+`lookup(entry_id)` returns the stored entry or `nothing`.
 """
 function same_run_chain(lookup, entry::SessionEntry)
     chain = SessionEntry[entry]
-    entry.run_id === nothing && return chain
+    run_id = entry.run_id
+    run_id === nothing && return chain
     while entry.parent_id !== nothing
-        parent = lookup(entry.parent_id)
-        (parent === nothing || parent.run_id != entry.run_id) && break
-        push!(chain, parent)
-        entry = parent
+        entry = lookup(entry.parent_id)
+        entry === nothing && break
+        if entry.run_id == run_id
+            push!(chain, entry)
+        elseif !(entry.is_compaction && entry.run_id === nothing)
+            break
+        end
     end
     return chain
 end
