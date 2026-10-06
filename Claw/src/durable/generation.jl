@@ -82,25 +82,38 @@ function _generation_prepare!(ctx,t,resolved)
         _place_boundary!(db,h,seq,c,t.run_id)
     end
     c=_dread(db->_done(db,"SELECT * FROM claw_conversations WHERE id=?",(t.conversation_id,)),h)
-    messages=_ordered_context(Agentif.load_branch(h.history,c.branch_id).messages)
+    leaf=Agentif.get_branch_leaf(h.history,c.branch_id)
+    messages=_context_at(h,leaf)
     _complete_tool_context(messages) || return _block_invocation!(ctx,"incomplete historical tool context; fork/reset at a reviewed completed cutoff")
-    budget=_prepared_budget(messages,resolved.agent)
     threshold=Agentif.compaction_threshold(h.compaction,resolved.agent.model)
-    if threshold>0 && budget>=threshold && (get(cp,"compacted",false) || !h.compaction.enabled)
+    compacted=get(cp,"compacted",false)
+    # The byte estimate can be low when the provider still overflows: after a
+    # reported overflow, compact before the one retry instead of resending.
+    needs_room=threshold>0 && _prepared_budget(messages,resolved.agent)>=threshold ||
+        get(cp,"overflow",0)>0 && !compacted
+    if needs_room
+        h.compaction.enabled && !compacted && return _schedule_compaction!(ctx,t,c,messages,cp)
         return _transition!(h;context=ctx,point=:context_budget) do db,seq
             _generation_settle!(db,h,seq,t,c;reason="context_overflow")
         end
     end
-    if h.compaction.enabled && threshold>0 && budget>=threshold && !get(cp,"compacted",false)
-        return _schedule_compaction!(ctx,t,c,messages,cp)
-    end
     _transition!(h;context=ctx,point=:request_prepare) do db,seq
         current=_done(db,"SELECT context_revision FROM claw_conversations WHERE id=?",(c.id,))
         current.context_revision==c.context_revision || throw(StaleInvocation())
-        next=Dict("phase"=>"request","messages"=>JSON.parse(JSON.json(messages)),"context_revision"=>c.context_revision,
-            "overflow"=>get(cp,"overflow",0),"compacted"=>get(cp,"compacted",false))
+        # History entries are immutable (redaction only masks them), so the
+        # request is rebuilt from this leaf rather than copied into the task.
+        next=Dict("phase"=>"request","leaf"=>leaf,"context_revision"=>c.context_revision,
+            "overflow"=>get(cp,"overflow",0),"compacted"=>compacted,"failures"=>get(cp,"failures",0))
         _exec!(db,"UPDATE claw_tasks SET checkpoint=?,status='pending',token=NULL,progress=NULL WHERE id=?",(JSON.json(next),t.id))
     end
+end
+
+# The model context of a history leaf, with tool results in call order.
+function _context_at(h,leaf)
+    leaf===nothing && return Agentif.StoredAgentMessage[]
+    state=Agentif.AgentState()
+    foreach(e->Agentif.apply_session_entry!(state,e),Agentif._collect_lineage(h.history,leaf))
+    return _ordered_context(state.messages)
 end
 
 function _model_progress!(ctx,event,last_write)
@@ -120,8 +133,11 @@ end
 function _model_request!(ctx,t,resolved;summary=false,purpose=false)
     h=ctx.harness
     cp=JSON.parse(t.checkpoint)
-    expired=h.clock()>get(JSON.parse(t.input_json),"deadline",Inf) || _dmono()>ctx.monotonic_deadline
-    if t.attempt>=h.limits.attempts || expired
+    # `attempts` bounds consecutive failed requests (a crash counts as one), not
+    # the number of turns; the run deadline bounds the whole run.
+    failures=get(cp,"failures",0)
+    expired=_dmono()>ctx.monotonic_deadline
+    if failures>=h.limits.attempts || expired
         return _transition!(h;context=ctx,point=:attempt_exhausted) do db,seq
             c=_done(db,"SELECT * FROM claw_conversations WHERE id=?",(t.conversation_id,))
             reason=expired ? "deadline" : "attempt_budget"
@@ -144,7 +160,8 @@ function _model_request!(ctx,t,resolved;summary=false,purpose=false)
         _exec!(db,"UPDATE claw_tasks SET attempt=? WHERE id=?",(attempt,t.id))
         _exec!(db,"INSERT INTO claw_task_attempts VALUES(?,?,?,?,?,NULL,0,NULL)",(t.id,attempt,ctx.token,"$(t.id):$attempt",seq))
     end
-    prepared=Agentif.AgentState(;messages=JSON.parse(JSON.json(cp["messages"]),Vector{Agentif.StoredAgentMessage}))
+    messages=haskey(cp,"messages") ? JSON.parse(JSON.json(cp["messages"]),Vector{Agentif.StoredAgentMessage}) : _context_at(h,cp["leaf"])
+    prepared=Agentif.AgentState(;messages)
     for message in prepared.messages
         message isa Agentif.AssistantMessage && message.response_id!==nothing && (prepared.response_id=message.response_id)
     end
@@ -153,6 +170,9 @@ function _model_request!(ctx,t,resolved;summary=false,purpose=false)
     last_write=Ref(-Inf)
     outcome=Agentif.model_turn(e->_model_progress!(ctx,e,last_write),agent,prepared,ctx.abort;stream_fn=h.stream_fn)
     h.fault(:after_model_response,h)
+    # Suspending aborts in-flight requests; they are repeated after reopening,
+    # never settled as aborted runs.
+    outcome.stop_reason===:aborted && h.state!==:open && throw(StaleInvocation())
     _transition!(h;context=ctx,point=summary ? :summary_result : outcome.stop_reason===:stop && isempty(outcome.pending_calls) ? :answer : :model_result) do db,seq
         current=_done(db,"SELECT * FROM claw_tasks WHERE id=?",(t.id,))
         _exec!(db,"UPDATE claw_task_attempts SET ended_seq=?,failure=? WHERE task_id=? AND attempt=?",
@@ -162,14 +182,15 @@ function _model_request!(ctx,t,resolved;summary=false,purpose=false)
         audit=outcome.message===nothing ? Dict("stop"=>String(outcome.stop_reason)) : JSON.parse(JSON.json(outcome.message))
         if outcome.error!==nothing
             class=Agentif.is_context_overflow_error(outcome.error) ? :context_overflow : classify_eval_failure(outcome.error)
-            if class in (:network,:rate_limit,:overloaded) && attempt<h.limits.attempts
+            if class in (:network,:rate_limit,:overloaded) && failures+1<h.limits.attempts
                 _entry!(db,h,seq,c,[];run=t.run_id,task=t.id,audit,stop="error")
-                delay=h.limits.retry_delays[min(attempt,length(h.limits.retry_delays))]
+                delay=h.limits.retry_delays[min(failures+1,length(h.limits.retry_delays))]
                 if outcome.error isa HTTP.StatusError
-                    delay=max(delay,Agentif.codex_retry_delay_seconds(attempt,0,Int(1000*h.limits.max_retry_delay);response=outcome.error.response))
+                    delay=max(delay,Agentif.codex_retry_delay_seconds(failures+1,0,Int(1000*h.limits.max_retry_delay);response=outcome.error.response))
                 end
                 due=h.clock()+min(h.limits.max_retry_delay,delay)
-                _exec!(db,"UPDATE claw_tasks SET status='pending',token=NULL,due_at=?,progress=NULL WHERE id=?",(due,t.id))
+                cp["failures"]=failures+1
+                _exec!(db,"UPDATE claw_tasks SET status='pending',token=NULL,due_at=?,progress=NULL,checkpoint=? WHERE id=?",(due,JSON.json(cp),t.id))
                 return
             elseif !summary && !purpose && class==:context_overflow && get(cp,"overflow",0)<1 &&
                     (outcome.message===nothing || (isempty(outcome.message.content) && isempty(outcome.pending_calls)))
@@ -196,8 +217,8 @@ function _model_request!(ctx,t,resolved;summary=false,purpose=false)
         elseif outcome.stop_reason==:stop && outcome.message!==nothing && !isempty(strip(Agentif.message_text(outcome.message)))
             steer=_done(db,"SELECT id FROM claw_submissions WHERE conversation_id=? AND mode='steer' AND state='queued' LIMIT 1",(c.id,))
             if steer!==nothing
+                # The next prepare places exactly one steer (and queued writes).
                 _entry!(db,h,seq,c,[outcome.message];run=t.run_id,task=t.id,stop="stop")
-                _place_boundary!(db,h,seq,c,t.run_id)
                 _exec!(db,"UPDATE claw_tasks SET status='pending',token=NULL,checkpoint=? WHERE id=?",(JSON.json(Dict("phase"=>"prepare","overflow"=>0)),t.id))
             else
                 _generation_settle!(db,h,seq,current,c;answer=outcome.message,stop="stop")

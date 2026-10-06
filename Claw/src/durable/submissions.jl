@@ -48,14 +48,9 @@ end
 """Wait timeout or caller abort only stops waiting. It never withdraws admitted work."""
 function wait_submission(r::SubmissionReceipt;timeout_s::Real=Inf,abort::Agentif.Abort=Agentif.Abort())
     resume!(r.harness)
-    start = time_ns()
-    while true
+    return _await(r.harness;timeout_s,abort) do
         row = submission(r)
-        row.state in ("answered","unanswered","withdrawn") && return row
-        Agentif.isaborted(abort) && return nothing
-        (time_ns()-start)/1e9 >= timeout_s && return nothing
-        r.harness.state === :poisoned && throw(HarnessPoisoned())
-        sleep(.01)
+        row.state in ("answered","unanswered","withdrawn") ? row : nothing
     end
 end
 

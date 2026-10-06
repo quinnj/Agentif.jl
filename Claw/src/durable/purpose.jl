@@ -36,24 +36,19 @@ function _durable_filter!(h,handler,ev,row,hash;abort=Agentif.Abort())
             checkpoint=Dict("phase"=>"request","prompt"=>EVENT_FILTER_PROMPT,"messages"=>JSON.parse(JSON.json([Agentif.UserMessage(input)]))))
     end
     resume!(h)
-    while h.state===:open
-        if Agentif.isaborted(abort)
-            _transition!(h;point=:filter_abort) do db,seq
-                _guard_source_claims!(db,[(row,ev)])
-                _cancel_task!(db,id)
-            end
-            live=lock(()->get(h.live,id,nothing),h.lock)
-            live===nothing || Agentif.abort!(live.context.abort)
-            Agentif.check_abort(abort)
+    t=_await(()->(t=_task_row(h,id); t.status=="terminal" || _dnull(t.blocked)!==nothing ? t : nothing),h;abort)
+    if t===nothing
+        Agentif.isaborted(abort) || throw(HarnessPoisoned())
+        _transition!(h;point=:filter_abort) do db,seq
+            _guard_source_claims!(db,[(row,ev)])
+            _cancel_task!(db,id)
         end
-        t=_task_row(h,id)
-        if t.status=="terminal"
-            outcome=JSON.parse(t.outcome)
-            get(outcome,"status","")=="completed" || error("durable prompt classifier failed: $(get(outcome,"reason","unknown"))")
-            return outcome["match"]::Bool
-        end
-        _dnull(t.blocked)===nothing || throw(DurableBlocked("durable prompt classifier blocked: $(t.blocked)"))
-        sleep(.01)
+        live=lock(()->get(h.live,id,nothing),h.lock)
+        live===nothing || Agentif.abort!(live.context.abort)
+        Agentif.check_abort(abort)
     end
-    throw(HarnessPoisoned())
+    _dnull(t.blocked)===nothing || throw(DurableBlocked("durable prompt classifier blocked: $(t.blocked)"))
+    outcome=JSON.parse(t.outcome)
+    get(outcome,"status","")=="completed" || error("durable prompt classifier failed: $(get(outcome,"reason","unknown"))")
+    return outcome["match"]::Bool
 end

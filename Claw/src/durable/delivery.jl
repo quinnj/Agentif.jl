@@ -1,12 +1,13 @@
 function register_delivery_adapter!(h::Harness,name::String,adapter::DeliveryAdapter)
-    lock(h.lock) do
+    fresh=lock(h.lock) do
         old=get(h.adapters,name,nothing)
         old===nothing || old.version!=adapter.version || old.capability==adapter.capability ||
             throw(ArgumentError("delivery version reused with a changed capability"))
         h.adapters[name]=adapter
+        old===nothing
     end
-    notify(h.wake)
-    nothing
+    fresh ? _recheck_blocked!(h) : notify(h.wake)
+    return nothing
 end
 
 function _delivery_phase!(ctx,t)

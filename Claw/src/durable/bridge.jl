@@ -83,7 +83,13 @@ function _durable_dispatch_group!(a,group,handlers;verdicts=nothing,abort=Agenti
         present=Set(x[1].id for x in members)
         for id in (r.event_id for r in frozen_ids if !(r.event_id in present))
             row=_claim_event!(a,Int(id))
-            row===nothing && throw(DurableBlocked("frozen batch member is unavailable: $id"))
+            if row===nothing
+                # A member that already ended (dead-lettered, redacted or done) is
+                # left out; only one still being processed elsewhere blocks.
+                status=_dread(db->_done(db,"SELECT status FROM claw_events WHERE id=?",(id,)),h)
+                status!==nothing && status.status in ("dead","done","failed") && continue
+                throw(DurableBlocked("frozen batch member is unavailable: $id"))
+            end
             ev=_live_event(a,Int(id))
             ev===nothing && (ev=rehydrate_event(row.source,row))
             if ev===nothing
@@ -100,6 +106,7 @@ function _durable_dispatch_group!(a,group,handlers;verdicts=nothing,abort=Agenti
         end
         sort!(members;by=x->findfirst(r->r.event_id==x[1].id,frozen_ids))
         prepared=Any[]
+        delivering=Set{Int}()
         for raw in JSON.parse(freeze.handlers)
             handler=_restore_handler(raw)
             hash=_digest(raw)
@@ -141,7 +148,12 @@ function _durable_dispatch_group!(a,group,handlers;verdicts=nothing,abort=Agenti
             route=_route(ch,kept[1][1])
             supervision=_supervision_spec(h,handler,ev)
             supervision===nothing || (route["supervision"]=supervision)
-            delivery=ch isa SinkChannel ? nothing : DeliveryAddress("claw-event-channel",1,Dict("event_id"=>kept[1][1].id,"channel_id"=>Agentif.channel_id(ch)))
+            # A channel that cannot deliver (e.g. a GitHub event with no comment
+            # target) keeps the answer local instead of queueing a send that can
+            # never succeed.
+            deliverable=!(ch isa SinkChannel) && delivery_available(ch)
+            delivery=deliverable ? DeliveryAddress("claw-event-channel",1,Dict("event_id"=>kept[1][1].id,"channel_id"=>Agentif.channel_id(ch))) : nothing
+            deliverable && push!(delivering,kept[1][1].id)
             c=_channel_conversation!(h,ch,profile,route,delivery)
             input=Agentif.UserMessage(raw["context_prefix"]*"\n\n"*make_prompt(handler.prompt,ev))
             push!(prepared,(;handler,hash,decisions,submission=(c,profile,input,route)))
@@ -170,9 +182,23 @@ function _durable_dispatch_group!(a,group,handlers;verdicts=nothing,abort=Agenti
             end
             _aggregate_dispatches!(db,h)
         end
+        # Events whose answer is not delivered through their own live channel are
+        # done with it: release the channel and the live event now, as the
+        # default path does. Delivery targets are released after their send.
+        for (row,ev) in members
+            row.id in delivering && continue
+            if ev isa ChannelEvent
+                try
+                    Agentif.close_channel(get_channel(ev))
+                catch err
+                    @debug "Claw: failed to release a durable member's channel" exception=(err,)
+                end
+            end
+            _forget_live_event!(a,row.id)
+        end
     end
     resume!(h)
-    nothing
+    return nothing
 end
 
 function _aggregate_dispatches!(db,h)
@@ -203,6 +229,10 @@ function _register_native_delivery!(h,a)
         result=Agentif.send_message(ch,body)
         post=Agentif.response_entry_id(ch)
         Agentif.close_channel(ch)
+        # Keep the live event while another answer for it is still queued.
+        others=_dread(db->_scalar(db,"""SELECT COUNT(*) FROM claw_outbox WHERE state='pending'
+            AND json_extract(address,'\$.routing.event_id')=?""",(id,)),h)
+        others==0 && _forget_live_event!(a,id)
         Dict("sent"=>true,"remote"=>_sanitize_integration_value(result),"_claw_response_post"=>post)
     end;available=address->begin
         row=_event_row_for_delivery(a,Int(address["event_id"]))

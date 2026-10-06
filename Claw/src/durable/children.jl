@@ -1,22 +1,24 @@
-const DURABLE_NATIVE_ADAPTERS=IdDict{Any,Function}()
-const DURABLE_RESOURCE_ADAPTERS=IdDict{Any,NamedTuple}()
-const DURABLE_FILE_ADAPTERS=IdDict{Any,NamedTuple}()
+# Durable contracts for Claw's built-in tools, keyed by tool object: the
+# `ToolSpec` keywords (`version`, `replay`, `effect`, `capabilities`, `invoke`)
+# that `register_profile!` uses instead of the unsafe legacy default.
+const DURABLE_TOOL_ADAPTERS=IdDict{Any,NamedTuple}()
 
 function _register_coding_adapters!(tools)
     for (operation,tool) in zip((:read,:edit,:write),tools[1:3])
-        DURABLE_FILE_ADAPTERS[tool]=(;replay=operation===:read ? :safe : :unsafe,capabilities=[String(operation)],
-            invoke=(t,args,ctx)->begin
-                task=_task_row(ctx.harness,ctx.task_id)
-                resolved,reason=_resolve_profile(ctx.harness,JSON.parse(task.input_json)["profile"])
-                reason===nothing || error(reason)
-                env=resolved.env
+        DURABLE_TOOL_ADAPTERS[tool]=(;version="durable-file-v1",replay=operation===:read ? :safe : :unsafe,effect=:file,
+            capabilities=[String(operation)],invoke=(t,args,ctx)->begin
+                env=execution_environment(ctx)
                 output=operation===:read ? LLMTools.env_read(env,args.path;offset=args.offset,limit=args.limit,abort=ctx.abort,deadline=ctx.deadline) :
                     operation===:edit ? LLMTools.env_edit(env,args.path,args.oldText,args.newText;abort=ctx.abort,deadline=ctx.deadline) :
                     LLMTools.env_write(env,args.path,args.content;abort=ctx.abort,deadline=ctx.deadline)
-                Agentif.ToolOutcome(output)
+                return Agentif.ToolOutcome(output)
             end)
     end
-    tools
+    # The terminal tools run native commands: they need the shell capability.
+    for tool in tools[4:end]
+        DURABLE_TOOL_ADAPTERS[tool]=(;version="durable-shell-v1",capabilities=["shell"])
+    end
+    return tools
 end
 struct OwnedToolWait
     task::String
@@ -25,10 +27,10 @@ end
 
 function _register_resource_adapters!(tools,kind)
     for (operation,tool) in enumerate(tools)
-        DURABLE_RESOURCE_ADAPTERS[tool]=(;replay=operation==3 ? :safe : :unsafe,
-            invoke=(t,args,ctx)->_resource_operation!(kind,operation,t,args,ctx))
+        DURABLE_TOOL_ADAPTERS[tool]=(;version="durable-resource-v1",replay=operation==3 ? :safe : :unsafe,effect=:resource,
+            capabilities=["shell"],invoke=(t,args,ctx)->_resource_operation!(kind,operation,t,args,ctx))
     end
-    tools
+    return tools
 end
 
 function _resource_operation!(kind,operation,tool,args,ctx)
@@ -47,7 +49,15 @@ function _resource_operation!(kind,operation,tool,args,ctx)
         return Agentif.ToolOutcome("Resource '$name' was interrupted by restart; start a new resource explicitly.";is_error=true)
     end
     resource=operation==1 ? record_managed_resource!(ctx;kind,key="resource:$(ctx.task_id)",details=Dict("name"=>name)) : nothing
-    output=Agentif.invoke_parsed_tool(tool,args)
+    output=try
+        Agentif.invoke_parsed_tool(tool,args)
+    catch
+        # A launch that failed leaves no running resource behind.
+        resource===nothing || _transition!(h;context=ctx,point=:resource_failed) do db,seq
+            _exec!(db,"UPDATE claw_managed_resources SET state='failed' WHERE id=?",(resource,))
+        end
+        rethrow()
+    end
     if operation in (1,4)
         _transition!(h;context=ctx,point=:resource_receipt) do db,seq
             if operation==1
@@ -65,9 +75,10 @@ end
 
 function _register_subagent_adapters!(tools)
     for (index,tool) in enumerate(tools)
-        DURABLE_NATIVE_ADAPTERS[tool]=(t,args,ctx)->_subagent_operation!(index,args,ctx)
+        DURABLE_TOOL_ADAPTERS[tool]=(;version="durable-child-v1",replay=:safe,effect=:child,
+            invoke=(t,args,ctx)->_subagent_operation!(index,args,ctx))
     end
-    tools
+    return tools
 end
 
 function _child_notification!(h,parent,resolved,name,prompt)
@@ -103,8 +114,10 @@ function _subagent_operation!(operation,args,ctx)
             credential_ref=resolved.profile["credential_ref"])
         sync=args.run_sync===true
         event_type=sync ? nothing : _child_notification!(h,parent,resolved,args.name,something(args.prompt,"Sub-agent '$(args.name)' output"))
+        # An asynchronous child is background work: it must not hold the parent's
+        # run open (or block the parent conversation's next input) until it ends.
         created=create_owned_child!(ctx;creation_key="launch:$(ctx.task_id)",name=args.name,profile,input=args.input_message,
-            event_type=sync ? nothing : event_type,owner_task=sync ? nothing : _dnull(parent.owner_task))
+            event_type=sync ? nothing : event_type,background=!sync)
         return sync ? OwnedToolWait(created.task,"Sub-agent '$(args.name)' completed.") :
             Agentif.ToolOutcome("Sub-agent '$(args.name)' started as durable conversation $(created.conversation).")
     elseif operation==2
@@ -117,8 +130,9 @@ function _subagent_operation!(operation,args,ctx)
         wrapper=_transition!(h;context=ctx,point=:child_followup) do db,seq
             c=_done(db,"SELECT * FROM claw_conversations WHERE id=?",(alias.child_id,))
             receipt=_admit!(db,seq,c,Agentif.UserMessage(args.input_message),"message:$(ctx.task_id)",mode,Dict("owner"=>ctx.task_id),c.profile_id)
-            wrapper=_task_create!(db,seq,parent.conversation_id,"child","message:$(ctx.task_id)";owner=sync ? ctx.task_id : _dnull(parent.owner_task),
-                input=Dict("profile"=>c.profile_id,"child"=>c.id),checkpoint=Dict("phase"=>"join","submission"=>receipt))
+            wrapper=_task_create!(db,seq,parent.conversation_id,"child","message:$(ctx.task_id)";owner=sync ? ctx.task_id : nothing,
+                background=!sync,input=Dict("profile"=>c.profile_id,"child"=>c.id,"event_type"=>event_type,"name"=>args.name),
+                checkpoint=Dict("phase"=>"join","submission"=>receipt))
             _exec!(db,"UPDATE claw_conversations SET owner_task=? WHERE id=?",(wrapper,c.id))
             _exec!(db,"UPDATE claw_child_aliases SET task_id=?,event_type=? WHERE conversation_id=? AND name=?",(wrapper,event_type,parent.conversation_id,args.name))
             wrapper
@@ -130,7 +144,7 @@ function _subagent_operation!(operation,args,ctx)
     else
         alias=_dread(db->_done(db,"SELECT * FROM claw_child_aliases WHERE conversation_id=? AND name=?",(parent.conversation_id,args.name)),h)
         alias===nothing && return Agentif.ToolOutcome("No sub-agent named '$(args.name)'")
-        abort_conversation!(h,alias.child_id)
+        abort_conversation!(h,alias.child_id;include_background=true)
         _transition!(h;context=ctx,point=:child_alias_remove) do db,seq
             _exec!(db,"DELETE FROM claw_child_aliases WHERE conversation_id=? AND name=?",(parent.conversation_id,args.name))
         end

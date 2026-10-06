@@ -4,8 +4,10 @@ function _finish_task!(db,t,outcome)
         (owned==0 ? "terminal" : "completing",JSON.json(outcome),t.id))
 end
 
+# A task that already has its outcome (`completing`, waiting for owned work)
+# keeps it; only its owned work is cancelled.
 function _cancel_task!(db,id)
-    _exec!(db,"UPDATE claw_tasks SET cancel=1,revision=revision+1 WHERE id=? AND status!='terminal'",(id,))
+    _exec!(db,"UPDATE claw_tasks SET cancel=1,revision=revision+1 WHERE id=? AND status NOT IN ('terminal','completing')",(id,))
     for child in _drows(db,"SELECT id FROM claw_tasks WHERE owner_task=? AND background=0",(id,))
         _cancel_task!(db,child.id)
     end
@@ -31,6 +33,46 @@ function abort_conversation!(h::Harness,cid::String;include_background::Bool=fal
     nothing
 end
 abort_conversation!(h::Harness,c::ConversationRef;kwargs...)=abort_conversation!(h,c.id;kwargs...)
+
+"""
+    _settle_cancelled!(db, h, seq, task)
+
+End a cancelled task as aborted. An open model attempt's spend becomes unknown;
+a tool call gets an error result, so the conversation's history never ends in a
+call without a result; a delivery not yet sent is withdrawn, and one that was
+being sent becomes uncertain; a generation settles its run and placed inputs.
+"""
+function _settle_cancelled!(db,h,seq,t)
+    reason=get(JSON.parse(t.input_json),"abort_reason","user_abort")
+    _exec!(db,"UPDATE claw_task_attempts SET unknown_spend=1,ended_seq=?,failure=? WHERE task_id=? AND ended_seq IS NULL",(seq,reason,t.id))
+    if t.kind=="tool"
+        _aborted_tool_result!(db,h,seq,t,reason)
+    elseif t.kind=="delivery"
+        outbox=get(JSON.parse(t.input_json),"outbox",nothing)
+        outbox===nothing || _exec!(db,"""UPDATE claw_outbox SET state=CASE state WHEN 'sending' THEN 'uncertain'
+            WHEN 'pending' THEN 'cancelled' ELSE state END WHERE id=?""",(outbox,))
+    end
+    _finish_task!(db,t,Dict("status"=>"aborted","reason"=>reason))
+    if t.kind=="generation"
+        _exec!(db,"UPDATE claw_runs SET status='aborted',reason=? WHERE id=? AND status='active'",(reason,t.run_id))
+        _exec!(db,"UPDATE claw_submissions SET state='unanswered',reason=? WHERE run_id=? AND state='placed'",(reason,t.run_id))
+    end
+    return nothing
+end
+
+function _aborted_tool_result!(db,h,seq,t,reason)
+    e=_done(db,"SELECT * FROM claw_tool_executions WHERE task_id=?",(t.id,))
+    (e===nothing || _dnull(e.result_entry)!==nothing) && return nothing
+    state=e.effect_state=="executing" ? "uncertain" : e.effect_state=="ready" ? "aborted" : e.effect_state
+    effect=state=="aborted" ? "it did not run" : "it may or may not have taken effect"
+    output=Agentif.render_tool_error_json(;error_kind="tool_call_aborted",tool=e.tool_name,call_id=e.call_id,
+        message="Tool call `$(e.tool_name)` was aborted ($reason); $effect.")
+    c=_done(db,"SELECT * FROM claw_conversations WHERE id=?",(t.conversation_id,))
+    entry=_entry!(db,h,seq,c,[Agentif.ToolResultMessage(e.call_id,e.tool_name,output;is_error=true)];
+        run=_dnull(t.run_id),task=t.id,stop="aborted")
+    _exec!(db,"UPDATE claw_tool_executions SET effect_state=?,result_entry=? WHERE task_id=?",(state,entry,t.id))
+    return nothing
+end
 
 function _wait_tasks!(db,waiter,children,policy="allSettled")
     policy in ("allSettled","failFast") || throw(ArgumentError("unknown join policy"))
@@ -61,18 +103,9 @@ function _wait_tasks!(db,waiter,children,policy="allSettled")
 end
 
 function _reconcile_ownership!(db,h,seq)
-    for t in _drows(db,"SELECT * FROM claw_tasks WHERE cancel=1 AND status!='terminal' ORDER BY created_seq DESC")
+    for t in _drows(db,"SELECT * FROM claw_tasks WHERE cancel=1 AND status NOT IN ('terminal','completing') ORDER BY created_seq DESC")
         lock(() -> haskey(h.live,t.id),h.lock) && continue
-        if t.kind=="tool"
-            e=_done(db,"SELECT effect_state FROM claw_tool_executions WHERE task_id=?",(t.id,))
-            e===nothing || e.effect_state!="executing" || _exec!(db,"UPDATE claw_tool_executions SET effect_state='uncertain' WHERE task_id=?",(t.id,))
-        end
-        reason=get(JSON.parse(t.input_json),"abort_reason","user_abort")
-        _finish_task!(db,t,Dict("status"=>"aborted","reason"=>reason))
-        if t.kind=="generation"
-            _exec!(db,"UPDATE claw_runs SET status='aborted',reason=? WHERE id=?",(reason,t.run_id))
-            _exec!(db,"UPDATE claw_submissions SET state='unanswered',reason=? WHERE run_id=? AND state='placed'",(reason,t.run_id))
-        end
+        _settle_cancelled!(db,h,seq,t)
     end
     for t in _drows(db,"SELECT * FROM claw_tasks WHERE status='waiting'")
         waits=_drows(db,"SELECT t.*,w.policy FROM claw_task_waits w JOIN claw_tasks t ON t.id=w.awaited WHERE w.waiter=?",(t.id,))
@@ -122,7 +155,7 @@ function create_owned_child!(ctx::InvocationContext;creation_key::String,name::S
         end
         cid=_did()
         wrapper=_task_create!(db,seq,owner.conversation_id,"child",creation_key;owner=target,
-            background,input=Dict("profile"=>profile.id,"child"=>cid),checkpoint=Dict("phase"=>"join"))
+            background,input=Dict("profile"=>profile.id,"child"=>cid,"event_type"=>event_type,"name"=>name),checkpoint=Dict("phase"=>"join"))
         parent_c=_done(db,"SELECT * FROM claw_conversations WHERE id=?",(owner.conversation_id,))
         _exec!(db,"INSERT INTO claw_conversations(id,branch_id,profile_id,owner_task,background,routing,created_seq) VALUES(?,?,?,?,?,?,?)",
             (cid,"child:$cid",profile.id,wrapper,Int(background),parent_c.routing,seq))

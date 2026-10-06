@@ -96,9 +96,12 @@ end
             @test time()-start<2
             @test Claw.submission(second)!==nothing
             Claw.scrub_durable_post!(h,"erase")
-            put!(release,nothing)
+            # Unrelated later input survives the scrub and is indexed too.
+            integration_until(()->(isready(release) || put!(release,nothing);
+                Claw._dread(db->Claw._scalar(db,"SELECT COUNT(*) FROM claw_index_jobs WHERE state IN ('pending','redacted')"),h)==0))
             integration_until(()->h.indexer===nothing || istaskdone(h.indexer))
             @test !occursin("erase this exact content",JSON.json(Agentif.load_branch(h.history,"indexed").messages))
+            @test occursin("following input",JSON.json(Agentif.load_branch(h.history,"indexed").messages))
             @test Claw.submission(r).input_json==JSON.json(Agentif.UserMessage("[redacted]"))
             indexed=Claw._dread(db->Claw._drows(db,"SELECT c.body FROM documents d JOIN content c ON c.hash=d.hash WHERE d.key LIKE 'session:entry:%'"),h)
             @test all(r->!occursin("erase this exact content",r.body),indexed)

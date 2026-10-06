@@ -97,7 +97,11 @@ mutable struct Harness
     live::Dict{String, Any}
     observers::Vector{Any}
     scheduler::Union{Nothing, Task}
+    # Auto-reset: every commit and registration notifies it, and the scheduler
+    # waits on it (or on its next due time) instead of polling.
     wake::Threads.Event
+    # Notified after every commit, for callers waiting on a durable state.
+    commits::Threads.Condition
     indexer::Union{Nothing,Task}
     supervision_due::Float64
     due_timers::Dict{String,Tuple{Float64,Float64}}

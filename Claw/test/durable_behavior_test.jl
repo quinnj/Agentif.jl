@@ -89,6 +89,8 @@ end
         invoke=(t,args,ctx)->begin
             saved[]=ctx;invoked[]+=1
             Claw.report_progress!(ctx,Dict("large"=>repeat("🦊",1000)))
+            # Interrupted mid-body: the effect may have happened.
+            Agentif.abort!(ctx.abort)
             error("effect happened; lost response secret-test-key")
         end
         h,c,p=durable_fixture(joinpath(dir,"claw.sqlite");stream=tool_then_answer("opaque"),tools=Agentif.AgentTool[tool],
@@ -99,7 +101,7 @@ end
             @test invoked[]==1
             @test Claw.submission(r).state=="placed"
             task=only(filter(t->t.kind=="tool",Claw.snapshot(h,c).tasks))
-            @test JSON.parse(task.progress)["truncated"]
+            @test JSON.parse(Claw.inspect_task(h,task.id;include_payload=true).progress)["truncated"]
             @test !occursin("secret-test-key",task.blocked)
             @test_throws Claw.StaleInvocation Claw.report_progress!(saved[],"late")
             @test_throws ArgumentError Claw.resolve_effect!(h,task.id,Agentif.ToolOutcome("proven");note="")
@@ -244,13 +246,9 @@ end
         LLMTools.env_write(env,"a.txt","one")
         LLMTools.env_edit(env,"a.txt","one","two")
         @test occursin("two",LLMTools.env_read(env,"a.txt"))
-        @test LLMTools.env_stat(env,"a.txt").size==3
-        @test "a.txt" in LLMTools.env_list(env)
         @test_throws ArgumentError LLMTools.env_read(env,"../escape")
-        shell=LLMTools.env_shell(env,"printf '\\377'";max_bytes=100)
-        @test isvalid(shell.output)
         aborted=Agentif.Abort();Agentif.abort!(aborted)
-        @test_throws Agentif.AbortEvaluation LLMTools.env_shell(env,"echo forbidden";abort=aborted)
+        @test_throws Agentif.AbortEvaluation LLMTools.env_write(env,"a.txt","three";abort=aborted)
         denied=LLMTools.LocalExecutionEnv(LLMTools.EnvRef(dir;id="denied",capabilities=["read"]))
         @test_throws ArgumentError LLMTools.env_write(denied,"denied","no")
     end

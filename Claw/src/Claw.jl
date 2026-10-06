@@ -1571,7 +1571,6 @@ end
 
 function scrub_post!(assistant::AgentAssistant, post_id::String)
     # 1. Mark session entries as deleted (preserves AgentState for prompt caching)
-    assistant._harness[] === nothing || scrub_durable_post!(assistant._harness[],post_id)
     Agentif.scrub_post!(assistant.session_store, post_id)
     # 2. Hard-delete agent data matching this post_id
     lock(AGENT_DATA_WRITE_LOCK) do
@@ -1592,6 +1591,9 @@ function scrub_post!(assistant::AgentAssistant, post_id::String)
             return nothing
         end
     end
+    # 3. Durable runtime copies (submissions, checkpoints, outbox, children).
+    h = assistant._harness[]
+    h === nothing || scrub_durable_post!(h, post_id)
     return nothing
 end
 

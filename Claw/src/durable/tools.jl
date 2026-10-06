@@ -30,8 +30,10 @@ function _tool_intents!(db,h,seq,t,c,entry,calls,resolved)
                 failure="tool_argument_parse_failed: "*_diagnostic(h,err)
             end
         end
+        issued=JSON.parse(t.input_json)
+        # Tools share the run's deadline.
         id=_task_create!(db,seq,c.id,"tool","$entry:$(call.call_id)";run=t.run_id,owner=t.id,
-            input=Dict("profile"=>JSON.parse(t.input_json)["profile"]),checkpoint=Dict("phase"=>"execute"))
+            input=Dict("profile"=>issued["profile"],"deadline"=>issued["deadline"]),checkpoint=Dict("phase"=>"execute"))
         push!(children,id)
         if failure!==nothing
             result=Agentif.ToolResultMessage(call.call_id,call.name,JSON.json(Dict("error_kind"=>failure));is_error=true)
@@ -54,12 +56,10 @@ end
 
 function report_progress!(ctx::InvocationContext,value)
     lock(ctx.lock) do
-        _dread(ctx.harness) do db
-            task=_done(db,"SELECT status,token,revision,cancel FROM claw_tasks WHERE id=?",(ctx.task_id,))
-            epoch=_done(db,"SELECT owner_epoch FROM claw_runtime_meta WHERE id=1").owner_epoch
-            ctx.harness.state===:open && epoch==ctx.epoch && task!==nothing && task.status=="running" && task.token==ctx.token && task.revision==ctx.revision[] && task.cancel==0 || throw(StaleInvocation())
-        end
         ctx.heartbeat[]=_dmono()
+        # Cancellation and closing also set these in-memory signals, so throttled
+        # reports skip the database; written reports re-check the full fence.
+        (Agentif.isaborted(ctx.abort) || !(ctx.harness.state in (:open,:closing))) && throw(StaleInvocation())
         _dmono()-ctx.last_progress[] >= ctx.harness.limits.progress_interval || return
         text=_bounded_json(_sanitize_integration_value(value),ctx.harness.limits.progress_bytes)
         _transition!(ctx.harness;context=ctx,point=:tool_progress) do db,seq
@@ -106,13 +106,20 @@ function _tool_phase!(ctx,t,resolved)
         end
         result isa Agentif.ToolOutcome ? result : Agentif.ToolOutcome(string(result))
     catch err
-        if spec.replay===:unsafe
+        # A body that throws has returned control: the model gets the error, as
+        # in the default tool loop. Only an interruption (abort or deadline) can
+        # leave an unsafe body's effect unknown.
+        interrupted=err isa Agentif.AbortEvaluation || Agentif.isaborted(ctx.abort) || _dmono()>ctx.monotonic_deadline
+        if interrupted && spec.replay===:unsafe
             return _transition!(h;context=ctx,point=:tool_uncertain) do db,seq
                 _exec!(db,"UPDATE claw_tool_executions SET effect_state='uncertain' WHERE task_id=?",(t.id,))
-                _exec!(db,"UPDATE claw_tasks SET status='pending',token=NULL,blocked=? WHERE id=?",("uncertain effect: "*_diagnostic(h,err),t.id))
+                _exec!(db,"UPDATE claw_tasks SET status='pending',token=NULL,blocked=?,due_at=? WHERE id=?",
+                    ("uncertain effect: "*_diagnostic(h,err),h.clock()+BLOCKED_RECHECK_S,t.id))
             end
         end
-        Agentif.ToolOutcome(JSON.json(Dict("error_kind"=>"tool_fault","message"=>_diagnostic(h,err)));is_error=true)
+        Agentif.ToolOutcome(Agentif.render_tool_error_json(;
+            error_kind=interrupted ? "tool_call_interrupted" : "tool_execution_failed",
+            message=_diagnostic(h,err),tool=e.tool_name,call_id=e.call_id);is_error=true)
     end
     h.fault(:after_effect_body,h)
     _transition!(h;context=ctx,point=:tool_result) do db,seq
@@ -123,13 +130,8 @@ end
 function _verify_invocation!(ctx)
     Agentif.check_abort(ctx.abort)
     _dmono()<=ctx.monotonic_deadline || throw(Agentif.AbortEvaluation())
-    _dread(ctx.harness) do db
-        t=_done(db,"SELECT status,token,epoch,revision,cancel FROM claw_tasks WHERE id=?",(ctx.task_id,))
-        epoch=_done(db,"SELECT owner_epoch FROM claw_runtime_meta WHERE id=1").owner_epoch
-        ctx.harness.state===:open && epoch==ctx.epoch && t!==nothing && t.status=="running" && t.token==ctx.token &&
-            t.epoch==ctx.epoch && t.revision==ctx.revision[] && t.cancel==0 || throw(StaleInvocation())
-    end
-    nothing
+    _dread(db->_check_fence(db,ctx),ctx.harness)
+    return nothing
 end
 
 execution_intent(ctx::InvocationContext)=_dread(db->_done(db,"SELECT * FROM claw_tool_executions WHERE task_id=?",(ctx.task_id,)),ctx.harness)

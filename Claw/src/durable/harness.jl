@@ -26,7 +26,8 @@ function _make_harness(assistant, writer, readers, history, epoch, owner, owns;
     end
     h = Harness(assistant,writer,readers,history,epoch,owner,owns,Dict{String,Agentif.Agent}(),
         Dict{Tuple{String,String},ToolSpec}(),Dict{String,LLMTools.LocalExecutionEnv}(),Dict{String,DeliveryAdapter}(),
-        limits,compaction,stream_fn,clock,fault,:open,ReentrantLock(),Dict{String,Any}(),Any[],nothing,Threads.Event(),nothing,0.0,
+        limits,compaction,stream_fn,clock,fault,:open,ReentrantLock(),Dict{String,Any}(),Any[],nothing,
+        Threads.Event(true),Threads.Condition(),nothing,0.0,
         Dict{String,Tuple{Float64,Float64}}())
     _recover_harness!(h)
     return h
@@ -88,12 +89,7 @@ function register_profile!(h::Harness, agent::Agentif.Agent; specs = nothing,
         environment = LLMTools.LocalExecutionEnv(LLMTools.EnvRef(h.assistant === nothing ? pwd() : h.assistant.config.base_dir)),
         trust::Symbol = :owner, credential_ref::String = agent.model.provider, version::Int = 1)
     trust in (:owner,:untrusted) || throw(ArgumentError("invalid trust"))
-    specs === nothing && (specs = ToolSpec[
-        haskey(DURABLE_NATIVE_ADAPTERS,t) ? ToolSpec(t;version="durable-child-v1",replay=:safe,effect=:child,invoke=DURABLE_NATIVE_ADAPTERS[t]) :
-        haskey(DURABLE_RESOURCE_ADAPTERS,t) ? ToolSpec(t;version="durable-resource-v1",replay=DURABLE_RESOURCE_ADAPTERS[t].replay,
-            effect=:resource,invoke=DURABLE_RESOURCE_ADAPTERS[t].invoke) :
-        haskey(DURABLE_FILE_ADAPTERS,t) ? ToolSpec(t;version="durable-file-v1",replay=DURABLE_FILE_ADAPTERS[t].replay,
-            effect=:file,capabilities=DURABLE_FILE_ADAPTERS[t].capabilities,invoke=DURABLE_FILE_ADAPTERS[t].invoke) : ToolSpec(t) for t in agent.tools])
+    specs === nothing && (specs = ToolSpec[ToolSpec(t; get(DURABLE_TOOL_ADAPTERS, t, (;))...) for t in agent.tools])
     wanted = Set(t.name for t in agent.tools)
     chosen = ToolSpec[s for s in specs if s.tool.name in wanted && (trust === :owner || s.tool.name in UNTRUSTED_ALLOWED_TOOLS)]
     length(unique(s.tool.name for s in chosen)) == length(chosen) || throw(ArgumentError("duplicate tool names"))
@@ -111,7 +107,9 @@ function register_profile!(h::Harness, agent::Agentif.Agent; specs = nothing,
     _transition!(h;point=:profile) do db,seq
         _exec!(db,"INSERT OR IGNORE INTO claw_agent_profiles VALUES(?,?,?,?)",(id,version,JSON.json(payload),id))
     end
-    lock(h.lock) do
+    fresh = lock(h.lock) do
+        added = !haskey(h.agents, id) || !haskey(h.environments, environment.ref.id) ||
+            any(s -> !haskey(h.specs, (s.tool.name, s.version)), chosen)
         h.agents[id] = Agentif.with_tools(agent, Agentif.AgentTool[s.tool for s in chosen])
         for s in chosen
             old = get(h.specs,(s.tool.name,s.version),nothing)
@@ -121,8 +119,9 @@ function register_profile!(h::Harness, agent::Agentif.Agent; specs = nothing,
         old = get(h.environments,environment.ref.id,nothing)
         old === nothing || _env_data(old.ref) == _env_data(environment.ref) || error("environment ID reused with a changed revision")
         h.environments[environment.ref.id] = environment
+        added
     end
-    notify(h.wake)
+    fresh ? _recheck_blocked!(h) : notify(h.wake)
     return AgentProfileRef(id)
 end
 
@@ -200,12 +199,18 @@ end
 function close_harness!(h::Harness; mode::Symbol=:suspend,grace_s::Real=30)
     deadline=_dmono()+grace_s
     mode in (:suspend,:abort) || throw(ArgumentError("invalid close mode"))
-    mode === :abort && foreach(c -> abort_conversation!(h,c.id;include_background=true),
+    h.state === :closed && return (;status=:closed,mode)
+    poisoned = h.state === :poisoned
+    mode === :abort && !poisoned && foreach(c -> abort_conversation!(h,c.id;include_background=true),
         _dread(db -> _drows(db,"SELECT id FROM claw_conversations"),h))
-    h.state = :closing
+    # A poisoned harness stays poisoned: nothing more is committed.
+    poisoned || (h.state = :closing)
     notify(h.wake)
+    # Suspending lets running tools finish within the grace period, so their
+    # results are recorded instead of becoming uncertain. Model requests are
+    # aborted; they are repeated after reopening.
     live = lock(() -> collect(values(h.live)),h.lock)
-    foreach(x -> Agentif.abort!(x.context.abort),live)
+    foreach(x -> (mode === :abort || poisoned || x.group !== :tool) && Agentif.abort!(x.context.abort),live)
     drained = timedwait(() -> lock(() -> isempty(h.live),h.lock),max(0.0,deadline-_dmono());pollint=.02) === :ok
     drained || return (;status=:draining,reason=:noncooperative_invocation)
     indexed=h.indexer===nothing || timedwait(()->istaskdone(h.indexer),max(0.0,deadline-_dmono());pollint=.02)===:ok

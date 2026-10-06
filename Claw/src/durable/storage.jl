@@ -89,6 +89,54 @@ function _durable_migration_10!(db)
 end
 merge!(CLAW_MIGRATIONS, Dict(7 => _durable_migration_7!, 8 => _durable_migration_8!, 9 => _durable_migration_9!, 10 => _durable_migration_10!))
 
+# The invocation still owns its task: same owner epoch, token and revision, not
+# cancelled, and the harness still accepts results (a closing harness records
+# the results of work it lets finish).
+function _check_fence(db, ctx)
+    h = ctx.harness
+    t = _done(db, "SELECT status, token, epoch, revision, cancel FROM claw_tasks WHERE id=?", (ctx.task_id,))
+    epoch = _done(db, "SELECT owner_epoch FROM claw_runtime_meta WHERE id=1").owner_epoch
+    ok = h.state in (:open, :closing) && epoch == ctx.epoch && t !== nothing && t.status == "running" &&
+        t.token == ctx.token && t.epoch == ctx.epoch && t.revision == ctx.revision[] && t.cancel == 0
+    ok || throw(StaleInvocation())
+    return nothing
+end
+
+function _notify_commit!(h)
+    notify(h.wake)
+    lock(h.commits) do
+        notify(h.commits)
+    end
+    return nothing
+end
+
+"""
+    _await(f, h; timeout_s = Inf, abort = nothing)
+
+Wait until `f()` returns something other than `nothing` and return it, re-checking
+after every commit (and at least once a second), or return `nothing` on timeout or
+abort. Waiting never changes durable state.
+"""
+function _await(f::Function, h; timeout_s::Real = Inf, abort = nothing)
+    deadline = _dmono() + timeout_s
+    while true
+        value = f()
+        value === nothing || return value
+        h.state === :poisoned && throw(HarnessPoisoned())
+        abort !== nothing && Agentif.isaborted(abort) && return nothing
+        remaining = deadline - _dmono()
+        remaining <= 0 && return nothing
+        lock(h.commits) do
+            timer = Timer(_ -> lock(() -> notify(h.commits), h.commits), min(1.0, remaining))
+            try
+                wait(h.commits)
+            finally
+                close(timer)
+            end
+        end
+    end
+end
+
 struct TransitionBatch{F<:Function}
     apply::F
     context::Union{Nothing,InvocationContext}
@@ -118,11 +166,7 @@ function _transition_unlocked!(batch::TransitionBatch, h)
         result, seq, revision = execute_write(h.writer) do db
             meta = _done(db, "SELECT * FROM claw_runtime_meta WHERE id=1")
             meta.owner_epoch == h.epoch || throw(StaleInvocation())
-            if ctx !== nothing
-                t = _done(db, "SELECT * FROM claw_tasks WHERE id=?", (ctx.task_id,))
-                (t !== nothing && t.status == "running" && t.token == ctx.token && t.epoch == ctx.epoch &&
-                    t.revision == ctx.revision[] && t.cancel == 0 && h.state === :open) || throw(StaleInvocation())
-            end
+            ctx === nothing || _check_fence(db, ctx)
             SQLite.execute(db, "BEGIN IMMEDIATE")
             try
                 seq = Int(meta.seq) + 1
@@ -143,7 +187,7 @@ function _transition_unlocked!(batch::TransitionBatch, h)
         ctx === nothing || (ctx.revision[] = revision)
         h.fault(Symbol("after_", point), h)
         _publish!(h, seq)
-        notify(h.wake)
+        _notify_commit!(h)
         return result
     catch
         (committed[] || commit_started[]) && (h.state = :poisoned)
@@ -173,7 +217,8 @@ function _entry!(db, h, seq, c, messages; run = nothing, task = nothing, audit =
         search_channel_id = get(route,"search_channel_id",nothing), channel_flags = get(route,"channel_flags",nothing),
         post_id = something(post_id, get(route,"post_id",nothing), ""))
     Agentif.append_session_batch!(db, c.branch_id, [entry])
-    _exec!(db, "UPDATE claw_conversations SET context_revision=context_revision+1 WHERE id=?", (c.id,))
+    # Audit-only entries (no messages) leave the model context unchanged.
+    isempty(messages) || _exec!(db, "UPDATE claw_conversations SET context_revision=context_revision+1 WHERE id=?", (c.id,))
     _exec!(db, "INSERT INTO claw_entry_runtime(entry_id,run_id,task_id,stop_reason,audit,eligible,seq) VALUES(?,?,?,?,?,?,?)",
         (entry.id,run,task,stop,audit === nothing ? nothing : JSON.json(audit),isempty(messages) ? 0 : 1,seq))
     _exec!(db, "INSERT INTO claw_index_jobs(entry_id,state) VALUES(?,'pending')", (entry.id,))

@@ -35,10 +35,12 @@ function model_turn(progress::Function, agent::Agent, prepared::AgentState, abor
         progress(deepcopy(event))
         nothing
     end
+    # The Codex adapter has its own retry loop, configured by request keyword.
+    codex = agent.model.api == "openai-codex-responses" ? (; max_retries = transport_retries) : (;)
     try
         check_abort(abort)
         stream_fn(sink, agent, state, ToolResultMessage[], abort;
-            http_kw = (; agent.http_kw..., retry = transport_retries > 0, retries = transport_retries), request_options...)
+            http_kw = (; agent.http_kw..., retry = transport_retries > 0, retries = transport_retries), codex..., request_options...)
     catch err
         failure[] = err isa Exception ? err : ErrorException(string(err))
         state.most_recent_stop_reason = isaborted(abort) || err isa AbortEvaluation ? :aborted : :error

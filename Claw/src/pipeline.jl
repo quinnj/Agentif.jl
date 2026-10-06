@@ -300,8 +300,9 @@ function submit_event!(assistant::AgentAssistant, ev::Event;
         dedup_key::Union{Nothing, AbstractString} = event_dedup_key(ev),
         lane::Union{Nothing, AbstractString} = nothing,
     )
-    h=assistant._harness[]
-    h===nothing || h.state===:open || throw(HarnessPoisoned())
+    # Intake persists even while a durable harness cannot schedule (poisoned or
+    # closing): the inbox row survives until a reopened harness dispatches it.
+    h = assistant._harness[]
     assistant._state[] in (:stopping, :stopped) &&
         error("Claw: cannot persist event while the pipeline is $(assistant._state[])")
     name = try
@@ -852,7 +853,12 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
                 current!==nothing && current.status=="running" && current.claim_token==row.claim_token && push!(current_rows,row)
             end
             if !isempty(current_rows)
-                err isa DurableBlocked ? _release_claim!(assistant,current_rows;delay=60.0,last_error=sprint(showerror,err)) :
+                # A blocked dependency or a harness that cannot schedule right now
+                # (poisoned or closing) says nothing about the event itself: return
+                # it to pending without charging an attempt.
+                h=assistant._harness[]
+                waiting=err isa DurableBlocked || err isa HarnessPoisoned || h===nothing || h.state!==:open
+                waiting ? _release_claim!(assistant,current_rows;delay=60.0,last_error=sprint(showerror,err)) :
                     _handle_event_failure!(assistant,current_rows,group[1][2],(),err)
             end
             _release_group_channels!(group,nothing)

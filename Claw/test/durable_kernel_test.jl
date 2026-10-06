@@ -38,11 +38,13 @@ end
             Claw._dread(h) do db
                 Claw._exec!(db,"UPDATE claw_tasks SET token='replacement',revision=revision+1 WHERE id=?",(id,))
             end
-            @test_throws Claw.StaleInvocation Claw.report_progress!(ctx,"stale token, even when throttled")
+            ctx.last_progress[]=-Inf # the next report is written, so it checks the fence
+            @test_throws Claw.StaleInvocation Claw.report_progress!(ctx,"stale token")
             @test Claw.inspect_task(h,id).revision==saved_revision+1
             other=kernel_task(h,c,p,"epoch")
             next,_=Claw._reserve!(h,Claw._task_row(h,other))
             Claw._dread(db->Claw._advance_owner!(db),h)
+            next.last_progress[]=-Inf
             @test_throws Claw.StaleInvocation Claw.report_progress!(next,"stale owner")
             @test_throws Claw.StaleInvocation Claw._verify_invocation!(next)
         finally

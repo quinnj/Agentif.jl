@@ -249,7 +249,8 @@ end
 
 @testset "supervised uncertainty is waiting rather than stalled" begin
     mktempdir() do dir
-        tool=Agentif.@tool "uncertain fixture" uncertain()=error("effect response lost")
+        # The body reports an interruption, so its effect is uncertain.
+        tool=Agentif.@tool "uncertain fixture" uncertain()=throw(Agentif.AbortEvaluation())
         stream=(f,a,s,input,abort;kw...)->begin
             msg=durable_message(a,"";calls=[Agentif.AgentToolCall(;call_id="uncertain",name="uncertain",arguments="{}")])
             Agentif.append_state!(s,input,msg,Agentif.Usage(;total=1));s.most_recent_stop_reason=:tool_calls;s
