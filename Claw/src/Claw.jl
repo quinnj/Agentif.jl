@@ -1531,7 +1531,7 @@ function evaluate(
     assistant._harness[] === nothing || return _durable_evaluate(assistant,input;channel,tools,kw...)
     if assistant._durable_parked[] && channel!==nothing
         blocked=execute_write(assistant._writer) do db
-            _done(db,"""SELECT id FROM claw_conversations c WHERE c.branch_id=? AND
+            _fetch_one(db,"""SELECT id FROM claw_conversations c WHERE c.branch_id=? AND
                 (EXISTS(SELECT 1 FROM claw_tasks t WHERE t.conversation_id=c.id AND t.status!='terminal') OR
                  EXISTS(SELECT 1 FROM claw_submissions s WHERE s.conversation_id=c.id AND s.state IN ('queued','placed'))) LIMIT 1""",
                 (String(Agentif.branch_id(channel)),))

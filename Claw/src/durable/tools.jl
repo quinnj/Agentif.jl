@@ -1,107 +1,117 @@
-function _tool_result!(db,h,seq,t,e,outcome;effect_state="completed")
-    details=outcome.details===nothing ? nothing : JSON.parse(_bounded_json(_sanitize_integration_value(outcome.details),h.limits.progress_bytes))
-    outcome=Agentif.ToolOutcome(outcome.output;is_error=outcome.is_error,details)
-    c=_done(db,"SELECT * FROM claw_conversations WHERE id=?",(t.conversation_id,))
-    message=Agentif.ToolResultMessage(e.call_id,e.tool_name,outcome.output;is_error=outcome.is_error)
-    entry=_entry!(db,h,seq,c,[message];run=t.run_id,task=t.id,stop=outcome.is_error ? "tool_error" : "tool_result")
-    _exec!(db,"UPDATE claw_tool_executions SET effect_state=?,result_entry=?,result=? WHERE task_id=?",
-        (effect_state,entry,JSON.json(outcome),t.id))
-    _finish_task!(db,t,Dict("status"=>"completed","is_error"=>outcome.is_error,"entry"=>entry))
+function _tool_result!(db, h, seq, t, e, outcome; effect_state = "completed")
+    details = outcome.details === nothing ? nothing : JSON.parse(_bounded_json(_sanitize_integration_value(outcome.details), h.limits.progress_bytes))
+    outcome = Agentif.ToolOutcome(outcome.output; is_error = outcome.is_error, details)
+    c = _fetch_one(db, "SELECT * FROM claw_conversations WHERE id=?", (t.conversation_id,))
+    message = Agentif.ToolResultMessage(e.call_id, e.tool_name, outcome.output; is_error = outcome.is_error)
+    entry = _entry!(db, h, seq, c, [message]; run = t.run_id, task = t.id, stop = outcome.is_error ? "tool_error" : "tool_result")
+    _exec!(
+        db, "UPDATE claw_tool_executions SET effect_state=?,result_entry=?,result=? WHERE task_id=?",
+        (effect_state, entry, JSON.json(outcome), t.id)
+    )
+    return _finish_task!(db, t, Dict("status" => "completed", "is_error" => outcome.is_error, "entry" => entry))
 end
 
-function _tool_intents!(db,h,seq,t,c,entry,calls,resolved)
-    children=String[]
-    sequential=any(call -> begin
-        s=findfirst(m->m["name"]==call.name,resolved.profile["tools"])
-        s!==nothing && resolved.profile["tools"][s]["execution"]=="sequential"
-    end,calls)
-    for (ordinal,call) in enumerate(calls)
-        index=findfirst(m->m["name"]==call.name,resolved.profile["tools"])
-        manifest=index===nothing ? nothing : resolved.profile["tools"][index]
-        args=nothing;failure=nothing
-        if manifest===nothing
-            failure="unknown_tool"
+function _tool_intents!(db, h, seq, t, c, entry, calls, resolved)
+    children = String[]
+    sequential = any(
+        call -> begin
+            s = findfirst(m -> m["name"] == call.name, resolved.profile["tools"])
+            s !== nothing && resolved.profile["tools"][s]["execution"] == "sequential"
+        end, calls
+    )
+    for (ordinal, call) in enumerate(calls)
+        index = findfirst(m -> m["name"] == call.name, resolved.profile["tools"])
+        manifest = index === nothing ? nothing : resolved.profile["tools"][index]
+        args = nothing;failure = nothing
+        if manifest === nothing
+            failure = "unknown_tool"
         else
-            spec=h.specs[(call.name,manifest["version"])]
+            spec = h.specs[(call.name, manifest["version"])]
             try
-                args=Agentif.parse_tool_arguments(call.arguments,Agentif.parameters(spec.tool))
-                all(cap->cap in resolved.env.ref.capabilities,spec.capabilities) || throw(ArgumentError("environment capability denied"))
+                args = Agentif.parse_tool_arguments(call.arguments, Agentif.parameters(spec.tool))
+                all(cap -> cap in resolved.env.ref.capabilities, spec.capabilities) || throw(ArgumentError("environment capability denied"))
             catch err
-                failure="tool_argument_parse_failed: "*_diagnostic(h,err)
+                failure = "tool_argument_parse_failed: " * _diagnostic(h, err)
             end
         end
-        issued=JSON.parse(t.input_json)
+        issued = JSON.parse(t.input_json)
         # Tools share the run's deadline.
-        id=_task_create!(db,seq,c.id,"tool","$entry:$(call.call_id)";run=t.run_id,owner=t.id,
-            input=Dict("profile"=>issued["profile"],"deadline"=>issued["deadline"]),checkpoint=Dict("phase"=>"execute"))
-        push!(children,id)
-        if failure!==nothing
-            result=Agentif.ToolResultMessage(call.call_id,call.name,JSON.json(Dict("error_kind"=>failure));is_error=true)
-            _entry!(db,h,seq,c,[result];run=t.run_id,task=id)
-            _exec!(db,"UPDATE claw_tasks SET status='terminal',outcome=? WHERE id=?",(JSON.json(Dict("status"=>"completed","is_error"=>true)),id))
+        id = _task_create!(
+            db, seq, c.id, "tool", "$entry:$(call.call_id)"; run = t.run_id, owner = t.id,
+            input = Dict("profile" => issued["profile"], "deadline" => issued["deadline"]), checkpoint = Dict("phase" => "execute")
+        )
+        push!(children, id)
+        if failure !== nothing
+            result = Agentif.ToolResultMessage(call.call_id, call.name, JSON.json(Dict("error_kind" => failure)); is_error = true)
+            _entry!(db, h, seq, c, [result]; run = t.run_id, task = id)
+            _exec!(db, "UPDATE claw_tasks SET status='terminal',outcome=? WHERE id=?", (JSON.json(Dict("status" => "completed", "is_error" => true)), id))
             continue
         end
-        raw=JSON.json(args)
-        _exec!(db,"""INSERT INTO claw_tool_executions(task_id,conversation_id,assistant_entry,call_id,ordinal,tool_name,manifest,
+        raw = JSON.json(args)
+        _exec!(
+            db, """INSERT INTO claw_tool_executions(task_id,conversation_id,assistant_entry,call_id,ordinal,tool_name,manifest,
             args,args_hash,env,profile_id,effect_key,effect_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'ready')""",
-            (id,c.id,entry,call.call_id,ordinal,call.name,JSON.json(manifest),raw,_digest(JSON.parse(raw)),JSON.json(resolved.profile["env"]),
-             JSON.parse(t.input_json)["profile"],"tool:$id"))
-        if sequential && ordinal>1
-            previous=children[ordinal-1]
-            _exec!(db,"UPDATE claw_tasks SET checkpoint=? WHERE id=?",(JSON.json(Dict("phase"=>"execute","after"=>previous)),id))
+            (
+                id, c.id, entry, call.call_id, ordinal, call.name, JSON.json(manifest), raw, _digest(JSON.parse(raw)), JSON.json(resolved.profile["env"]),
+                JSON.parse(t.input_json)["profile"], "tool:$id",
+            )
+        )
+        if sequential && ordinal > 1
+            previous = children[ordinal - 1]
+            _exec!(db, "UPDATE claw_tasks SET checkpoint=? WHERE id=?", (JSON.json(Dict("phase" => "execute", "after" => previous)), id))
         end
     end
     return children
 end
 
-function report_progress!(ctx::InvocationContext,value)
-    lock(ctx.lock) do
-        ctx.heartbeat[]=_dmono()
+function report_progress!(ctx::InvocationContext, value)
+    return lock(ctx.lock) do
+        ctx.heartbeat[] = _monotonic_s()
         # Cancellation and closing also set these in-memory signals, so throttled
         # reports skip the database; written reports re-check the full fence.
-        (Agentif.isaborted(ctx.abort) || !(ctx.harness.state in (:open,:closing))) && throw(StaleInvocation())
-        _dmono()-ctx.last_progress[] >= ctx.harness.limits.progress_interval || return
-        text=_bounded_json(_sanitize_integration_value(value),ctx.harness.limits.progress_bytes)
-        _transition!(ctx.harness;context=ctx,point=:tool_progress) do db,seq
-            _exec!(db,"UPDATE claw_tasks SET progress=? WHERE id=?",(text,ctx.task_id))
+        (Agentif.isaborted(ctx.abort) || !(ctx.harness.state in (:open, :closing))) && throw(StaleInvocation())
+        _monotonic_s() - ctx.last_progress[] >= ctx.harness.limits.progress_interval || return
+        text = _bounded_json(_sanitize_integration_value(value), ctx.harness.limits.progress_bytes)
+        _transition!(ctx.harness; context = ctx, point = :tool_progress) do db, seq
+            _exec!(db, "UPDATE claw_tasks SET progress=? WHERE id=?", (text, ctx.task_id))
         end
-        ctx.last_progress[]=_dmono()
+        ctx.last_progress[] = _monotonic_s()
     end
 end
 
-function _tool_phase!(ctx,t,resolved)
-    h=ctx.harness
-    e=_dread(db->_done(db,"SELECT * FROM claw_tool_executions WHERE task_id=?",(t.id,)),h)
-    e===nothing && error("missing tool execution intent")
-    get(JSON.parse(t.checkpoint),"phase","")=="child_join" && return _owned_tool_join!(ctx,t,e)
-    manifest=JSON.parse(e.manifest)
-    spec=h.specs[(e.tool_name,manifest["version"])]
-    _spec_data(spec)==manifest && resolved.profile["env"]==JSON.parse(e.env) || error("tool intent compatibility mismatch")
-    _digest(JSON.parse(e.args))==e.args_hash || error("corrupt final tool arguments")
-    if e.effect_state=="uncertain"
-        spec.reconcile===nothing && return _block_invocation!(ctx,"uncertain effect: $(e.effect_key)")
-        result=spec.reconcile(e)
-        result===nothing && return _block_invocation!(ctx,"uncertain effect: $(e.effect_key)")
+function _tool_phase!(ctx, t, resolved)
+    h = ctx.harness
+    e = _on_writer(db -> _fetch_one(db, "SELECT * FROM claw_tool_executions WHERE task_id=?", (t.id,)), h)
+    e === nothing && error("missing tool execution intent")
+    get(JSON.parse(t.checkpoint), "phase", "") == "child_join" && return _owned_tool_join!(ctx, t, e)
+    manifest = JSON.parse(e.manifest)
+    spec = h.specs[(e.tool_name, manifest["version"])]
+    _spec_data(spec) == manifest && resolved.profile["env"] == JSON.parse(e.env) || error("tool intent compatibility mismatch")
+    _digest(JSON.parse(e.args)) == e.args_hash || error("corrupt final tool arguments")
+    if e.effect_state == "uncertain"
+        spec.reconcile === nothing && return _block_invocation!(ctx, "uncertain effect: $(e.effect_key)")
+        result = spec.reconcile(e)
+        result === nothing && return _block_invocation!(ctx, "uncertain effect: $(e.effect_key)")
         if result isa Agentif.ToolOutcome
-            return _transition!(h;context=ctx,point=:tool_result) do db,seq
-                _tool_result!(db,h,seq,t,e,result;effect_state="reconciled")
+            return _transition!(h; context = ctx, point = :tool_result) do db, seq
+                _tool_result!(db, h, seq, t, e, result; effect_state = "reconciled")
             end
         end
-        result===:retry || error("invalid effect reconciliation result")
+        result === :retry || error("invalid effect reconciliation result")
     end
-    args=Agentif.parse_tool_arguments(e.args,Agentif.parameters(spec.tool))
-    _transition!(h;context=ctx,point=:tool_intent) do db,seq
-        _exec!(db,"UPDATE claw_tool_executions SET effect_state='executing' WHERE task_id=?",(t.id,))
+    args = Agentif.parse_tool_arguments(e.args, Agentif.parameters(spec.tool))
+    _transition!(h; context = ctx, point = :tool_intent) do db, seq
+        _exec!(db, "UPDATE claw_tool_executions SET effect_state='executing' WHERE task_id=?", (t.id,))
     end
-    h.fault(:before_effect_body,h)
+    h.fault(:before_effect_body, h)
     _verify_invocation!(ctx)
-    outcome=try
-        result=spec.invoke(spec.tool,args,ctx)
+    outcome = try
+        result = spec.invoke(spec.tool, args, ctx)
         if result isa OwnedToolWait
-            return _transition!(h;context=ctx,point=:tool_child_wait) do db,seq
-                _exec!(db,"UPDATE claw_tool_executions SET effect_state='owned_child' WHERE task_id=?",(t.id,))
-                _exec!(db,"UPDATE claw_tasks SET checkpoint=? WHERE id=?",(JSON.json(Dict("phase"=>"child_join","child"=>result.task,"output"=>result.output)),t.id))
-                _wait_tasks!(db,t.id,[result.task])
+            return _transition!(h; context = ctx, point = :tool_child_wait) do db, seq
+                _exec!(db, "UPDATE claw_tool_executions SET effect_state='owned_child' WHERE task_id=?", (t.id,))
+                _exec!(db, "UPDATE claw_tasks SET checkpoint=? WHERE id=?", (JSON.json(Dict("phase" => "child_join", "child" => result.task, "output" => result.output)), t.id))
+                _wait_tasks!(db, t.id, [result.task])
             end
         end
         result isa Agentif.ToolOutcome ? result : Agentif.ToolOutcome(string(result))
@@ -109,50 +119,55 @@ function _tool_phase!(ctx,t,resolved)
         # A body that throws has returned control: the model gets the error, as
         # in the default tool loop. Only an interruption (abort or deadline) can
         # leave an unsafe body's effect unknown.
-        interrupted=err isa Agentif.AbortEvaluation || Agentif.isaborted(ctx.abort) || _dmono()>ctx.monotonic_deadline
-        if interrupted && spec.replay===:unsafe
-            return _transition!(h;context=ctx,point=:tool_uncertain) do db,seq
-                _exec!(db,"UPDATE claw_tool_executions SET effect_state='uncertain' WHERE task_id=?",(t.id,))
-                _exec!(db,"UPDATE claw_tasks SET status='pending',token=NULL,blocked=?,due_at=? WHERE id=?",
-                    ("uncertain effect: "*_diagnostic(h,err),h.clock()+BLOCKED_RECHECK_S,t.id))
+        interrupted = err isa Agentif.AbortEvaluation || Agentif.isaborted(ctx.abort) || _monotonic_s() > ctx.monotonic_deadline
+        if interrupted && spec.replay === :unsafe
+            return _transition!(h; context = ctx, point = :tool_uncertain) do db, seq
+                _exec!(db, "UPDATE claw_tool_executions SET effect_state='uncertain' WHERE task_id=?", (t.id,))
+                _exec!(
+                    db, "UPDATE claw_tasks SET status='pending',token=NULL,blocked=?,due_at=? WHERE id=?",
+                    ("uncertain effect: " * _diagnostic(h, err), h.clock() + BLOCKED_RECHECK_S, t.id)
+                )
             end
         end
-        Agentif.ToolOutcome(Agentif.render_tool_error_json(;
-            error_kind=interrupted ? "tool_call_interrupted" : "tool_execution_failed",
-            message=_diagnostic(h,err),tool=e.tool_name,call_id=e.call_id);is_error=true)
+        Agentif.ToolOutcome(
+            Agentif.render_tool_error_json(;
+                error_kind = interrupted ? "tool_call_interrupted" : "tool_execution_failed",
+                message = _diagnostic(h, err), tool = e.tool_name, call_id = e.call_id
+            ); is_error = true
+        )
     end
-    h.fault(:after_effect_body,h)
-    _transition!(h;context=ctx,point=:tool_result) do db,seq
-        _tool_result!(db,h,seq,t,e,outcome)
+    h.fault(:after_effect_body, h)
+    return _transition!(h; context = ctx, point = :tool_result) do db, seq
+        _tool_result!(db, h, seq, t, e, outcome)
     end
 end
 
 function _verify_invocation!(ctx)
     Agentif.check_abort(ctx.abort)
-    _dmono()<=ctx.monotonic_deadline || throw(Agentif.AbortEvaluation())
-    _dread(db->_check_fence(db,ctx),ctx.harness)
+    _monotonic_s() <= ctx.monotonic_deadline || throw(Agentif.AbortEvaluation())
+    _on_writer(db -> _check_fence(db, ctx), ctx.harness)
     return nothing
 end
 
-execution_intent(ctx::InvocationContext)=_dread(db->_done(db,"SELECT * FROM claw_tool_executions WHERE task_id=?",(ctx.task_id,)),ctx.harness)
+execution_intent(ctx::InvocationContext) = _on_writer(db -> _fetch_one(db, "SELECT * FROM claw_tool_executions WHERE task_id=?", (ctx.task_id,)), ctx.harness)
 function execution_environment(ctx::InvocationContext)
-    t=_task_row(ctx.harness,ctx.task_id)
-    resolved,reason=_resolve_profile(ctx.harness,JSON.parse(t.input_json)["profile"])
-    reason===nothing || error(reason)
-    resolved.env
+    t = _task_row(ctx.harness, ctx.task_id)
+    resolved, reason = _resolve_profile(ctx.harness, JSON.parse(t.input_json)["profile"])
+    reason === nothing || error(reason)
+    return resolved.env
 end
 
 """Resolve an uncertain effect from operator evidence. This never silently retries
 an unsafe body. `result` records the operator's selected model-visible outcome.
 """
-function resolve_effect!(h::Harness,id::String,result::Agentif.ToolOutcome;note::String)
+function resolve_effect!(h::Harness, id::String, result::Agentif.ToolOutcome; note::String)
     isempty(strip(note)) && throw(ArgumentError("resolution evidence is required"))
-    _transition!(h;point=:effect_resolution) do db,seq
-        t=_done(db,"SELECT * FROM claw_tasks WHERE id=?",(id,))
-        e=_done(db,"SELECT * FROM claw_tool_executions WHERE task_id=?",(id,))
-        e!==nothing && e.effect_state=="uncertain" && t.status=="pending" || throw(ArgumentError("effect is not parked uncertain"))
-        _exec!(db,"UPDATE claw_tasks SET progress=? WHERE id=?",(JSON.json(Dict("resolution"=>first(note,2000))),id))
-        _tool_result!(db,h,seq,t,e,result;effect_state="operator_resolved")
+    _transition!(h; point = :effect_resolution) do db, seq
+        t = _fetch_one(db, "SELECT * FROM claw_tasks WHERE id=?", (id,))
+        e = _fetch_one(db, "SELECT * FROM claw_tool_executions WHERE task_id=?", (id,))
+        e !== nothing && e.effect_state == "uncertain" && t.status == "pending" || throw(ArgumentError("effect is not parked uncertain"))
+        _exec!(db, "UPDATE claw_tasks SET progress=? WHERE id=?", (JSON.json(Dict("resolution" => first(note, 2000))), id))
+        _tool_result!(db, h, seq, t, e, result; effect_state = "operator_resolved")
     end
-    notify(h.wake)
+    return notify(h.wake)
 end

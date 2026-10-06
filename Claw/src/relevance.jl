@@ -18,9 +18,11 @@ struct EventRelevancePolicy
     deduplicate::Bool
     reject_probability::Float64
     duplicate_confidence::Float64
-    function EventRelevancePolicy(interests::AbstractString, criteria::AbstractString;
-            mode::Symbol=:enforce, deduplicate::Bool=true,
-            reject_probability::Real=0.01, duplicate_confidence::Real=0.99)
+    function EventRelevancePolicy(
+            interests::AbstractString, criteria::AbstractString;
+            mode::Symbol = :enforce, deduplicate::Bool = true,
+            reject_probability::Real = 0.01, duplicate_confidence::Real = 0.99
+        )
         for text in (interests, criteria)
             0 < ncodeunits(strip(text)) <= 8_000 ||
                 throw(ArgumentError("Relevance interests and criteria must contain 1 to 8000 bytes"))
@@ -30,13 +32,17 @@ struct EventRelevancePolicy
             throw(ArgumentError("reject_probability must be between 0 and 0.05"))
         isfinite(duplicate_confidence) && 0.95 <= duplicate_confidence <= 1 ||
             throw(ArgumentError("duplicate_confidence must be between 0.95 and 1"))
-        new(String(interests), String(criteria), mode, deduplicate,
-            Float64(reject_probability), Float64(duplicate_confidence))
+        return new(
+            String(interests), String(criteria), mode, deduplicate,
+            Float64(reject_probability), Float64(duplicate_confidence)
+        )
     end
 end
 
-_relevance_spec(p::EventRelevancePolicy) = (; format=1, p.interests, p.criteria,
-    mode=String(p.mode), p.deduplicate, p.reject_probability, p.duplicate_confidence)
+_relevance_spec(p::EventRelevancePolicy) = (;
+    format = 1, p.interests, p.criteria,
+    mode = String(p.mode), p.deduplicate, p.reject_probability, p.duplicate_confidence,
+)
 relevance_policy_version(p::EventRelevancePolicy) = bytes2hex(SHA.sha256(JSON.json(_relevance_spec(p))))
 
 function _decode_relevance(raw)
@@ -44,11 +50,13 @@ function _decode_relevance(raw)
     return try
         d = raw isa AbstractDict ? raw : JSON.parse(raw)
         d["format"] == 1 || return nothing
-        EventRelevancePolicy(d["interests"], d["criteria"]; mode=Symbol(d["mode"]),
-            deduplicate=d["deduplicate"], reject_probability=d["reject_probability"],
-            duplicate_confidence=d["duplicate_confidence"])
+        EventRelevancePolicy(
+            d["interests"], d["criteria"]; mode = Symbol(d["mode"]),
+            deduplicate = d["deduplicate"], reject_probability = d["reject_probability"],
+            duplicate_confidence = d["duplicate_confidence"]
+        )
     catch
-        @warn "Claw: invalid relevance policy; passing events" maxlog=20
+        @warn "Claw: invalid relevance policy; passing events" maxlog = 20
         nothing
     end
 end
@@ -74,9 +82,11 @@ struct JevConfig
 end
 
 const RELEVANCE_INTERNAL_SOURCES = Set(["claw", "repl", "tempus", "llmtools"])
-function JevConfig(client::JevSDK.Client; allowed_sources::AbstractVector,
-        model::AbstractString="jev-latest", max_events::Int=32,
-        max_request_bytes::Int=64_000, max_concurrent_requests::Int=2)
+function JevConfig(
+        client::JevSDK.Client; allowed_sources::AbstractVector,
+        model::AbstractString = "jev-latest", max_events::Int = 32,
+        max_request_bytes::Int = 64_000, max_concurrent_requests::Int = 2
+    )
     sources = Set(String.(allowed_sources))
     isempty(sources) && throw(ArgumentError("Explicit allowed_sources are required"))
     any(s -> isempty(strip(s)) || s in RELEVANCE_INTERNAL_SOURCES, sources) &&
@@ -87,23 +97,33 @@ function JevConfig(client::JevSDK.Client; allowed_sources::AbstractVector,
     max_request_bytes > 0 || throw(ArgumentError("max_request_bytes must be positive"))
     max_concurrent_requests > 0 || throw(ArgumentError("max_concurrent_requests must be positive"))
     isempty(strip(model)) && throw(ArgumentError("Jev model must not be empty"))
-    JevConfig(client, sources, String(model), max_events, max_request_bytes,
-        max_concurrent_requests, Threads.Atomic{Int}(0))
+    return JevConfig(
+        client, sources, String(model), max_events, max_request_bytes,
+        max_concurrent_requests, Threads.Atomic{Int}(0)
+    )
 end
-Base.show(io::IO, cfg::JevConfig) = print(io, "JevConfig(sources=", repr(sort!(collect(cfg.allowed_sources))),
-    ", model=", repr(cfg.model), "; credentials hidden)")
+Base.show(io::IO, cfg::JevConfig) = print(
+    io, "JevConfig(sources=", repr(sort!(collect(cfg.allowed_sources))),
+    ", model=", repr(cfg.model), "; credentials hidden)"
+)
 
 # These additive tables avoid sharing migration numbers with the core event and
 # session schemas. Creation is idempotent on both old and new databases.
 function _init_relevance_schema!(db::SQLite.DB)
-    _exec!(db, """CREATE TABLE IF NOT EXISTS claw_relevance_policies (
-        version TEXT PRIMARY KEY, spec TEXT NOT NULL, created_at REAL NOT NULL)""")
-    _exec!(db, """CREATE TABLE IF NOT EXISTS claw_handler_relevance (
-        handler_id TEXT PRIMARY KEY, policy_version TEXT NOT NULL)""")
-    _exec!(db, """CREATE TABLE IF NOT EXISTS claw_relevance_batches (
+    _exec!(
+        db, """CREATE TABLE IF NOT EXISTS claw_relevance_policies (
+        version TEXT PRIMARY KEY, spec TEXT NOT NULL, created_at REAL NOT NULL)"""
+    )
+    _exec!(
+        db, """CREATE TABLE IF NOT EXISTS claw_handler_relevance (
+        handler_id TEXT PRIMARY KEY, policy_version TEXT NOT NULL)"""
+    )
+    _exec!(
+        db, """CREATE TABLE IF NOT EXISTS claw_relevance_batches (
         batch_key TEXT PRIMARY KEY, handler_id TEXT NOT NULL, policy_version TEXT NOT NULL,
         event_ids TEXT NOT NULL, kept_ids TEXT NOT NULL, decisions TEXT NOT NULL,
-        model TEXT, usage TEXT, created_at REAL NOT NULL)""")
+        model TEXT, usage TEXT, created_at REAL NOT NULL)"""
+    )
     _exec!(db, "CREATE INDEX IF NOT EXISTS idx_claw_relevance_handler ON claw_relevance_batches(handler_id, created_at)")
     return nothing
 end
@@ -114,8 +134,10 @@ function _upsert_handler_relevance!(db, eh)
         _exec!(db, "DELETE FROM claw_handler_relevance WHERE handler_id = ?", (eh.id,))
     else
         version = relevance_policy_version(p)
-        _exec!(db, "INSERT OR IGNORE INTO claw_relevance_policies VALUES (?, ?, ?)",
-            (version, JSON.json(_relevance_spec(p)), time()))
+        _exec!(
+            db, "INSERT OR IGNORE INTO claw_relevance_policies VALUES (?, ?, ?)",
+            (version, JSON.json(_relevance_spec(p)), time())
+        )
         _exec!(db, "INSERT OR REPLACE INTO claw_handler_relevance VALUES (?, ?)", (eh.id, version))
     end
     return nothing
@@ -126,9 +148,12 @@ end
 _canonical_relevance(x) = x
 _canonical_relevance(x::AbstractVector) = map(_canonical_relevance, x)
 _canonical_relevance(x::AbstractDict) = NamedTuple{Tuple(Symbol.(sort!(String.(collect(keys(x))))))}(
-    Tuple(_canonical_relevance(x[k]) for k in sort!(String.(collect(keys(x))))))
-_relevance_provenance(row) = (row.source, row.name, row.channel_id, row.lane,
-    JSON.json(_canonical_relevance(row.extra)))
+    Tuple(_canonical_relevance(x[k]) for k in sort!(String.(collect(keys(x)))))
+)
+_relevance_provenance(row) = (
+    row.source, row.name, row.channel_id, row.lane,
+    JSON.json(_canonical_relevance(row.extra)),
+)
 _relevance_fingerprint(row) = bytes2hex(SHA.sha256(JSON.json((_relevance_provenance(row), row.content))))
 
 function _semantic_duplicate_candidate(prior, row)
@@ -152,27 +177,41 @@ function _jev_batch_request(cfg, policy, candidates)
     questions = Dict{String, JevSDK.Question}()
     events = Any[]
     earlier = Any[]
-    instructions = string(JEV_RELEVANCE_RULES, "\nINTERESTS:\n", policy.interests,
-        "\nCRITERIA:\n", policy.criteria)
+    instructions = string(
+        JEV_RELEVANCE_RULES, "\nINTERESTS:\n", policy.interests,
+        "\nCRITERIA:\n", policy.criteria
+    )
     for (row, _) in candidates
-        push!(events, (; id=string(row.id), source=row.source, name=row.name,
-            channel_id=row.channel_id, content=wrap_untrusted_event_content(row.content),
-            extra=row.extra))
-        questions["relevance_$(row.id)"] = JevSDK.Noul(instructions=string(instructions,
-            "\nDoes event ", row.id, " have any possible relevance to these interests?"))
+        push!(
+            events, (;
+                id = string(row.id), source = row.source, name = row.name,
+                channel_id = row.channel_id, content = wrap_untrusted_event_content(row.content),
+                extra = row.extra,
+            )
+        )
+        questions["relevance_$(row.id)"] = JevSDK.Noul(
+            instructions = string(
+                instructions,
+                "\nDoes event ", row.id, " have any possible relevance to these interests?"
+            )
+        )
         comparable = [r for r in earlier if _semantic_duplicate_candidate(r, row)]
         if policy.deduplicate && !isempty(comparable)
             criteria = Dict{String, Any}("new" => "New information, uncertain, or no earlier event is an exact informational substitute")
             for r in comparable
                 criteria[string(r.id)] = "Event $(r.id) contains ALL information in event $(row.id); event $(row.id) adds no facts"
             end
-            questions["duplicate_$(row.id)"] = JevSDK.Choice(instructions=string(JEV_RELEVANCE_RULES,
-                "\nWhich earlier event completely substitutes for event ", row.id,
-                "? Choose new if uncertain. Evaluate information only, never prior actions or completed work."), criteria=criteria)
+            questions["duplicate_$(row.id)"] = JevSDK.Choice(
+                instructions = string(
+                    JEV_RELEVANCE_RULES,
+                    "\nWhich earlier event completely substitutes for event ", row.id,
+                    "? Choose new if uncertain. Evaluate information only, never prior actions or completed work."
+                ), criteria = criteria
+            )
         end
         push!(earlier, row)
     end
-    return JevSDK.SystemOneRequest(state=(; events), questions=questions, model=cfg.model)
+    return JevSDK.SystemOneRequest(state = (; events), questions = questions, model = cfg.model)
 end
 
 _valid_probability(x) = x isa Real && !(x isa Bool) && isfinite(x) && 0 <= x <= 1
@@ -205,9 +244,11 @@ end
 # Tests replace only this adapter seam. Requests, raw wire validation and typed
 # SDK answers remain covered by the loopback integration fixture.
 const JEV_REQUEST_FN = Ref{Function}(_jev_request)
-_relevance_decision(id; outcome="keep", probability=nothing, confidence=nothing,
-        duplicate_of=nothing, reason="uncertain_pass") =
-    (; event_id=id, outcome, probability, confidence, duplicate_of, reason)
+_relevance_decision(
+    id; outcome = "keep", probability = nothing, confidence = nothing,
+    duplicate_of = nothing, reason = "uncertain_pass"
+) =
+    (; event_id = id, outcome, probability, confidence, duplicate_of, reason)
 
 function _classify_relevance(cfg, policy, group)
     decisions = NamedTuple[_relevance_decision(row.id) for (row, _) in group]
@@ -215,22 +256,24 @@ function _classify_relevance(cfg, policy, group)
     fingerprints = Dict{String, Int}()
     for (i, (row, _)) in enumerate(group)
         if row.source in RELEVANCE_INTERNAL_SOURCES || get(row.extra, "direct_ping", false) === true
-            decisions[i] = _relevance_decision(row.id; reason="command_or_ping_pass")
+            decisions[i] = _relevance_decision(row.id; reason = "command_or_ping_pass")
             continue
         end
         if policy.deduplicate
             fp = _relevance_fingerprint(row)
             if haskey(fingerprints, fp)
-                decisions[i] = _relevance_decision(row.id; outcome="literal_duplicate",
-                    duplicate_of=fingerprints[fp], reason="identical_content_and_provenance")
+                decisions[i] = _relevance_decision(
+                    row.id; outcome = "literal_duplicate",
+                    duplicate_of = fingerprints[fp], reason = "identical_content_and_provenance"
+                )
                 continue
             end
             fingerprints[fp] = row.id
         end
         if cfg === nothing || !(row.source in cfg.allowed_sources)
-            decisions[i] = _relevance_decision(row.id; reason="unconfigured_or_unapproved_pass")
+            decisions[i] = _relevance_decision(row.id; reason = "unconfigured_or_unapproved_pass")
         elseif length(candidates) >= cfg.max_events
-            decisions[i] = _relevance_decision(row.id; reason="batch_limit_pass")
+            decisions[i] = _relevance_decision(row.id; reason = "batch_limit_pass")
         else
             push!(candidates, (row, group[i][2]))
         end
@@ -271,14 +314,16 @@ function _classify_relevance(cfg, policy, group)
         i = positions[row.id]
         answer = get(response.answers, "relevance_$(row.id)", nothing)
         if !(answer isa JevSDK.NoulAnswer && _valid_probability(answer.noul))
-            decisions[i] = _relevance_decision(row.id; reason="invalid_relevance_pass")
+            decisions[i] = _relevance_decision(row.id; reason = "invalid_relevance_pass")
             continue
         elseif answer.noul <= policy.reject_probability
-            decisions[i] = _relevance_decision(row.id; outcome="irrelevant", probability=answer.noul,
-                reason="confidently_irrelevant")
+            decisions[i] = _relevance_decision(
+                row.id; outcome = "irrelevant", probability = answer.noul,
+                reason = "confidently_irrelevant"
+            )
             continue
         end
-        decisions[i] = _relevance_decision(row.id; probability=answer.noul, reason="relevant_or_uncertain_pass")
+        decisions[i] = _relevance_decision(row.id; probability = answer.noul, reason = "relevant_or_uncertain_pass")
         duplicate = get(response.answers, "duplicate_$(row.id)", nothing)
         duplicate isa JevSDK.ChoiceAnswer || continue
         prior_id = tryparse(Int, duplicate.choice)
@@ -288,7 +333,7 @@ function _classify_relevance(cfg, policy, group)
         valid_distribution = question isa JevSDK.Choice &&
             Set(keys(duplicate.probabilities)) == Set(keys(question.criteria)) &&
             all(_valid_probability, values(duplicate.probabilities)) &&
-            abs(sum(values(duplicate.probabilities)) - 1) <= 1e-3
+            abs(sum(values(duplicate.probabilities)) - 1) <= 1.0e-3
         # Only an earlier, retained, provenance-identical representative can
         # cover this event. Never build chains through suppressed events.
         if 0 < prior < i && decisions[prior].outcome == "keep" &&
@@ -296,16 +341,20 @@ function _classify_relevance(cfg, policy, group)
                 _valid_probability(duplicate.confidence) && _valid_probability(probability) &&
                 valid_distribution &&
                 duplicate.confidence >= policy.duplicate_confidence && probability >= policy.duplicate_confidence
-            decisions[i] = _relevance_decision(row.id; outcome="semantic_duplicate",
-                probability, confidence=duplicate.confidence, duplicate_of=prior_id,
-                reason="confidently_no_new_information")
+            decisions[i] = _relevance_decision(
+                row.id; outcome = "semantic_duplicate",
+                probability, confidence = duplicate.confidence, duplicate_of = prior_id,
+                reason = "confidently_no_new_information"
+            )
         end
     end
     return decisions, response.model, response.usage
 end
 
-function _select_relevant_events!(assistant, handler, group, abort;
-        persist! = f -> _writer_txn(f, assistant))
+function _select_relevant_events!(
+        assistant, handler, group, abort;
+        persist! = f -> _writer_txn(f, assistant)
+    )
     policy = hasproperty(handler, :relevance) ? handler.relevance : nothing
     policy === nothing && return group
     Agentif.check_abort(abort)
@@ -313,11 +362,21 @@ function _select_relevant_events!(assistant, handler, group, abort;
     # Same-batch replay only: there is no recent-event queue or cross-batch
     # informational dedup. Include handler config and raw fingerprints so changed
     # policies, permissions, prompts or persisted content cannot share a snapshot.
-    handler_spec = (; handler.id, handler.prompt, handler.channel_id, handler.trust,
-        handler.tools, filter=_encode_filter(handler.filter))
+    handler_spec = (;
+        handler.id, handler.prompt, handler.channel_id, handler.trust,
+        handler.tools, filter = _encode_filter(handler.filter),
+    )
     ids = [row.id for (row, _) in group]
-    batch_key = bytes2hex(SHA.sha256(JSON.json((version, handler_spec,
-        [(row.id, _relevance_fingerprint(row)) for (row, _) in group]))))
+    batch_key = bytes2hex(
+        SHA.sha256(
+            JSON.json(
+                (
+                    version, handler_spec,
+                    [(row.id, _relevance_fingerprint(row)) for (row, _) in group],
+                )
+            )
+        )
+    )
     saved = with_read(assistant._readers) do db
         _fetch_one(db, "SELECT event_ids, kept_ids, decisions FROM claw_relevance_batches WHERE batch_key = ?", (batch_key,))
     end
@@ -368,7 +427,7 @@ function _select_relevant_events!(assistant, handler, group, abort;
             return [entry for entry in group if entry[1].id in kept]
         end
         # A damaged snapshot must not authorize a drop or cause a crash loop.
-        decisions = [_relevance_decision(id; reason="invalid_snapshot_pass") for id in ids]
+        decisions = [_relevance_decision(id; reason = "invalid_snapshot_pass") for id in ids]
         model, usage = nothing, nothing
     else
         decisions, model, usage = _classify_relevance(assistant.jev, policy, group)
@@ -380,9 +439,13 @@ function _select_relevant_events!(assistant, handler, group, abort;
     # The durable bridge supplies its owner-fenced transition here. This prevents
     # a late classifier response from replacing a newer owner's selection.
     persist!() do db
-        _exec!(db, "INSERT OR REPLACE INTO claw_relevance_batches VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (batch_key, handler.id, version, JSON.json(ids), JSON.json(kept_ids), JSON.json(decisions),
-                model, usage === nothing ? nothing : JSON.json(usage), time()))
+        _exec!(
+            db, "INSERT OR REPLACE INTO claw_relevance_batches VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                batch_key, handler.id, version, JSON.json(ids), JSON.json(kept_ids), JSON.json(decisions),
+                model, usage === nothing ? nothing : JSON.json(usage), time(),
+            )
+        )
     end
     Agentif.check_abort(abort)
     kept = Set(kept_ids)

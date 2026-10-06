@@ -14,7 +14,7 @@ end
 
 eligible_tool_calls(outcome::ModelTurnOutcome) =
     outcome.error === nothing && outcome.stop_reason in (:stop, :tool_calls) ?
-        deepcopy(outcome.pending_calls) : PendingToolCall[]
+    deepcopy(outcome.pending_calls) : PendingToolCall[]
 
 """Execute a single turn from copied prepared context. Progress events are copies.
 
@@ -22,8 +22,10 @@ Transport retries are disabled by default so a durable host owns the total attem
 budget. Ordinary `stream` and `evaluate` defaults are unchanged. `request_options`
 are provider request keywords. `stream_fn` supports deterministic provider fixtures.
 """
-function model_turn(progress::Function, agent::Agent, prepared::AgentState, abort::Abort = Abort();
-        request_options = (;), stream_fn = stream, transport_retries::Int = 0)
+function model_turn(
+        progress::Function, agent::Agent, prepared::AgentState, abort::Abort = Abort();
+        request_options = (;), stream_fn = stream, transport_retries::Int = 0
+    )
     state = deepcopy(prepared)
     state.usage = Usage()
     empty!(state.pending_tool_calls)
@@ -39,8 +41,10 @@ function model_turn(progress::Function, agent::Agent, prepared::AgentState, abor
     codex = agent.model.api == "openai-codex-responses" ? (; max_retries = transport_retries) : (;)
     try
         check_abort(abort)
-        stream_fn(sink, agent, state, ToolResultMessage[], abort;
-            http_kw = (; agent.http_kw..., retry = transport_retries > 0, retries = transport_retries), codex..., request_options...)
+        stream_fn(
+            sink, agent, state, ToolResultMessage[], abort;
+            http_kw = (; agent.http_kw..., retry = transport_retries > 0, retries = transport_retries), codex..., request_options...
+        )
     catch err
         failure[] = err isa Exception ? err : ErrorException(string(err))
         state.most_recent_stop_reason = isaborted(abort) || err isa AbortEvaluation ? :aborted : :error
@@ -49,8 +53,10 @@ function model_turn(progress::Function, agent::Agent, prepared::AgentState, abor
     reason = isaborted(abort) ? :aborted : failure[] !== nothing ? :error :
         something(state.most_recent_stop_reason, :invalid_response)
     calls = message === nothing ? PendingToolCall[] : pending_tool_calls_from_message(message)
-    return ModelTurnOutcome(deepcopy(message), reason, deepcopy(calls), deepcopy(state.usage),
-        failure[], state.response_id)
+    return ModelTurnOutcome(
+        deepcopy(message), reason, deepcopy(calls), deepcopy(state.usage),
+        failure[], state.response_id
+    )
 end
 
 struct ToolOutcome
@@ -69,7 +75,7 @@ Context-aware hosts can install an explicitly versioned invocation adapter.
 function invoke_tool(tool::AgentTool, parsed_args, context)
     hasproperty(context, :abort) && check_abort(context.abort)
     hasproperty(context, :deadline) && time() >= context.deadline && throw(AbortEvaluation())
-    ToolOutcome(invoke_parsed_tool(tool, parsed_args))
+    return ToolOutcome(invoke_parsed_tool(tool, parsed_args))
 end
 
 valid_summary(outcome::ModelTurnOutcome) = outcome.error === nothing && outcome.stop_reason === :stop &&

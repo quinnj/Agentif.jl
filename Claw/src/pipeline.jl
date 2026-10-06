@@ -432,12 +432,12 @@ group it runs with from now on (see `_process_event_batch!`).
 """
 function _claim_event!(assistant::AgentAssistant, id::Int; batch::Union{Nothing, Int} = nothing)
     lease = time() + assistant.pipeline.lease_duration_s
-    token = _did()
+    token = _new_id()
     return _writer_txn(assistant) do db
         if assistant._harness[]===nothing
-            frozen=_done(db,"SELECT event_id FROM claw_frozen_members WHERE event_id=?",(id,))
+            frozen=_fetch_one(db,"SELECT event_id FROM claw_frozen_members WHERE event_id=?",(id,))
             frozen===nothing || return nothing
-            mode=_done(db,"SELECT durable FROM claw_events WHERE id=?",(id,))
+            mode=_fetch_one(db,"SELECT durable FROM claw_events WHERE id=?",(id,))
             mode===nothing || mode.durable==0 || return nothing
         end
         _exec!(db,
@@ -848,7 +848,7 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
             current_rows=EventRow[]
             for (row,ev) in group
                 current=with_read(assistant._readers) do db
-                    _done(db,"SELECT status,claim_token FROM claw_events WHERE id=?",(row.id,))
+                    _fetch_one(db,"SELECT status,claim_token FROM claw_events WHERE id=?",(row.id,))
                 end
                 current!==nothing && current.status=="running" && current.claim_token==row.claim_token && push!(current_rows,row)
             end
@@ -1018,7 +1018,7 @@ function _scan_due_events!(assistant::AgentAssistant)
     active=lock(()->Set(keys(assistant._inflight)),assistant._inflight_lock)
     try
         execute_write(assistant._writer) do db
-            for row in _drows(db,"SELECT id,claim_token,claim_revision FROM claw_events WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?",(now,))
+            for row in _fetch_all(db,"SELECT id,claim_token,claim_revision FROM claw_events WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?",(now,))
                 row.id in active && continue
                 _exec!(db,"UPDATE claw_events SET status='pending',lease_expires_at=NULL,claim_token=NULL,claim_revision=claim_revision+1 WHERE id=? AND status='running' AND claim_revision=?",
                     (row.id,row.claim_revision))
@@ -1141,7 +1141,7 @@ function _rehydration_ready!(assistant::AgentAssistant)
 end
 
 # ─── Event loop ───
-_lookup_event_admission(a::AgentAssistant,key::String)=with_read(db->_done(db,"SELECT id,status FROM claw_events WHERE dedup_key=?",(key,)),a._readers)
+_lookup_event_admission(a::AgentAssistant,key::String)=with_read(db->_fetch_one(db,"SELECT id,status FROM claw_events WHERE dedup_key=?",(key,)),a._readers)
 
 function start_event_loop!(assistant::AgentAssistant; level::Union{Nothing, LogLevel} = assistant.log_level)
     assistant._harness[]===nothing && _guard_legacy_runtime!(assistant)
