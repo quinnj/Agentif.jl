@@ -270,26 +270,35 @@ end
 end
 
 @testset "supervised uncertainty is waiting rather than stalled" begin
-    mktempdir() do dir
-        # The body reports an interruption, so its effect is uncertain.
-        tool = Agentif.@tool "uncertain fixture" uncertain() = throw(Agentif.AbortEvaluation())
-        stream = (f, a, s, input, abort; kw...) -> begin
-            msg = durable_message(a, ""; calls = [Agentif.AgentToolCall(; call_id = "uncertain", name = "uncertain", arguments = "{}")])
-            Agentif.append_state!(s, input, msg, Agentif.Usage(; total = 1));s.most_recent_stop_reason = :tool_calls;s
-        end
-        watcher = Claw.WatcherConfig(; provider = "test", model_id = "durable-test", apikey = "key", stall_timeout_s = 0.05, check_interval_s = 0.02)
+    # The body reports an interruption, so its effect is uncertain.
+    tool = Agentif.@tool "uncertain fixture" uncertain() = throw(Agentif.AbortEvaluation())
+    stream = (f, a, s, input, abort; kw...) -> begin
+        msg = durable_message(a, ""; calls = [Agentif.AgentToolCall(; call_id = "uncertain", name = "uncertain", arguments = "{}")])
+        Agentif.append_state!(s, input, msg, Agentif.Usage(; total = 1));s.most_recent_stop_reason = :tool_calls;s
+    end
+    function start_uncertain(dir; watcher = nothing)
         a, h = attached_fixture(joinpath(dir, "supervised.sqlite"); watcher, stream)
+        a._state[] = :running
+        push!(a.tools, tool)
+        Claw.register_event_handler!(a, Claw.EventHandler("uncertain", ["durable-event"], "uncertain"))
+        Claw._process_event!(a, Claw.submit_event!(a, DurableEvent(DurableChannel("uncertain"), "uncertain")))
+        integration_until(() -> Claw._on_writer(db -> Claw._scalar(db, "SELECT COUNT(*) FROM claw_tool_executions WHERE effect_state='uncertain'"), h) == 1)
+        return a, h
+    end
+    supervisor(stall) = Claw.WatcherConfig(; provider = "test", model_id = "durable-test", apikey = "key", stall_timeout_s = stall, check_interval_s = 0.02)
+    # First-call compilation outlasts the short stall budget below, so run the
+    # same supervised path once with a long budget first.
+    mktempdir() do dir
+        a, _ = start_uncertain(dir; watcher = supervisor(60))
+        Claw.shutdown!(a; timeout_s = 10)
+    end
+    mktempdir() do dir
+        a, h = start_uncertain(dir; watcher = supervisor(0.25))
         try
-            a._state[] = :running
-            push!(a.tools, tool)
-            Claw.register_event_handler!(a, Claw.EventHandler("uncertain", ["durable-event"], "uncertain"))
-            id = Claw.submit_event!(a, DurableEvent(DurableChannel("uncertain"), "uncertain"))
-            Claw._process_event!(a, id)
-            integration_until(() -> Claw._on_writer(db -> Claw._scalar(db, "SELECT COUNT(*) FROM claw_tool_executions WHERE effect_state='uncertain'"), h) == 1)
             integration_until(() -> isempty(lock(() -> collect(h.live), h.lock)))
             sleep(0.1) # let a supervisor that sampled the last live phase commit its heartbeat
             seq = Claw._on_writer(db -> Claw._scalar(db, "SELECT seq FROM claw_runtime_meta"), h)
-            sleep(0.15)
+            sleep(0.4) # longer than the stall budget plus a check interval
             @test Claw._on_writer(db -> Claw._scalar(db, "SELECT seq FROM claw_runtime_meta"), h) == seq
             journal = Claw._on_writer(db -> Claw._fetch_one(db, "SELECT status,failure_class FROM claw_evals"), h)
             @test journal.status == "running" && ismissing(journal.failure_class)

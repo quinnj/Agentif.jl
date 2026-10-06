@@ -350,9 +350,12 @@ end
     ev = WatcherTestEvent("test_event", "wedged thing")
     handler = (; id = "h-zombie", prompt = "Test prompt", channel_id = ch.id)
     # Ignores abort entirely; bounded sleep so the leaked task ends on its own.
-    zombie_handler = (f, agent, state, input, abort; kw...) -> (sleep(5.0); state)
-    elapsed = @elapsed run_handler_guarded(a, ev, handler; base_handler = zombie_handler)
-    @test elapsed < 4.0  # returned well before the zombie's 5s sleep
+    # Wall-clock bounds would include first-call compilation, so assert the
+    # supervisor answered before the zombie woke instead.
+    woke = Ref(false)
+    zombie_handler = (f, agent, state, input, abort; kw...) -> (sleep(20.0); woke[] = true; state)
+    run_handler_guarded(a, ev, handler; base_handler = zombie_handler)
+    @test !woke[]
     rows = fetch_evals(a.db)
     @test length(rows) == 1
     row = rows[1]

@@ -101,9 +101,10 @@ end
             c = Claw.ensure_conversation!(h; branch_id = "indexed", profile)
             r = Claw.submit!(h, c, "erase this exact content"; request_id = "indexed", origin = Dict("post_id" => "erase"))
             integration_until(() -> isready(entered))
-            start = time()
-            second = Claw.submit!(h, c, "following input"; request_id = "following")
-            @test time() - start < 2
+            # The embedder stays blocked until `release`, so admission must not wait on it.
+            following = errormonitor(Threads.@spawn Claw.submit!(h, c, "following input"; request_id = "following"))
+            @test timedwait(() -> istaskdone(following), 10) === :ok
+            second = fetch(following)
             @test Claw.submission(second) !== nothing
             Claw.scrub_durable_post!(h, "erase")
             # Unrelated later input survives the scrub and is indexed too.
