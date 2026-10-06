@@ -100,7 +100,7 @@ throwing_watcher_handler = (f, agent, state, input, abort; kw...) -> error("watc
 # ─── Helpers ───
 
 function make_watcher_assistant(; watcher = nothing)
-    AgentAssistant(":memory:";
+    AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider = "watcher-test", model_id = "watcher-test-model", apikey = "test-key",
         timezone = "America/Denver", watcher)
 end
@@ -350,9 +350,12 @@ end
     ev = WatcherTestEvent("test_event", "wedged thing")
     handler = (; id = "h-zombie", prompt = "Test prompt", channel_id = ch.id)
     # Ignores abort entirely; bounded sleep so the leaked task ends on its own.
-    zombie_handler = (f, agent, state, input, abort; kw...) -> (sleep(5.0); state)
-    elapsed = @elapsed run_handler_guarded(a, ev, handler; base_handler = zombie_handler)
-    @test elapsed < 4.0  # returned well before the zombie's 5s sleep
+    # Wall-clock bounds would include first-call compilation, so assert the
+    # supervisor answered before the zombie woke instead.
+    woke = Ref(false)
+    zombie_handler = (f, agent, state, input, abort; kw...) -> (sleep(20.0); woke[] = true; state)
+    run_handler_guarded(a, ev, handler; base_handler = zombie_handler)
+    @test !woke[]
     rows = fetch_evals(a.db)
     @test length(rows) == 1
     row = rows[1]
@@ -506,18 +509,16 @@ end
 
 @testset "init! crash recovery: running rows flipped to failed/process_crash" begin
     db_path = tempname() * ".sqlite"
-    a1 = AgentAssistant(db_path;
+    a1 = AgentAssistant(db_path; search_options=(embed=nothing,),
         provider = "watcher-test", model_id = "watcher-test-model", apikey = "test-key")
     SQLite.DBInterface.execute(a1.db, """
         INSERT INTO claw_evals (event_name, handler_id, status, started_at, last_activity_at)
         VALUES ('crash_event', 'h-crash', 'running', ?, ?)
     """, (time(), time()))
     @test fetch_evals(a1.db)[1].status == "running"
-    Claw.close_writer!(a1._writer)
-    Claw.close_readers!(a1._readers)
-    close(a1.db)  # simulate process exit
+    Claw.shutdown!(a1;timeout_s=0.1)  # simulate process exit
 
-    a2 = Claw.init!(db_path;
+    a2 = Claw.init!(db_path; search_options=(embed=nothing,),
         event_sources = Claw.EventSource[],
         provider = "watcher-test", model_id = "watcher-test-model", apikey = "test-key",
         watcher = watcher_cfg())

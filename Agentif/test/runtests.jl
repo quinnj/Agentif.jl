@@ -659,12 +659,12 @@ end
         "argument `yield_time_ms` expects an integer or null, but received a string"
     @test parse_message("\"echo hi\"") ==
         "expected a JSON object of arguments, but received a string"
-    # JSON.jl v1.7.1 raises BoundsError, not its own ArgumentError, when the
-    # input ends mid-token; the call site must absorb that.
-    @test parse_message("{\"cmd\":\"echo") ==
-        "the arguments are not valid JSON: the input ends unexpectedly (truncated or malformed)"
-    @test parse_message("{") ==
-        "the arguments are not valid JSON: the input ends unexpectedly (truncated or malformed)"
+    # JSON.jl 1.7's broken EOF diagnostic needs a fallback; 1.8 supplies a
+    # proper UnexpectedEOF diagnostic. Both remain field-validation errors.
+    truncated_diagnostic(message) = startswith(message,"the arguments are not valid JSON: ") &&
+        occursin(r"the input ends unexpectedly \(truncated or malformed\)|UnexpectedEOF",message)
+    @test truncated_diagnostic(parse_message("{\"cmd\":\"echo"))
+    @test truncated_diagnostic(parse_message("{"))
     # JSON.jl's own diagnostic survives when it is well formed
     @test occursin("invalid JSON at byte position", parse_message("{cmd:\"echo hi\"}"))
 
@@ -678,7 +678,7 @@ end
     typed_tool = @tool "Echoes." echoer(cmd::String) = cmd
     for (args, expected) in [
             ("{\"cmd\":12345}", "argument `cmd` expects a string, but received an integer"),
-            ("{\"cmd\":\"echo", "the input ends unexpectedly (truncated or malformed)"),
+            ("{\"cmd\":\"echo", r"the input ends unexpectedly \(truncated or malformed\)|UnexpectedEOF"),
         ]
         tc = Agentif.PendingToolCall(; call_id = "call-bad", name = "echoer", arguments = args)
         trm = wait(Agentif.call_function_tool!(identity, typed_tool, tc))
@@ -4681,3 +4681,5 @@ end
             content = [Agentif.TextContent(; text = "ok")], is_error = false)], model)
     @test only(m.reasoning_details for m in compacted_messages if m.role == "assistant") == current_details
 end
+
+include("turn_test.jl")

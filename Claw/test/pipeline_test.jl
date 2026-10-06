@@ -70,8 +70,8 @@ Claw.get_name(ev::NamedPipelineEvent) = ev.name
 Claw.get_channel(ev::NamedPipelineEvent) = ev.channel
 Claw.event_content(ev::NamedPipelineEvent) = ev.content
 
-function make_assistant(db_path::String = ":memory:"; kwargs...)
-    return Claw.AgentAssistant(db_path;
+function make_assistant(db_path::String = ":memory:"; search_options=(embed=nothing,),kwargs...)
+    return Claw.AgentAssistant(db_path; search_options,
         provider = "openai-completions",
         model_id = "gpt-4o-mini",
         apikey = "test-key",
@@ -110,6 +110,38 @@ end
 const FAST = (; scan_interval_s = 0.05, min_refire_gap_s = 0.05, lane_backlog_warn_s = 0.5)
 
 # ─── §1.7 SQLite ownership + migrations ───
+
+@testset "restarts tolerate a stale backup_path and foreign-key orphans" begin
+    path = tempname() * ".sqlite"
+    backup = tempname() * ".sqlite"
+    open_assistant() = Claw.AgentAssistant(path; search_options = (; embed = nothing), backup_path = backup,
+        provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key", timezone = "UTC", level = :error)
+    function close_assistant(a)
+        Claw.close_writer!(a._writer)
+        Claw.close_readers!(a._readers)
+        close(a.session_store.db)
+        close(a.db)
+    end
+    try
+        close_assistant(open_assistant())       # migrates, and backs up first
+        @test isfile(backup)
+        close_assistant(open_assistant())       # nothing to migrate: no second backup
+        # An orphan written by a connection without foreign keys (the sqlite3
+        # default) is reported before the next migration, not a reason to refuse.
+        db = SQLite.DB(path)
+        SQLite.execute(db, "INSERT INTO claw_agent_data_tags (key, tag) VALUES ('missing', 'x')")
+        SQLite.execute(db, "PRAGMA user_version = $(Claw.CLAW_SCHEMA_VERSION - 1)")
+        close(db)
+        rm(backup)
+        a = @test_logs (:warn, r"foreign-key orphans") match_mode = :any open_assistant()
+        @test Claw._get_user_version(a.db) == Claw.CLAW_SCHEMA_VERSION
+        close_assistant(a)
+    finally
+        for f in (path, path * "-wal", path * "-shm", backup)
+            rm(f; force = true)
+        end
+    end
+end
 
 @testset "SQLite writer + user_version migrations" begin
     path = tempname() * ".sqlite"
@@ -164,7 +196,7 @@ end
 
 @testset "session persistence shares the pipeline writer" begin
     path = tempname() * ".sqlite"
-    a = make_assistant(path)
+    a = make_assistant(path;search_options=(embed=texts->zeros(Float32,2,length(texts)),))
     try
         # Pause inside LocalSearch after it has read the document metadata and
         # before it writes the embedding rows. With a second write connection,
@@ -254,7 +286,7 @@ end
         id = Claw.submit_event!(a, PipelineTestEvent("durable", ch))
         row = Claw._claim_event!(a, id)
         @test row !== nothing
-        Claw._finish_event!(a, id, "done")     # last statement on the writer
+        Claw._finish_event!(a, row, "done")     # last statement on the writer
 
         probe = SQLite.DB(path)                # an independent connection
         status = nothing
@@ -560,7 +592,7 @@ end
         ("with a provider error", soft_error_handler, "overloaded"),
         ("without a provider error", silent_error_handler, "stop reason :error"),
     ]
-    a = Claw.AgentAssistant(":memory:";
+    a = Claw.AgentAssistant(":memory:";search_options=(;embed=nothing),
         provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
         timezone = "UTC", level = :error,
         pipeline = Claw.PipelineConfig(; retry_backoff_s = [0.05], max_attempts = 2, unknown_max_attempts = 2,
@@ -584,8 +616,90 @@ end
     Claw.shutdown!(a; timeout_s = 5)
 end
 
+# Turn 1 calls `side_effect`; the next call fails `failures` times with a provider
+# error, then answers. A retry resumes from the session checkpoints.
+function tool_then_error_handler(failures::Ref{Int})
+    return function (f, agent, state, input, abort; kw...)
+        msg = Agentif.AssistantMessage(; provider = "test", api = "test", model = "test")
+        if !any(m -> m isa Agentif.ToolResultMessage, state.messages)
+            push!(msg.tool_calls, Agentif.AgentToolCall(; call_id = "c1", name = "side_effect", arguments = "{}"))
+            Agentif.append_state!(state, input, msg, Agentif.Usage())
+            state.pending_tool_calls = Agentif.pending_tool_calls_from_message(msg)
+            state.most_recent_stop_reason = :tool_calls
+        elseif failures[] > 0
+            failures[] -= 1
+            f(Agentif.AgentErrorEvent(ErrorException("provider overloaded")))
+            Agentif.append_state!(state, input, msg, Agentif.Usage())
+            state.most_recent_stop_reason = :error
+        else
+            Agentif.append_text!(msg, "done")
+            Agentif.append_state!(state, input, msg, Agentif.Usage())
+            state.most_recent_stop_reason = :stop
+        end
+        return state
+    end
+end
+
+function tool_pipeline_assistant(effect; path = ":memory:")
+    a = Claw.AgentAssistant(path; search_options = (; embed = nothing),
+        provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
+        timezone = "UTC", level = :error,
+        pipeline = Claw.PipelineConfig(; retry_backoff_s = [0.05], max_attempts = 3,
+            min_refire_gap_s = 0.05, scan_interval_s = 0.05, lane_backlog_warn_s = 5.0))
+    Claw.CURRENT_ASSISTANT[] = a
+    push!(a.tools, effect)
+    return a
+end
+
+@testset "a provider error after a finished tool is retried without re-running it" begin
+    runs = Threads.Atomic{Int}(0)
+    effect = Agentif.@tool "Apply an effect." side_effect() = (Threads.atomic_add!(runs, 1); "applied")
+    a = tool_pipeline_assistant(effect)
+    ch = RecordingChannel("tool-then-error")
+    a._channels[ch.id] = ch
+    register_test_handler!(a)
+    handler = tool_then_error_handler(Ref(1))
+    local id
+    with_handler((assistant, ev, h; kwargs...) -> Claw._run_event_handler!(assistant, ev, h; kwargs..., base_handler = handler)) do
+        Claw.start_event_loop!(a)
+        id = Claw.submit_event!(a, PipelineTestEvent("act", ch))
+        @test timedwait(() -> event_row(a, id).status in ("done", "dead"), 20.0) == :ok
+    end
+    row = event_row(a, id)
+    @test row.status == "done"
+    @test row.attempts == 2
+    @test runs[] == 1                           # the retry resumed after the tool
+    @test isempty(sent_messages(ch))            # no dead-letter notice
+    Claw.shutdown!(a; timeout_s = 5)
+end
+
+@testset "shutdown while a tool runs returns the event to pending" begin
+    started = Threads.Event()
+    effect = Agentif.@tool "Apply an effect." side_effect() = (notify(started); sleep(1.0); "applied")
+    path = tempname() * ".sqlite"
+    a = tool_pipeline_assistant(effect; path)
+    ch = RecordingChannel("shutdown-mid-tool")
+    a._channels[ch.id] = ch
+    register_test_handler!(a)
+    handler = tool_then_error_handler(Ref(0))
+    local id
+    with_handler((assistant, ev, h; kwargs...) -> Claw._run_event_handler!(assistant, ev, h; kwargs..., base_handler = handler)) do
+        Claw.start_event_loop!(a)
+        id = Claw.submit_event!(a, PipelineTestEvent("act", ch))
+        wait(started)
+        Claw.shutdown!(a; timeout_s = 0.2)      # aborts while the tool is still running
+    end
+    db = SQLite.DB(path)
+    row = Claw._fetch_one(db, "SELECT status, attempts FROM claw_events WHERE id = ?", (id,))
+    close(db)
+    @test row.status == "pending"
+    @test row.attempts == 0
+    @test isempty(sent_messages(ch))
+    rm(path; force = true)
+end
+
 @testset "a refusal is the model's answer, not a failure to retry" begin
-    a = Claw.AgentAssistant(":memory:";
+    a = Claw.AgentAssistant(":memory:";search_options=(;embed=nothing),
         provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
         timezone = "UTC", level = :error,
         pipeline = Claw.PipelineConfig(; retry_backoff_s = [0.05], max_attempts = 2,
@@ -631,7 +745,7 @@ end
             provider = "midstream-error", baseUrl = "http://127.0.0.1:$(HTTP.port(server))", reasoning = false,
             input = ["text"], cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
             contextWindow = 100000, maxTokens = 4096))
-        a = Claw.AgentAssistant(":memory:";
+        a = Claw.AgentAssistant(":memory:";search_options=(;embed=nothing),
             provider = "midstream-error", model_id = "midstream-error-model", apikey = "test-key",
             timezone = "UTC", level = :error,
             pipeline = Claw.PipelineConfig(; retry_backoff_s = [0.05], unknown_max_attempts = 2,
@@ -969,7 +1083,7 @@ end
             push!(seen, Claw.event_content(ev))
             return nothing
         end) do
-            a = Claw.init!(path;
+            a = Claw.init!(path; search_options=(embed=nothing,),
                 event_sources = Claw.EventSource[],
                 provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key",
                 level = :error, install_signal_handlers = false,
@@ -998,7 +1112,7 @@ function remove_db(path)
     end
 end
 
-init_test_assistant(path) = Claw.init!(path;
+init_test_assistant(path) = Claw.init!(path; search_options=(embed=nothing,),
     event_sources = Claw.EventSource[],
     provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
     level = :error, install_signal_handlers = false,
@@ -1125,7 +1239,7 @@ end
 end
 
 @testset "a batch settles all of its events in one write" begin
-    a = Claw.AgentAssistant(":memory:";
+    a = Claw.AgentAssistant(":memory:";search_options=(;embed=nothing),
         provider = "pipeline-test", model_id = "pipeline-test-model", apikey = "test-key",
         timezone = "UTC", level = :error, pipeline = Claw.PipelineConfig(; FAST...))
     Claw.CURRENT_ASSISTANT[] = a
@@ -1165,7 +1279,7 @@ end
         # Answered batch: the second "done" write fails, so neither row settles.
         e1, e2 = Claw.submit_event!(a, PipelineTestEvent("one", ch)), Claw.submit_event!(a, PipelineTestEvent("two", ch))
         fail_settle!(e2, "done")
-        Claw._process_event_batch!(a, [e1, e2])
+        @test_throws SQLite.SQLiteException Claw._process_event_batch!(a, [e1, e2])
         allow_settle!()
         @test effects[] == 1
         @test status(e1) == status(e2) == "running"
@@ -1180,7 +1294,7 @@ end
         failing[] = true
         e3, e4 = Claw.submit_event!(a, PipelineTestEvent("three", ch)), Claw.submit_event!(a, PipelineTestEvent("four", ch))
         fail_settle!(e4, "pending")
-        Claw._process_event_batch!(a, [e3, e4])
+        @test_throws SQLite.SQLiteException Claw._process_event_batch!(a, [e3, e4])
         allow_settle!()
         @test status(e3) == status(e4) == "running"
         Claw._process_event_batch!(a, [e3, e4])     # not pending: nothing runs
@@ -1250,7 +1364,7 @@ Claw.RUN_EVENT_HANDLER_FN[] = function (assistant, ev, handler; kwargs...)
     return Claw._run_event_handler!(assistant, ev, handler; kwargs..., base_handler = scripted_model)
 end
 
-a = Claw.init!(DB_PATH; event_sources = Claw.EventSource[],
+a = Claw.init!(DB_PATH; search_options=(embed=nothing,), event_sources = Claw.EventSource[],
     provider = "crash-test", model_id = "crash-test-model", apikey = "test-key",
     level = :error, install_signal_handlers = false,
     pipeline = Claw.PipelineConfig(; scan_interval_s = 0.05, min_refire_gap_s = 0.05))

@@ -2,6 +2,10 @@
 
 `Claw` is the event-driven assistant app layer built on top of `Agentif` and `LLMTools`.
 
+Opt-in `durable=true` adds committed input receipts, model/tool recovery, owned
+children, compaction and outbound delivery. See [the durable runtime guide](docs/durable.md)
+for APIs, migration, operator recovery and guarantees.
+
 It combines:
 
 - SQLite-backed assistant/session state
@@ -233,6 +237,13 @@ the model sends the event to the pipeline's retry ladder rather than silently
 dropping or delivering it. The `add_event_handler` tool takes
 `filter_type`/`filter_expr`/`filter_pattern` arguments.
 
+An optional contextual Jev policy selects events after these filters. The
+subscription setup model records the user's interests and relevance criteria;
+uncertain or unavailable classifications pass to the full model. Jev requires
+an explicitly configured client and approval for the source data being sent.
+It can deduplicate information within a batch without changing action permissions.
+See [relevance and deduplication](docs/relevance.md) for setup, auditing and limits.
+
 ## Coalescing
 
 When several events of the same type pile up on one lane behind a running
@@ -241,6 +252,10 @@ evaluation (a burst of chat messages), the next drain folds up to
 prompt demarcates each event (`--- Event i of N ---`). Filters apply per event
 before the batch forms. `max_coalesce = 1` disables coalescing. The global
 concurrency cap is `PipelineConfig.max_concurrent_evals`.
+
+`PipelineConfig.coalesce_window_s` optionally collects a burst for up to two
+seconds from its first event's queued age. The default is zero, preserving the
+existing opportunistic drain. Waiting holds no event claims or evaluation slots.
 
 ## Untrusted event content
 

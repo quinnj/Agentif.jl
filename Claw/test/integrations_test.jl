@@ -204,7 +204,7 @@ Claw.register_integration!(INVALID_SPEC, InvalidEventSource)
 # loads the real Telegram/Slack packages into this process.)
 Claw.INTEGRATION_SPECS["ghost"] = Claw.IntegrationSpec("ghost", "GhostPkg", "ghost integration for tests", [])
 
-make_assistant(db_path::String = ":memory:") = Claw.AgentAssistant(db_path;
+make_assistant(db_path::String = ":memory:") = Claw.AgentAssistant(db_path; search_options=(embed=nothing,),
     provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key",
     timezone = "UTC", level = :error)
 
@@ -414,7 +414,7 @@ end
 
 @testset "disable serializes with source start" begin
     cfg = Claw.PipelineConfig(; source_stop_timeout_s = 0.5)
-    a = Claw.AgentAssistant(":memory:";
+    a = Claw.AgentAssistant(":memory:"; search_options=(embed=nothing,),
         provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key",
         timezone = "UTC", level = :error, pipeline = cfg)
     a._state[] = :running
@@ -540,7 +540,7 @@ end
     Claw.shutdown!(a; timeout_s = 5)
 
     # a fresh assistant on the same database re-enables it with the stored config
-    b = Claw.init!(path;
+    b = Claw.init!(path; search_options=(embed=nothing,),
         provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key",
         timezone = "UTC", level = :error,
         event_sources = Claw.EventSource[], install_signal_handlers = false)
@@ -558,14 +558,14 @@ end
     end
 
     # disabled stays disabled across restarts
-    c = Claw.init!(path;
+    c = Claw.init!(path; search_options=(embed=nothing,),
         provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key",
         timezone = "UTC", level = :error,
         event_sources = Claw.EventSource[], install_signal_handlers = false)
     Claw.disable_integration!(c, "toy")
     Claw.shutdown!(c; timeout_s = 5)
     Claw.CURRENT_ASSISTANT[] = nothing
-    d = Claw.init!(path;
+    d = Claw.init!(path; search_options=(embed=nothing,),
         provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key",
         timezone = "UTC", level = :error,
         event_sources = Claw.EventSource[], install_signal_handlers = false)
@@ -680,7 +680,7 @@ end
     Claw._exec!(a.db,
         "INSERT INTO claw_integrations (name, enabled, config, updated_at) VALUES ('ghost', 1, NULL, 0)")
     Claw.shutdown!(a; timeout_s = 5)
-    b = Claw.init!(path;
+    b = Claw.init!(path; search_options=(embed=nothing,),
         provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key",
         timezone = "UTC", level = :error,
         event_sources = Claw.EventSource[], install_signal_handlers = false)
@@ -707,7 +707,7 @@ end
     # version-4 config before reconciliation gets to validate it.
     Claw.shutdown!(a; timeout_s = 5)
 
-    b = Claw.init!(path;
+    b = Claw.init!(path; search_options=(embed=nothing,),
         provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key",
         timezone = "UTC", level = :error,
         event_sources = Claw.EventSource[], install_signal_handlers = false)
@@ -734,7 +734,7 @@ end
     Claw.shutdown!(a; timeout_s = 5)
 
     explicit = ToyEventSource(; token = "explicit")
-    b = Claw.init!(path;
+    b = Claw.init!(path; search_options=(embed=nothing,),
         provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key",
         timezone = "UTC", level = :error,
         event_sources = Claw.EventSource[explicit], install_signal_handlers = false)
