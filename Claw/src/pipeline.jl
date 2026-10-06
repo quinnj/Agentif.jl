@@ -1141,7 +1141,6 @@ function _rehydration_ready!(assistant::AgentAssistant)
 end
 
 # ─── Event loop ───
-_lookup_event_admission(a::AgentAssistant,key::String)=with_read(db->_fetch_one(db,"SELECT id,status FROM claw_events WHERE dedup_key=?",(key,)),a._readers)
 
 function start_event_loop!(assistant::AgentAssistant; level::Union{Nothing, LogLevel} = assistant.log_level)
     assistant._harness[]===nothing && _guard_legacy_runtime!(assistant)
@@ -1517,7 +1516,7 @@ function shutdown!(assistant::AgentAssistant; timeout_s::Real = assistant.pipeli
             return result
         end
     end
-    if !idle() || assistant._legacy_tools_running[] > 0
+    if !idle() || (@atomic assistant._legacy_tools_running.n) > 0
         assistant._state[] = :draining
         return (;status=:draining,reason=:noncooperative_invocation)
     end

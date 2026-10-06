@@ -75,18 +75,6 @@ end
             @test_throws ArgumentError Claw._transition!((db, seq) -> Claw._wait_tasks!(db, b, [a]), h)
             nested = kernel_task(h, c, p, "nested"; owner = b)
             @test_throws ArgumentError Claw._transition!((db, seq) -> Claw._wait_tasks!(db, nested, [b]), h)
-            @test_throws ArgumentError Claw._transition!((db, seq) -> Claw._wait_tasks!(db, b, [a], "failFast"), h)
-            fast = kernel_task(h, c, p, "fast")
-            bad = kernel_task(h, c, p, "bad"; owner = fast);sibling = kernel_task(h, c, p, "sibling"; owner = fast)
-            Claw._transition!(h) do db, seq
-                Claw._wait_tasks!(db, fast, [bad, sibling], "failFast")
-                Claw._finish_task!(db, Claw._fetch_one(db, "SELECT * FROM claw_tasks WHERE id=?", (bad,)), Dict("status" => "failed"))
-                Claw._reconcile_ownership!(db, h, seq)
-            end
-            @test Claw.inspect_task(h, sibling).cancel == 1
-            Claw._transition!((db, seq) -> Claw._reconcile_ownership!(db, h, seq), h)
-            @test Claw.inspect_task(h, sibling).status == "terminal"
-            @test Claw.inspect_task(h, fast).status == "pending"
             Claw.abort_conversation!(h, c)
             @test Claw.inspect_task(h, background).cancel == 0
             Claw.abort_conversation!(h, c; include_background = true)

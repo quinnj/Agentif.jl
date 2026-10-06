@@ -46,11 +46,11 @@ function _route(ch, row)
     )
 end
 
-"""Admit a frozen source batch. Optional `verdicts[(handler_id,event_id)]` is the
-seam for a source relevance policy. Decisions and exact handler revisions persist
-before submissions; coalescing changes cannot reinterpret an existing batch.
+"""Admit a frozen source batch. Filter and relevance decisions and exact handler
+revisions persist before submissions; coalescing changes cannot reinterpret an
+existing batch.
 """
-function _durable_dispatch_group!(a, group, handlers; verdicts = nothing, abort = Agentif.Abort())
+function _durable_dispatch_group!(a, group, handlers; abort = Agentif.Abort())
     Agentif.check_abort(abort)
     h = a._harness[]
     h === nothing && error("durable runtime is not attached")
@@ -120,7 +120,7 @@ function _durable_dispatch_group!(a, group, handlers; verdicts = nothing, abort 
             kept = Any[];decisions = Dict{String, Bool}()
             for (row, ev) in members
                 receipt = _on_writer(db -> _fetch_one(db, "SELECT verdict FROM claw_filter_receipts WHERE event_id=? AND handler_hash=?", (row.id, hash)), h)
-                pass = receipt === nothing ? (verdicts === nothing ? _durable_filter!(h, handler, ev, row, hash; abort) : verdicts[(handler.id, row.id)]) : receipt.verdict == 1
+                pass = receipt === nothing ? _durable_filter!(h, handler, ev, row, hash; abort) : receipt.verdict == 1
                 if receipt === nothing
                     _transition!(h; point = :filter_receipt) do db, seq
                         _guard_source_claims!(db, members, abort)
@@ -130,7 +130,7 @@ function _durable_dispatch_group!(a, group, handlers; verdicts = nothing, abort 
                 decisions[string(row.id)] = pass
                 pass && push!(kept, (row, ev))
             end
-            if verdicts === nothing && !isempty(kept)
+            if !isempty(kept)
                 persist_selection = write -> _transition!(h; point = :relevance_receipt) do db, seq
                     # Fence the source claim as well as the runtime owner. A
                     # lease can be reclaimed within the same runtime epoch.
@@ -264,12 +264,28 @@ function _register_native_delivery!(h, a)
             end
         )
     )
-    return register_delivery_adapter!(
+    register_delivery_adapter!(
         h, "claw-child-event", DeliveryAdapter(
             (address, body, key) ->
             submit_event!(a, SubagentOutputEvent(address["event_type"], address["name"], body); dedup_key = key); capability = :idempotent
         )
     )
+    # Registered at startup, not per evaluation, so a direct answer still queued
+    # after a restart can be delivered once its channel is registered again.
+    register_delivery_adapter!(
+        h, "claw-direct-channel", DeliveryAdapter(
+            (address, body, key) -> begin
+                target = _channel_get(a, address["channel_id"])
+                target === nothing && error("direct delivery channel unavailable")
+                Agentif.send_message(target, body)
+                post = Agentif.response_entry_id(target)
+                Agentif.close_channel(target)
+                Dict("sent" => true, "_claw_response_post" => post)
+            end;
+            available = address -> _channel_get(a, address["channel_id"]) !== nothing
+        )
+    )
+    return nothing
 end
 
 function _event_row_for_delivery(a, id)
@@ -295,7 +311,7 @@ function _register_default_profile!(h, a)
     end
     return register_profile!(h, agent)
 end
-function _durable_evaluate(a, input; channel = nothing, tools = nothing, request_id = _new_id(), input_key = nothing, kwargs...)
+function _durable_evaluate(a, input; channel = nothing, tools = nothing, input_key = nothing, kwargs...)
     h = a._harness[]
     ch = channel === nothing ? SinkChannel("internal") : channel
     handler = (; id = "direct", prompt = "", channel_id = Agentif.channel_id(ch), trust = :owner, tools = tools === nothing ? nothing : [t.name for t in tools], filter = nothing)
@@ -305,23 +321,9 @@ function _durable_evaluate(a, input; channel = nothing, tools = nothing, request
         "channel_flags" => (Agentif.is_private(ch) ? 1 : 0), "post_id" => Agentif.entry_id(ch)
     )
     _channel_set!(a, Agentif.channel_id(ch), ch)
-    if !(ch isa SinkChannel)
-        register_delivery_adapter!(
-            h, "claw-direct-channel", DeliveryAdapter(
-                (address, body, key) -> begin
-                    target = _channel_get(a, address["channel_id"])
-                    target === nothing && error("direct delivery channel unavailable")
-                    Agentif.send_message(target, body)
-                    post = Agentif.response_entry_id(target)
-                    Agentif.close_channel(target)
-                    Dict("sent" => true, "_claw_response_post" => post)
-                end
-            )
-        )
-    end
     delivery = ch isa SinkChannel ? nothing : DeliveryAddress("claw-direct-channel", 1, Dict("channel_id" => Agentif.channel_id(ch)))
     c = _channel_conversation!(h, ch, profile, route, delivery)
-    key = something(input_key, request_id)
+    key = something(input_key, _new_id())
     route["input_digest"] = _digest(input)
     old = lookup_submission(h, c.id, key)
     if old !== nothing

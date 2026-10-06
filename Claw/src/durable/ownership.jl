@@ -84,12 +84,11 @@ function _aborted_tool_result!(db, h, seq, t, reason)
     return nothing
 end
 
-function _wait_tasks!(db, waiter, children, policy = "allSettled")
-    policy in ("allSettled", "failFast") || throw(ArgumentError("unknown join policy"))
+# Park `waiter` until every task in `children` is terminal.
+function _wait_tasks!(db, waiter, children)
     for id in children
         child = _fetch_one(db, "SELECT * FROM claw_tasks WHERE id=?", (id,))
         child === nothing && throw(ArgumentError("missing awaited task"))
-        policy == "failFast" && _or_nothing(child.owner_task) != waiter && throw(ArgumentError("failFast requires owned children"))
         owner = _fetch_one(db, "SELECT owner_task FROM claw_tasks WHERE id=?", (waiter,))
         ancestor = owner === nothing ? nothing : _or_nothing(owner.owner_task)
         while ancestor !== nothing
@@ -107,7 +106,7 @@ function _wait_tasks!(db, waiter, children, policy = "allSettled")
             append!(todo, [r.awaited for r in _fetch_all(db, "SELECT awaited FROM claw_task_waits WHERE waiter=?", (current,))])
 
         end
-        _exec!(db, "INSERT OR IGNORE INTO claw_task_waits VALUES(?,?,?)", (waiter, id, policy))
+        _exec!(db, "INSERT OR IGNORE INTO claw_task_waits VALUES(?,?)", (waiter, id))
     end
     return _exec!(db, "UPDATE claw_tasks SET status='waiting',token=NULL WHERE id=?", (waiter,))
 end
@@ -118,11 +117,7 @@ function _reconcile_ownership!(db, h, seq)
         _settle_cancelled!(db, h, seq, t)
     end
     for t in _fetch_all(db, "SELECT * FROM claw_tasks WHERE status='waiting'")
-        waits = _fetch_all(db, "SELECT t.*,w.policy FROM claw_task_waits w JOIN claw_tasks t ON t.id=w.awaited WHERE w.waiter=?", (t.id,))
-        failed = any(w -> w.status == "terminal" && get(JSON.parse(something(_or_nothing(w.outcome), "{}")), "status", "") != "completed", waits)
-        if failed && any(w -> w.policy == "failFast", waits)
-            foreach(w -> w.status == "terminal" || _cancel_task!(db, w.id), waits)
-        end
+        waits = _fetch_all(db, "SELECT t.status FROM claw_task_waits w JOIN claw_tasks t ON t.id=w.awaited WHERE w.waiter=?", (t.id,))
         all(w -> w.status == "terminal", waits) || continue
         _exec!(db, "DELETE FROM claw_task_waits WHERE waiter=?", (t.id,))
         _exec!(db, "UPDATE claw_tasks SET status='pending',revision=revision+1 WHERE id=?", (t.id,))

@@ -28,17 +28,9 @@ _activity_signature(rows) = _digest([(t.id, t.status, t.revision, t.attempt, _or
 
 function _watcher_outbox!(db, h, seq, root, note)
     run = _fetch_one(db, "SELECT * FROM claw_runs WHERE id=?", (root.run_id,))
-    _or_nothing(run.delivery) === nothing && return
-    key = "watcher-failure:$(root.id)";id = _new_id()
-    _exec!(
-        db, "INSERT OR IGNORE INTO claw_outbox(id,conversation_id,run_id,logical_key,address,body,state) VALUES(?,?,?,?,?,?,'pending')",
-        (id, root.conversation_id, root.run_id, key, run.delivery, note)
-    )
-    saved = _fetch_one(db, "SELECT id FROM claw_outbox WHERE logical_key=?", (key,))
-    return _task_create!(
-        db, seq, root.conversation_id, "delivery", "deliver:$key"; background = true,
-        input = Dict("outbox" => saved.id), checkpoint = Dict("phase" => "send")
-    )
+    _or_nothing(run.delivery) === nothing && return nothing
+    _enqueue_delivery!(db, seq, root.conversation_id, "watcher-failure:$(root.id)", run.delivery, note; run = root.run_id)
+    return nothing
 end
 _watcher_default(reason) = "⚠️ I hit a problem while handling this event ($reason) and couldn't finish. The error has been logged; you may want to retry or check the logs."
 

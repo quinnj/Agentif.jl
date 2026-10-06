@@ -120,7 +120,6 @@ end
             @test saved.status == "dead"
             @test startswith(saved.last_error, "legacy_interrupted")
             @test_throws Claw.StaleInvocation Claw._finish_event!(a, row, "done")
-            @test Claw._lookup_event_admission(a, string(id)) === nothing
         finally
             Claw.shutdown!(a; timeout_s = 10)
         end

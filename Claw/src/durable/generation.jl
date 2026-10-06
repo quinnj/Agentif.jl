@@ -69,19 +69,26 @@ function _generation_settle!(db, h, seq, t, c; answer = nothing, reason = nothin
     end
     issued = _fetch_one(db, "SELECT delivery FROM claw_runs WHERE id=?", (t.run_id,))
     delivery = issued === nothing ? nothing : _or_nothing(issued.delivery)
-    return if answer !== nothing && delivery !== nothing
-        address = JSON.parse(delivery)
-        key = "$entry:" * _digest(address)
-        oid = _new_id()
-        _exec!(
-            db, "INSERT INTO claw_outbox(id,conversation_id,run_id,entry_id,logical_key,address,body,state) VALUES(?,?,?,?,?,?,?,'pending')",
-            (oid, c.id, t.run_id, entry, key, JSON.json(address), Agentif.message_text(answer))
-        )
-        _task_create!(
-            db, seq, c.id, "delivery", "delivery:$key"; background = true,
-            input = Dict("outbox" => oid, "profile" => JSON.parse(t.input_json)["profile"]), checkpoint = Dict("phase" => "send")
-        )
+    if answer !== nothing && delivery !== nothing
+        key = "$entry:" * _digest(JSON.parse(delivery))
+        _enqueue_delivery!(db, seq, c.id, key, delivery, Agentif.message_text(answer); run = t.run_id, entry)
     end
+    return nothing
+end
+
+# Queue one outbound send: an immutable outbox row under its logical key, and the
+# background task that sends it. Idempotent per key.
+function _enqueue_delivery!(db, seq, conversation_id, key, address::String, body; run = nothing, entry = nothing)
+    _exec!(
+        db, "INSERT OR IGNORE INTO claw_outbox(id,conversation_id,run_id,entry_id,logical_key,address,body,state) VALUES(?,?,?,?,?,?,?,'pending')",
+        (_new_id(), conversation_id, run, entry, key, address, body)
+    )
+    outbox = _fetch_one(db, "SELECT id FROM claw_outbox WHERE logical_key=?", (key,)).id
+    _task_create!(
+        db, seq, conversation_id, "delivery", "delivery:$key"; background = true,
+        input = Dict("outbox" => outbox), checkpoint = Dict("phase" => "send")
+    )
+    return nothing
 end
 
 function _generation_prepare!(ctx, t, resolved)

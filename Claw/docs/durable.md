@@ -27,6 +27,8 @@ returns that attached instance. `open_harness(path)` is also available
 for a standalone file-backed host. Register its model/profile, exact tool
 contracts, environments and delivery adapters before `resume!`. Opening recovers
 records but does not dispatch them; submission, wait or `resume!` starts scheduling.
+The scheduler sleeps until a commit, a registration or its next due time; a
+blocked task is rechecked after a delay or when a registration may unblock it.
 
 An identical `(conversation, request_id, input, mode, origin, profile)` returns
 the same durable receipt. A conflict throws `SubmissionConflict`. States are
@@ -52,11 +54,16 @@ p = Claw.register_profile!(h, agent; specs=[spec], environment=env)
 
 Every legacy/custom tool defaults to unsafe. Parsing, authorization, final args,
 schema/adapter version, environment, policy and operation key commit before its
-body begins. Completed receipts are reused. An interrupted unsafe invocation is
-`uncertain` and holds the run; the next model request cannot repeat it under a
-new call ID. Explicit safe replay permits repetition of the same compatible
-intent, including a read that may return changed data. Safety is the adapter
-author's versioned contract, not a name or purity guess.
+body begins. Completed receipts are reused. A body that throws has finished: the
+model receives the error as a tool result, as in the default tool loop. Only an
+interruption (abort, deadline or process loss) leaves an unsafe invocation
+`uncertain`; that holds the run, and the next model request cannot repeat it
+under a new call ID. A cancelled call always gets an error result, so the
+conversation's history never ends in a call without one. Explicit safe replay
+permits repetition of the same compatible intent, including a read that may
+return changed data. Safety is the adapter author's versioned contract, not a
+name or purity guess. Built-in shell, PTY and worker tools require the `shell`
+environment capability; file tools require `read`, `edit` or `write`.
 
 A context adapter receives `InvocationContext` with Abort, deadline, progress and
 fenced commit helpers. `Claw.execution_intent(ctx)` and
@@ -77,15 +84,21 @@ assumed. A lost send receipt produces uncertainty. A registered `DeliveryAdapter
 may explicitly declare `:idempotent` or `:reconcile` when its remote protocol
 supports that behavior. `resolve_delivery!` also requires operator evidence.
 An answered input means the local answer exists; inspect delivery separately.
+Durable answers are sent as one message once the run settles; partial output is
+not streamed to channels. A channel that cannot deliver (for example a GitHub
+event with no comment target) keeps the answer local.
 
 Model requests can repeat after interruption. Known usage is unique by
 task/attempt/category; unreceived spend is unknown. Each request intent and bounded
 partial output is persisted, and interrupted partials remain audit-only. Transport
-retry is disabled for durable calls. `HarnessLimits.attempts` limits total model
-requests per logical task (including tool turns); `run_timeout`, request/tool
-timeouts and bounded persisted UTC backoff also apply. Live deadlines, retry timers,
-progress throttling and supervision use monotonic time. Restart delays clamp to
-their configured budgets; UTC records remain available for diagnosis. Anthropic pause-turn
+retry is disabled for durable calls (including the Codex adapter's own loop).
+`HarnessLimits.attempts` bounds consecutive failed requests of one task (a process
+loss counts as one); `run_timeout` bounds the whole run, and request/tool timeouts
+and bounded persisted UTC backoff also apply. Deadlines, retry timers, progress
+throttling and supervision use monotonic time. Restart delays clamp to their
+configured budgets; UTC records remain available for diagnosis. A request
+checkpoint records the history leaf it was prepared from and rebuilds the context
+from immutable history, rather than copying the conversation. Anthropic pause-turn
 continuations remain one logical turn and can contain several wire requests.
 No mid-socket or deferred provider handle is restored.
 
@@ -105,13 +118,16 @@ stored child conversations and aliases. Keyed creation, initial submission and
 ownership commit together. Child tool contracts are a subset of inherited exact
 manifests; trust/environment cannot widen. `message_subagent` accepts
 `mode="steer"` in durable mode and can admit input while the child runs.
-Completion notifications are idempotent local source events with persisted intent.
+An asynchronous child is background work: it never holds its parent's run open
+or blocks the parent conversation's next input. Each child run records its own
+completion target. Completion notifications are idempotent local source events
+with persisted intent.
 Their handler and event type survive restart, including asynchronous messages to a
 child that was initially created synchronously.
 
 Parents release model/tool permits while waiting. Ordinary children drain before
-the parent task becomes terminal. `allSettled` and owned-only `failFast` are
-supported; ancestor and cross-task dependency cycles are rejected. A local answer
+the parent task becomes terminal. A wait ends when every awaited task is
+terminal; ancestor and cross-task dependency cycles are rejected. A local answer
 can be inspectable while its generation is still `completing` owned work.
 Background work is excluded from normal abort unless `include_background=true`.
 
@@ -123,7 +139,9 @@ subprocess variables. File mutation guards serialize native operations on canoni
 paths in this process. Shell and other processes can bypass those guards, and shell
 can access paths outside cwd. This is native execution, not an OS sandbox.
 
-`close_harness!(h; mode=:suspend, grace_s=30)` keeps work resumable.
+`close_harness!(h; mode=:suspend, grace_s=30)` keeps work resumable: running tools
+may finish within the grace period and their results are recorded, while
+in-flight model requests are aborted and repeated after reopening.
 `mode=:abort` records cancellation. Cooperative workers drain; a noncooperative
 worker returns `status=:draining` and retains capacity and the owner lock until it
 actually exits or the process ends. Repeated close can finish draining. Watchers
@@ -147,20 +165,22 @@ compaction and a general state-document/plugin DSL remain optional later work.
 New search indexing is eventual. Embedding/tokenizer work runs outside the writer;
 committed index intents remain visible until the host's search store processes
 them. A standalone Harness without a search host leaves them pending.
-`scrub_durable_post!` immediately masks source/descendant history, summary copies,
-classifier checkpoints, derived child state, payloads, outbox and index work before
-observation/search. It conservatively cancels and clears runtime payloads in
-affected conversations, including saved supervision routing, managed-resource
-details and child completion events already admitted to another conversation.
-Older independent history is preserved. Redaction can therefore
-remove later derived context; it does not attempt to edit a summary sentence by
-sentence. Legacy standalone Agentif summaries have the narrower existing scrub
+`scrub_durable_post!` masks, in one transaction and before observation or search
+can read them: the post's own entries, its reply and the entries of runs it
+started; compaction entries after them (a summary or kept copy may hold it); its
+submissions, source events and classifier inputs; and child conversations started
+in conversations whose context includes the post. In those conversations it also
+clears runtime payloads (task checkpoints, tool arguments, outbox bodies, resource
+details, saved routing) and cancels unfinished work. Search documents are deleted
+immediately. Entries that merely follow the post, and unrelated queued input, are
+kept: deleting one message does not erase what came after it. It runs even when
+the scheduler is poisoned, and it does not edit a summary sentence by sentence. Legacy standalone Agentif summaries have the narrower existing scrub
 contract and are not retroactively assigned durable provenance.
 
 `inspect_task` hides input/checkpoint/progress payloads by default; owner diagnosis
 can explicitly select `include_payload=true`. `snapshot`, `watch` and
 `live_activity` show graph/phase, block reason, UTC due time, unknown effects,
-usage, deliveries, resources and indexing. These local handles are for the trusted
+usage, deliveries, resource states and indexing, never payloads or partial output. These local handles are for the trusted
 host. Watch registration and its first snapshot share the writer sequence; bounded
 overflow declares a reset snapshot. They are observations, not external delivery
 queues. Closing/failing an observer does not fail execution.
@@ -184,9 +204,11 @@ requiring close/reopen to derive truth from committed records.
 Schema v6 remains the reviewed legacy batch migration. Durable v7 adds fenced
 claims/version metadata, v8 conversations/tasks/receipts and the explicit event
 CHECK rebuild, v9 effects/outbox/indexing and v10 child/resource/platform aliases.
-Pass `backup_path` before production migration or use `backup_harness!` for a
-SQLite-backup-API snapshot including WAL. Shared schemas and integrity are checked;
-future writer/schema versions fail before baseline mutation. v1–v6 migration
+`backup_path` takes a SQLite-backup-API snapshot (including WAL) before a pending
+migration; `backup_harness!` takes one on demand. Shared schemas and integrity are
+checked only before a migration (foreign-key orphans are reported, not refused),
+so routine restarts never scan the whole file. Future writer/schema versions fail
+before baseline mutation. v1–v6 migration
 fixtures preserve old IDs, branches, handlers, schedules and source metadata and
 invent no historical effect receipts.
 

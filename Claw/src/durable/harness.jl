@@ -94,7 +94,7 @@ resuming issued work. Untrusted tool intersections are enforced here and on use.
 function register_profile!(
         h::Harness, agent::Agentif.Agent; specs = nothing,
         environment = LLMTools.LocalExecutionEnv(LLMTools.EnvRef(h.assistant === nothing ? pwd() : h.assistant.config.base_dir)),
-        trust::Symbol = :owner, credential_ref::String = agent.model.provider, version::Int = 1
+        trust::Symbol = :owner, credential_ref::String = agent.model.provider
     )
     trust in (:owner, :untrusted) || throw(ArgumentError("invalid trust"))
     specs === nothing && (specs = ToolSpec[ToolSpec(t; get(DURABLE_TOOL_ADAPTERS, t, (;))...) for t in agent.tools])
@@ -102,37 +102,38 @@ function register_profile!(
     chosen = ToolSpec[s for s in specs if s.tool.name in wanted && (trust === :owner || s.tool.name in UNTRUSTED_ALLOWED_TOOLS)]
     length(unique(s.tool.name for s in chosen)) == length(chosen) || throw(ArgumentError("duplicate tool names"))
     payload = Dict(
-        "version" => version, "model" => _profile_model(agent.model), "http_options" => _profile_config(JSON.parse(JSON.json(agent.http_kw))), "prompt" => agent.prompt,
+        "version" => 1, "model" => _profile_model(agent.model), "http_options" => _profile_config(JSON.parse(JSON.json(agent.http_kw))), "prompt" => agent.prompt,
         "tools" => [_spec_data(s) for s in chosen], "env" => _env_data(environment.ref), "trust" => String(trust), "credential_ref" => credential_ref
     )
     id = _digest(payload)
-    lock(h.lock) do
-        for s in chosen
-            old = get(h.specs, (s.tool.name, s.version), nothing)
-            old === nothing || _spec_data(old) == _spec_data(s) || error("tool version reused with a changed manifest")
-        end
-        old = get(h.environments, environment.ref.id, nothing)
-        old === nothing || _env_data(old.ref) == _env_data(environment.ref) || error("environment ID reused with a changed revision")
-    end
+    lock(() -> _check_registration(h, chosen, environment), h.lock)
     _transition!(h; point = :profile) do db, seq
-        _exec!(db, "INSERT OR IGNORE INTO claw_agent_profiles VALUES(?,?,?,?)", (id, version, JSON.json(payload), id))
+        _exec!(db, "INSERT OR IGNORE INTO claw_agent_profiles VALUES(?,?,?,?)", (id, 1, JSON.json(payload), id))
     end
     fresh = lock(h.lock) do
         added = !haskey(h.agents, id) || !haskey(h.environments, environment.ref.id) ||
             any(s -> !haskey(h.specs, (s.tool.name, s.version)), chosen)
+        # Re-checked under the lock: a concurrent registration may have won.
+        _check_registration(h, chosen, environment)
         h.agents[id] = Agentif.with_tools(agent, Agentif.AgentTool[s.tool for s in chosen])
-        for s in chosen
-            old = get(h.specs, (s.tool.name, s.version), nothing)
-            old === nothing || _spec_data(old) == _spec_data(s) || error("tool version reused with a changed manifest")
-            h.specs[(s.tool.name, s.version)] = s
-        end
-        old = get(h.environments, environment.ref.id, nothing)
-        old === nothing || _env_data(old.ref) == _env_data(environment.ref) || error("environment ID reused with a changed revision")
+        foreach(s -> h.specs[(s.tool.name, s.version)] = s, chosen)
         h.environments[environment.ref.id] = environment
         added
     end
     fresh ? _recheck_blocked!(h) : notify(h.wake)
     return AgentProfileRef(id)
+end
+
+# A tool version or environment ID names one immutable contract; reusing it for
+# a different manifest would change what recorded intents mean.
+function _check_registration(h, specs, environment)
+    for s in specs
+        old = get(h.specs, (s.tool.name, s.version), nothing)
+        old === nothing || _spec_data(old) == _spec_data(s) || error("tool version reused with a changed manifest")
+    end
+    old = get(h.environments, environment.ref.id, nothing)
+    old === nothing || _env_data(old.ref) == _env_data(environment.ref) || error("environment ID reused with a changed revision")
+    return nothing
 end
 
 function _resolve_profile(h, id)
@@ -247,4 +248,13 @@ function close_harness!(h::Harness; mode::Symbol = :suspend, grace_s::Real = 30)
         h.owner === nothing || close(h.owner)
     end
     return (; status = :closed, mode)
+end
+
+# Legacy mode must not run while durable work is unfinished (unless parked).
+function _guard_legacy_runtime!(a)
+    a._durable_parked[] && return
+    work = execute_write(a._writer) do db
+        _fetch_one(db, "SELECT id FROM claw_tasks WHERE status!='terminal' UNION ALL SELECT id FROM claw_submissions WHERE state IN ('queued','placed') UNION ALL SELECT id FROM claw_events WHERE status='dispatched' OR (durable=1 AND status IN ('pending','running')) LIMIT 1")
+    end
+    return work === nothing || error("unfinished durable work is present; enable durable=true, settle it, or explicitly park it with park_durable=true on this capable binary")
 end

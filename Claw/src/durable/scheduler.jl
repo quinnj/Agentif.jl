@@ -192,18 +192,14 @@ function _child_phase!(ctx, t)
         issued = JSON.parse(t.input_json)
         event_type = get(issued, "event_type", nothing)
         if event_type !== nothing
-            oid = _new_id();key = "child-completion:$(t.id)"
-            address = JSON.json(DeliveryAddress("claw-child-event", 1, Dict("event_type" => event_type, "name" => issued["name"])))
-            issued = JSON.parse(address);issued["capability"] = "idempotent";address = JSON.json(issued)
-            _exec!(
-                db, "INSERT OR IGNORE INTO claw_outbox(id,conversation_id,entry_id,logical_key,address,body,state) VALUES(?,?,?,?,?,?,'pending')",
-                (
-                    oid, t.conversation_id, _or_nothing(s.answer_entry), key, address,
-                    s.answer_entry === missing || s.answer_entry === nothing ? JSON.json(Dict("submission" => s.id, "state" => s.state)) :
-                        join(Agentif.message_text.(JSON.parse(_fetch_one(db, "SELECT entry FROM session_entries WHERE entry_id=?", (s.answer_entry,)).entry, Agentif.SessionEntry).messages), "\n"),
-                )
+            address = Dict(
+                "adapter" => "claw-child-event", "version" => 1, "capability" => "idempotent",
+                "routing" => Dict("event_type" => event_type, "name" => issued["name"])
             )
-            _task_create!(db, seq, t.conversation_id, "delivery", key; background = true, input = Dict("outbox" => oid), checkpoint = Dict("phase" => "send"))
+            answer = _or_nothing(s.answer_entry)
+            body = answer === nothing ? JSON.json(Dict("submission" => s.id, "state" => s.state)) :
+                join(Agentif.message_text.(JSON.parse(_fetch_one(db, "SELECT entry FROM session_entries WHERE entry_id=?", (answer,)).entry, Agentif.SessionEntry).messages), "\n")
+            _enqueue_delivery!(db, seq, t.conversation_id, "child-completion:$(t.id)", JSON.json(address), body; entry = answer)
         end
     end
 end
@@ -284,10 +280,8 @@ function _ownership_ready(db, h)
         if t.status == "completing"
             _fetch_one(db, "SELECT id FROM claw_tasks WHERE owner_task=? AND background=0 AND status!='terminal' LIMIT 1", (t.id,)) === nothing && return true
         elseif t.status == "waiting"
-            waits = _fetch_all(db, "SELECT t.status,t.cancel,t.outcome,w.policy FROM claw_task_waits w JOIN claw_tasks t ON t.id=w.awaited WHERE w.waiter=?", (t.id,))
+            waits = _fetch_all(db, "SELECT t.status FROM claw_task_waits w JOIN claw_tasks t ON t.id=w.awaited WHERE w.waiter=?", (t.id,))
             all(w -> w.status == "terminal", waits) && return true
-            failed = any(w -> w.policy == "failFast" && w.status == "terminal" && get(JSON.parse(something(_or_nothing(w.outcome), "{}")), "status", "") != "completed", waits)
-            failed && any(w -> w.status != "terminal" && w.cancel == 0, waits) && return true
         end
     end
     return false

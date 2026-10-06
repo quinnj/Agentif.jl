@@ -78,7 +78,7 @@ struct JevConfig
     max_events::Int
     max_request_bytes::Int
     max_concurrent_requests::Int
-    _inflight::Threads.Atomic{Int}
+    _inflight::AtomicCount
 end
 
 const RELEVANCE_INTERNAL_SOURCES = Set(["claw", "repl", "tempus", "llmtools"])
@@ -99,7 +99,7 @@ function JevConfig(
     isempty(strip(model)) && throw(ArgumentError("Jev model must not be empty"))
     return JevConfig(
         client, sources, String(model), max_events, max_request_bytes,
-        max_concurrent_requests, Threads.Atomic{Int}(0)
+        max_concurrent_requests, AtomicCount()
     )
 end
 Base.show(io::IO, cfg::JevConfig) = print(
@@ -186,7 +186,8 @@ function _jev_batch_request(cfg, policy, candidates)
             events, (;
                 id = string(row.id), source = row.source, name = row.name,
                 channel_id = row.channel_id, content = wrap_untrusted_event_content(row.content),
-                extra = row.extra,
+                # Source metadata can carry message text too (e.g. a Teams activity).
+                extra = wrap_untrusted_event_content(JSON.json(row.extra)),
             )
         )
         questions["relevance_$(row.id)"] = JevSDK.Noul(
@@ -285,7 +286,7 @@ function _classify_relevance(cfg, policy, group)
     if ncodeunits(JSON.json(request)) > cfg.max_request_bytes
         reason = "request_size_pass"
     else
-        previous = Threads.atomic_add!(cfg._inflight, 1)
+        previous = (@atomic cfg._inflight.n += 1) - 1
         try
             if previous >= cfg.max_concurrent_requests
                 reason = "jev_busy_pass"
@@ -300,7 +301,7 @@ function _classify_relevance(cfg, policy, group)
                 end
             end
         finally
-            Threads.atomic_sub!(cfg._inflight, 1)
+            @atomic cfg._inflight.n -= 1
         end
     end
     positions = Dict(row.id => i for (i, (row, _)) in enumerate(group))

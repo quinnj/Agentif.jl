@@ -135,6 +135,14 @@ end
 
 # Subscription filters (EventFilter is a field of EventHandler below).
 include("filters.jl")
+
+# A count shared across threads (for example, calls in flight).
+mutable struct AtomicCount
+    @atomic n::Int
+end
+AtomicCount() = AtomicCount(0)
+Base.getindex(c::AtomicCount) = @atomic c.n
+Base.setindex!(c::AtomicCount, n::Integer) = (@atomic c.n = n)
 include("relevance.jl")
 
 # ─── Core types ───
@@ -293,7 +301,7 @@ struct AgentAssistant
     _owner_lock::Base.RefValue{Union{Nothing, IOStream}}
     _owner_epoch::Base.RefValue{Int}
     _harness::Base.RefValue{Any}
-    _legacy_tools_running::Threads.Atomic{Int}
+    _legacy_tools_running::AtomicCount
     _durable_parked::Base.RefValue{Bool}
 end
 
@@ -335,7 +343,7 @@ function _new_agent_assistant(;
         _owner_lock = Ref{Union{Nothing, IOStream}}(nothing),
         _owner_epoch = Ref(0),
         _harness = Ref{Any}(nothing),
-        _legacy_tools_running = Threads.Atomic{Int}(0),
+        _legacy_tools_running = AtomicCount(),
         _durable_parked = Ref(false),
     )
     return AgentAssistant(
@@ -1554,8 +1562,8 @@ function evaluate(
     ctx = build_context_prefix(cfg)
     prefixed_input = input isa String ? string(ctx, "\n\n", input) : input
     tracking = event -> begin
-        event isa Agentif.ToolExecutionStartEvent && Threads.atomic_add!(assistant._legacy_tools_running,1)
-        event isa Agentif.ToolExecutionEndEvent && Threads.atomic_sub!(assistant._legacy_tools_running,1)
+        event isa Agentif.ToolExecutionStartEvent && @atomic assistant._legacy_tools_running.n += 1
+        event isa Agentif.ToolExecutionEndEvent && @atomic assistant._legacy_tools_running.n -= 1
         observer(event)
     end
     return Agentif.evaluate(tracking, agent, prefixed_input;
@@ -1784,7 +1792,6 @@ include("durable/compaction.jl")
 include("durable/delivery.jl")
 include("durable/scheduler.jl")
 include("durable/bridge.jl")
-include("durable/modes.jl")
 include("durable/migrations.jl")
 
 # ─── Constructor ───

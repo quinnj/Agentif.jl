@@ -53,7 +53,7 @@ function _durable_migration_8!(db)
             cancel INTEGER NOT NULL DEFAULT 0,outcome TEXT,blocked TEXT,progress TEXT,created_seq INTEGER NOT NULL)""",
             """CREATE UNIQUE INDEX IF NOT EXISTS claw_creation_key ON claw_tasks(conversation_id,COALESCE(owner_task,''),creation_key)""",
             """CREATE TABLE IF NOT EXISTS claw_task_waits(waiter TEXT NOT NULL REFERENCES claw_tasks(id),awaited TEXT NOT NULL REFERENCES claw_tasks(id),
-            policy TEXT NOT NULL CHECK(policy IN ('allSettled','failFast')),PRIMARY KEY(waiter,awaited))""",
+            PRIMARY KEY(waiter,awaited))""",
             """CREATE TABLE IF NOT EXISTS claw_task_attempts(task_id TEXT NOT NULL,attempt INTEGER NOT NULL,token TEXT NOT NULL,
             request_key TEXT NOT NULL,started_seq INTEGER NOT NULL,ended_seq INTEGER,unknown_spend INTEGER NOT NULL DEFAULT 0,
             failure TEXT,PRIMARY KEY(task_id,attempt))""",
@@ -150,27 +150,19 @@ function _await(f::Function, h; timeout_s::Real = Inf, abort = nothing)
     return
 end
 
-struct TransitionBatch{F <: Function}
-    apply::F
-    context::Union{Nothing, InvocationContext}
-    point::Symbol
-end
-
 """Internal mutation boundary. Only deterministic SQL belongs in its callback.
 
 Commit outcome/adoption uncertainty poisons the harness. A known rolled-back
 precommit rejection can be retried. Progress/final callbacks share the same fence.
 """
 function _transition!(f::Function, h::Harness; context = nothing, point::Symbol = :transition)
-    batch = TransitionBatch(f, context, point)
     context === nothing || return lock(context.lock) do
-        _transition_unlocked!(batch, h)
+        _transition_unlocked!(f, h, context, point)
     end
-    return _transition_unlocked!(batch, h)
+    return _transition_unlocked!(f, h, context, point)
 end
 
-function _transition_unlocked!(batch::TransitionBatch, h)
-    f, ctx, point = batch.apply, batch.context, batch.point
+function _transition_unlocked!(f, h, ctx, point)
     h.state === :poisoned && throw(HarnessPoisoned())
     h.state === :closed && error("harness is closed")
     committed = Ref(false)
