@@ -619,9 +619,6 @@ function supervised_evaluate(assistant, ev::Event, handler, ch::Agentif.Abstract
         end
     end
     @debug "Claw watcher: supervised evaluate end" eval_id status failure_class
-    if propagate_failure && failure_class !== nothing && ws.tool_calls[] > 0
-        failure_class="unsafe_to_retry"
-    end
     if propagate_failure && failure_class !== nothing
         throw(SupervisedEvaluationFailure(
             Symbol(failure_class),

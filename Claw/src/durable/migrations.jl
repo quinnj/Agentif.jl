@@ -20,8 +20,11 @@ function _validate_shared_database!(db)
     end
     check=_drows(db,"PRAGMA quick_check")
     all(r->first(r)=="ok",check) || error("Claw: database integrity check failed")
-    isempty(_drows(db,"PRAGMA foreign_key_check")) || error("Claw: shared database foreign-key violations")
-    nothing
+    # Connections without `foreign_keys=ON` (SQLite's default, e.g. the sqlite3
+    # shell) can leave orphans that predate this runtime; report, don't refuse.
+    orphans=_drows(db,"PRAGMA foreign_key_check")
+    isempty(orphans) || @warn "Claw: shared database has foreign-key orphans" tables=unique(String(r.table) for r in orphans) count=length(orphans)
+    return nothing
 end
 
 function _backup_database!(db,path::String)
@@ -41,9 +44,15 @@ This runs on the writer line. A backup is a snapshot, not a live standby runtime
 """
 backup_harness!(h::Harness,path::String)=_dread(db->_backup_database!(db,path),h)
 
+# Integrity checks and the optional backup run only when a migration is about to
+# rewrite shared tables, so a routine restart neither scans the whole file nor
+# refuses because last start's backup already exists.
 function _prepare_database!(db;backup_path=nothing)
     _check_future_writer!(db)
-    _validate_shared_database!(db)
-    backup_path===nothing || _backup_database!(db,String(backup_path))
+    if _get_user_version(db)<CLAW_SCHEMA_VERSION
+        _validate_shared_database!(db)
+        backup_path===nothing || _backup_database!(db,String(backup_path))
+    end
     _init_claw_schema!(db)
+    return nothing
 end

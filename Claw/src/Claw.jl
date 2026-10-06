@@ -291,7 +291,7 @@ struct AgentAssistant
     _health_loop_started::Base.RefValue{Bool}
     # Held by `init!` for the runtime's lifetime; see `_acquire_owner_lock`.
     _owner_lock::Base.RefValue{Union{Nothing, IOStream}}
-    _owner_epoch::Int
+    _owner_epoch::Base.RefValue{Int}
     _harness::Base.RefValue{Any}
     _legacy_tools_running::Threads.Atomic{Int}
     _durable_parked::Base.RefValue{Bool}
@@ -333,7 +333,7 @@ function _new_agent_assistant(;
         _integrations_lock = ReentrantLock(),
         _health_loop_started = Ref(false),
         _owner_lock = Ref{Union{Nothing, IOStream}}(nothing),
-        _owner_epoch = 0,
+        _owner_epoch = Ref(0),
         _harness = Ref{Any}(nothing),
         _legacy_tools_running = Threads.Atomic{Int}(0),
         _durable_parked = Ref(false),
@@ -401,7 +401,6 @@ _tool_snapshot(assistant::AgentAssistant) =
 
 function _init_claw_schema!(db::SQLite.DB)
     _check_future_writer!(db)
-    _validate_shared_database!(db)
     # Pragmas go through `SQLite.execute` (step + reset). `DBInterface.execute`
     # hands back a lazy cursor, and an unconsumed `PRAGMA journal_mode=WAL` cursor
     # keeps holding its exclusive lock, which blocks every other connection to the
@@ -1530,7 +1529,6 @@ function evaluate(
         kw...,
     )
     assistant._harness[] === nothing || return _durable_evaluate(assistant,input;channel,tools,kw...)
-    _guard_legacy_runtime!(assistant)
     if assistant._durable_parked[] && channel!==nothing
         blocked=execute_write(assistant._writer) do db
             _done(db,"""SELECT id FROM claw_conversations c WHERE c.branch_id=? AND
@@ -1746,28 +1744,20 @@ function _run_event_handler!(
     end
     input = make_prompt(handler.prompt, ev)
     observed_error = Ref{Union{Nothing, Exception}}(nothing)
-    tools_started=Ref(false)
-    observer=event -> begin
-        event isa Agentif.AgentErrorEvent && (observed_error[]=event.error)
-        event isa Agentif.ToolExecutionStartEvent && (tools_started[]=true)
-        nothing
-    end
-    state = try
-    if abort === nothing
+    observer = event -> (event isa Agentif.AgentErrorEvent && (observed_error[] = event.error); nothing)
+    state = if abort === nothing
         evaluate(assistant, input; channel = ch, level = level, tools = tools, observer, eval_kw...)
     else
         evaluate(assistant, input; channel = ch, level = level, tools = tools, abort = abort, observer, eval_kw...)
     end
-    catch err
-        pipeline_managed && tools_started[] && throw(SupervisedEvaluationFailure(:unsafe_to_retry,"failed","legacy tools started before evaluation failure"))
-        rethrow()
-    end
     @debug "Claw handler evaluate end" handler_id = handler.id event_name = get_name(ev)
-    # Every returned :error or emitted provider error belongs to the retry
-    # policy. Refusals have their own reason. Legacy effects forbid whole-run retry.
-    if pipeline_managed && (state.most_recent_stop_reason===:error || observed_error[]!==nothing)
-        tools_started[] && throw(SupervisedEvaluationFailure(:unsafe_to_retry,"failed","legacy tools started before provider failure"))
-        throw(something(observed_error[],ErrorException("evaluation returned stop reason :error without an error event")))
+    # A provider failure can end the evaluation normally, with a stop reason of
+    # :error (usually after an AgentErrorEvent). The pipeline must still see it
+    # as a failure, or the event is marked done and never retried. A refusal
+    # ends with :refusal instead: that is the model's answer. A retry resumes
+    # from the session checkpoints, so finished tools never run again.
+    if pipeline_managed && state.most_recent_stop_reason === :error
+        throw(something(observed_error[], ErrorException("evaluation ended with stop reason :error")))
     end
     return nothing
 end
@@ -1812,7 +1802,6 @@ function AgentAssistant(db_path::String="";
     level::Union{Nothing, LogLevel, Int, Symbol, AbstractString}=nothing,
     watcher::Union{Nothing, WatcherConfig}=nothing,
     pipeline::PipelineConfig=PipelineConfig(),
-    _held_owner_lock = nothing,
     search_options::NamedTuple = (;),
     backup_path::Union{Nothing,String} = nothing,
     jev::Union{Nothing, JevConfig}=nothing,
@@ -1821,13 +1810,12 @@ function AgentAssistant(db_path::String="";
     isfinite(pipeline.coalesce_window_s) && 0 <= pipeline.coalesce_window_s <= 2 ||
         throw(ArgumentError("coalesce_window_s must be finite and between 0 and 2 seconds"))
     db_path = _resolve_db_path(db_path, name)
-    owner_lock = _held_owner_lock === nothing ? _acquire_owner_lock(db_path) : _held_owner_lock
     db = SQLite.DB(db_path)
     writer = nothing
     session_db = db
     try
     _prepare_database!(db;backup_path)
-    epoch = _advance_owner!(db)
+    epoch = _current_owner_epoch(db)
     writer = SQLiteWriter(db_path, db)
     # LocalSearch performs a read/embedding/write sequence for each session
     # entry. Bind its mutation-side store to the writer connection so another
@@ -1855,7 +1843,6 @@ function AgentAssistant(db_path::String="";
         execute_write = f -> execute_write(f, writer),
     )
     tempus_store = Tempus.SQLiteStore(db)
-    _validate_shared_database!(db)
     scheduler = Tempus.Scheduler(tempus_store)
     config = AgentConfig(; name, provider, model_id, apikey, timezone, base_dir, enable_web, enable_coding)
     log_level = Agentif.resolve_log_level(level)
@@ -1872,14 +1859,12 @@ function AgentAssistant(db_path::String="";
         _writer = writer,
         _readers = ReaderPool(db_path, db),
         _sem = Base.Semaphore(max(1, pipeline.max_concurrent_evals)),
-        _owner_lock = Ref{Union{Nothing, IOStream}}(owner_lock),
-        _owner_epoch = epoch,
+        _owner_epoch = Ref(epoch),
     )
     catch
         writer === nothing || close_writer!(writer)
         session_db === db || close(session_db)
         close(db)
-        owner_lock === nothing || close(owner_lock)
         rethrow()
     end
 end
@@ -1902,12 +1887,13 @@ function init!(
     db_path = _resolve_db_path(db_path, get(kwargs, :name, nothing))
     owner_lock = _acquire_owner_lock(db_path)
     assistant = try
-        AgentAssistant(db_path; level, _held_owner_lock = owner_lock, kwargs...)
+        AgentAssistant(db_path; level, kwargs...)
     catch
         owner_lock === nothing || close(owner_lock)
         rethrow()
     end
     assistant._owner_lock[] = owner_lock
+    owner_lock === nothing || _advance_owner_epoch!(assistant)
     try
         if !durable
             assistant._durable_parked[]=park_durable

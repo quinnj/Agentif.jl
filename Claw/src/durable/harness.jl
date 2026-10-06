@@ -1,3 +1,12 @@
+_current_owner_epoch(db) = Int(_done(db, "SELECT owner_epoch FROM claw_runtime_meta WHERE id=1").owner_epoch)
+
+# Only the owner-lock holder advances the epoch, which fences durable work and
+# event claims left by a previous owner of this database.
+function _advance_owner_epoch!(a)
+    a._owner_epoch[] = execute_write(_advance_owner!, a._writer)
+    return a
+end
+
 function _advance_owner!(db)
     _exec!(db, "UPDATE claw_runtime_meta SET owner_epoch=owner_epoch+1 WHERE id=1")
     return Int(_done(db, "SELECT owner_epoch FROM claw_runtime_meta WHERE id=1").owner_epoch)
@@ -35,7 +44,6 @@ function open_harness(path::String; backup_path::Union{Nothing,String}=nothing, 
     try
         _prepare_database!(db;backup_path)
         Agentif.init_sqlite_session_schema!(db)
-        _validate_shared_database!(db)
         epoch = _advance_owner!(db)
         writer = SQLiteWriter(path, db)
         readers = ReaderPool(path, db)
@@ -56,7 +64,7 @@ function open_harness(assistant::AgentAssistant; limits = HarnessLimits(models =
     _is_private_memory_path(assistant.db_path) && throw(ArgumentError("durable runtime requires a file-backed database"))
     assistant._owner_lock[] === nothing && error("assistant must hold the database owner lock")
     h = _make_harness(assistant,assistant._writer,assistant._readers,assistant.session_store,
-        assistant._owner_epoch, nothing, false;limits,kwargs...)
+        assistant._owner_epoch[], nothing, false;limits,kwargs...)
     assistant._harness[] = h
     _backfill_conversations!(h)
     return h

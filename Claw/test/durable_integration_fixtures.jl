@@ -40,6 +40,8 @@ function attached_fixture(path;stream=durable_stream,embed=nothing,watcher=nothi
     Agentif.registerModel!(durable_model())
     a=Claw.AgentAssistant(path;provider="test",model_id="durable-test",apikey="secret-test-key",
         base_dir=dirname(path),search_options=(;embed),level=:error,watcher,jev)
+    a._owner_lock[]=Claw._acquire_owner_lock(path)
+    Claw._advance_owner_epoch!(a)
     h=Claw.open_harness(a;stream_fn=stream,limits,compaction=Agentif.CompactionConfig(;enabled=false))
     Claw._register_native_delivery!(h,a)
     a,h

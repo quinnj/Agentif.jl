@@ -441,7 +441,7 @@ function _claim_event!(assistant::AgentAssistant, id::Int; batch::Union{Nothing,
         end
         _exec!(db,
             "UPDATE claw_events SET status='running', attempts=attempts+1, lease_expires_at=?,batch=COALESCE(batch,?),claim_token=?,claim_revision=claim_revision+1,owner_epoch=?,durable=MAX(durable,?) WHERE id=? AND status='pending'",
-            (lease,batch,token,assistant._owner_epoch,Int(assistant._harness[]!==nothing),id))
+            (lease,batch,token,assistant._owner_epoch[],Int(assistant._harness[]!==nothing),id))
         Int(_scalar(db, "SELECT changes()")) == 0 && return nothing
         result = nothing
         for row in SQLite.DBInterface.execute(db,
@@ -477,6 +477,9 @@ function _fenced_events!(a,rows::AbstractVector{EventRow},assignment,params)
     length(unique(r.id for r in rows))==length(rows) || throw(ArgumentError("duplicate claim member"))
     values_sql=join(fill("(?,?,?,?)",length(rows)),",")
     values_params=Tuple(Iterators.flatten((r.id,r.claim_token,r.claim_revision,r.owner_epoch) for r in rows))
+    # The claim token fences legacy settlement. Durable work is also fenced by
+    # the runtime owner epoch, which only the owner-lock holder advances.
+    owner_fence=a._harness[]===nothing ? "" : "AND e.owner_epoch=(SELECT owner_epoch FROM claw_runtime_meta WHERE id=1)"
     _writer_txn(a) do db
         _exec!(db,"""WITH expected(id,token,revision,epoch) AS (VALUES $values_sql)
             UPDATE claw_events SET $assignment
@@ -484,7 +487,7 @@ function _fenced_events!(a,rows::AbstractVector{EventRow},assignment,params)
                 AND x.token=claw_events.claim_token AND x.revision=claw_events.claim_revision AND x.epoch=claw_events.owner_epoch)
             AND (SELECT COUNT(*) FROM claw_events e JOIN expected x ON e.id=x.id AND e.claim_token=x.token
                 AND e.claim_revision=x.revision AND e.owner_epoch=x.epoch
-                WHERE e.status='running' AND e.owner_epoch=(SELECT owner_epoch FROM claw_runtime_meta WHERE id=1))=(SELECT COUNT(*) FROM expected)
+                WHERE e.status='running' $(owner_fence))=(SELECT COUNT(*) FROM expected)
         """,(values_params...,params...))
         Int(_scalar(db,"SELECT changes()"))==length(rows) || throw(StaleInvocation())
     end
@@ -1414,7 +1417,7 @@ function _return_claims!(assistant::AgentAssistant)
             UPDATE claw_events
             SET status='pending', attempts = MAX(attempts - 1, 0), lease_expires_at = NULL, next_attempt_at = ?,claim_token=NULL,claim_revision=claim_revision+1
             WHERE status='running' AND owner_epoch=?
-    """, (time(),assistant._owner_epoch))
+    """, (time(),assistant._owner_epoch[]))
     return nothing
 end
 
