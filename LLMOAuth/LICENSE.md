@@ -1,4 +1,4 @@
-The LLMProviders package is licensed under the MIT "Expat" License:
+The LLMOAuth package is licensed under the MIT "Expat" License:
 
 > Copyright (c) 2022: Jacob Quinn
 >
