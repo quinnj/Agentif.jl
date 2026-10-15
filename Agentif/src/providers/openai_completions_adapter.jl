@@ -323,6 +323,11 @@ function openai_completions_build_messages(agent::Agent, state::AgentState, inpu
                         extra[signature] = join((b.thinking for b in non_empty_thinking), "\n")
                         assistant_msg.extra = extra
                     end
+                    if isempty(non_empty_text) && isempty(tool_calls)
+                        assistant_msg.content = OpenAICompletions.ContentPart[
+                            OpenAICompletions.ContentPart(; type = "text", text = join((b.thinking for b in non_empty_thinking), "\n\n"))
+                        ]
+                    end
                 end
             end
 

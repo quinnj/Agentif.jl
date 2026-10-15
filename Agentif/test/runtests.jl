@@ -10,6 +10,8 @@ using LocalSearch
 using SQLite
 using Sockets
 
+include("thinking_replay_test.jl")
+
 function dummy_model()
     return Model(
         id = "test-model",
