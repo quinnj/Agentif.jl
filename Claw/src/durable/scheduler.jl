@@ -366,6 +366,7 @@ function _next_wakeup_s(h)
     end
     delay = min(1.0, due - now, h.supervision_due - _monotonic_s())
     for live in lock(() -> collect(values(h.live)), h.lock)
+        Agentif.isaborted(live.context.abort) && continue
         delay = min(delay, live.context.monotonic_deadline - _monotonic_s())
     end
     return max(0.0, delay)
