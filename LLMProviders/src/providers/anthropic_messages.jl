@@ -102,7 +102,7 @@ end
 @omit_null @kwarg struct Tool
     name::String
     description::Union{Nothing, String} = nothing
-    input_schema::JSONSchema.Schema
+    input_schema::Union{JSONSchema.Schema, AbstractDict{String, Any}}
 end
 
 

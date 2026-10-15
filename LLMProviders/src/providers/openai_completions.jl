@@ -8,7 +8,7 @@ schema(::Type{T}) where {T} = JSONSchema.schema(T; all_fields_required = false, 
 @omit_null @kwarg struct ToolFunction
     name::String
     description::Union{Nothing, String} = nothing
-    parameters::JSONSchema.Schema
+    parameters::Union{JSONSchema.Schema, AbstractDict{String, Any}}
     strict::Union{Nothing, Bool} = nothing
 end
 

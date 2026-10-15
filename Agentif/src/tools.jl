@@ -3,6 +3,43 @@
     description::Union{Nothing, String} = nothing
     strict::Bool = true
     func::F
+    input_schema::Union{Nothing, Dict{String, Any}} = nothing
+end
+
+AgentTool{F, T}(name, description, strict, func) where {F, T} =
+    AgentTool{F, T}(name, description, strict, func, nothing)
+
+"""Create a tool with a JSON Schema and a callable receiving one argument dictionary.
+
+Schema tools default to non-strict provider mode so optional properties retain
+their meaning. References must be local fragments; schema loading never fetches
+files or URLs. Returning `ToolOutcome` preserves an application's error flag.
+"""
+function AgentTool(func::F; name::String, input_schema::AbstractDict, description = nothing, strict::Bool = false) where {F}
+    _check_local_schema_refs(input_schema)
+    schema = JSON.parse(JSON.json(input_schema), Dict{String, Any})
+    return AgentTool{F, Dict{String, Any}}(; name, description, strict, func, input_schema = schema)
+end
+
+function _check_local_schema_refs(value)
+    if value isa AbstractDict
+        for (key, item) in value
+            key in ("enum", "const") && continue
+            if key in ("\$ref", "\$dynamicRef") && item isa AbstractString
+                startswith(item, '#') || throw(ArgumentError("tool schemas require local references"))
+            end
+            _check_local_schema_refs(item)
+        end
+    elseif value isa AbstractVector
+        foreach(_check_local_schema_refs, value)
+    end
+    return nothing
+end
+
+function tool_schema(tool::AgentTool, provider::Module = OpenAICompletions)
+    tool.input_schema === nothing && return provider.schema(parameters(tool))
+    schema = deepcopy(tool.input_schema)
+    return provider in (GoogleGenerativeAI, GoogleGeminiCli) ? provider.sanitize_schema(schema) : schema
 end
 
 parameters(::AgentTool{F, T}) where {F, T} = T

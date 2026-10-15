@@ -123,7 +123,7 @@ function build_codex_tools(tools::Vector{<:AgentTool})
                 "type" => "function",
                 "name" => tool.name,
                 "description" => something(tool.description, "Custom tool"),
-                "parameters" => OpenAIResponses.schema(parameters(tool)),
+                "parameters" => tool_schema(tool, OpenAIResponses),
                 "strict" => nothing,
             )
         )

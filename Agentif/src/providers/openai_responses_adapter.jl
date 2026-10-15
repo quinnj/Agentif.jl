@@ -12,7 +12,7 @@ function openai_responses_build_tools(tools::Vector{<:AgentTool})
                 name = tool.name,
                 description = tool.description,
                 strict = tool.strict,
-                parameters = OpenAIResponses.schema(parameters(tool)),
+                parameters = tool_schema(tool, OpenAIResponses),
             )
         )
     end

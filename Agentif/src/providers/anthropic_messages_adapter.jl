@@ -8,7 +8,7 @@ function anthropic_build_tools(
             provider_tools, AnthropicMessages.Tool(
                 name = tool_name,
                 description = tool.description,
-                input_schema = AnthropicMessages.schema(parameters(tool)),
+                input_schema = tool_schema(tool, AnthropicMessages),
             )
         )
     end

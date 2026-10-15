@@ -11,4 +11,5 @@ using Test, LLMTools
     include("optional_args_test.jl")
     include("hostile_output_test.jl")
     include("worker_tools_test.jl")
+    include("mcp_test.jl")
 end

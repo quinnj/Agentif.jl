@@ -163,7 +163,7 @@ function openai_completions_build_tools(
                 var"function" = OpenAICompletions.ToolFunction(
                     name = tool.name,
                     description = tool.description,
-                    parameters = OpenAICompletions.schema(parameters(tool)),
+                    parameters = tool_schema(tool, OpenAICompletions),
                     strict = tool.strict,
                 )
             )

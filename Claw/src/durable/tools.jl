@@ -28,7 +28,7 @@ function _tool_intents!(db, h, seq, t, c, entry, calls, resolved)
         else
             spec = h.specs[(call.name, manifest["version"])]
             try
-                args = Agentif.parse_tool_arguments(call.arguments, Agentif.parameters(spec.tool))
+                args = Agentif.parse_tool_arguments(call.arguments, spec.tool)
                 all(cap -> cap in resolved.env.ref.capabilities, spec.capabilities) || throw(ArgumentError("environment capability denied"))
             catch err
                 failure = "tool_argument_parse_failed: " * _diagnostic(h, err)
@@ -99,7 +99,7 @@ function _tool_phase!(ctx, t, resolved)
         end
         result === :retry || error("invalid effect reconciliation result")
     end
-    args = Agentif.parse_tool_arguments(e.args, Agentif.parameters(spec.tool))
+    args = Agentif.parse_tool_arguments(e.args, spec.tool)
     _transition!(h; context = ctx, point = :tool_intent) do db, seq
         _exec!(db, "UPDATE claw_tool_executions SET effect_state='executing' WHERE task_id=?", (t.id,))
     end
