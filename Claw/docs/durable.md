@@ -193,8 +193,11 @@ it cannot authorize an uncertain effect.
 
 ## Migration and guarantees
 
-The canonical database path has one POSIX advisory-lock owner before startup writes.
-An owner epoch plus invocation token/revision fences callbacks and event claims.
+`init!` acquires the canonical database path's POSIX advisory lock before claiming
+runtime ownership. An owner epoch plus invocation token/revision fences callbacks
+and event claims. Constructing `AgentAssistant` opens and migrates the database
+before `init!`; stop any existing runtime before constructing an assistant for an
+upgrade. Standalone `open_harness(path)` acquires its lock before opening the file.
 Claimed groups settle atomically; frozen dispatch/filter/relevance membership
 prevents a later event or handler edit from replaying an earlier admission.
 Every transition uses the shared writer and publishes after commit. A known
@@ -204,6 +207,9 @@ requiring close/reopen to derive truth from committed records.
 Schema v6 remains the reviewed legacy batch migration. Durable v7 adds fenced
 claims/version metadata, v8 conversations/tasks/receipts and the explicit event
 CHECK rebuild, v9 effects/outbox/indexing and v10 child/resource/platform aliases.
+These migrations run when the database opens, including when `durable=false`.
+The flag selects runtime behavior, not the on-disk schema. Keep an unmigrated
+backup if an older binary may need to reopen the database.
 `backup_path` takes a SQLite-backup-API snapshot (including WAL) before a pending
 migration; `backup_harness!` takes one on demand. Shared schemas and integrity are
 checked only before a migration (foreign-key orphans are reported, not refused),
