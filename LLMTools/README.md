@@ -39,6 +39,68 @@ coding = LLMTools.coding_tools(pwd())
 everything = LLMTools.all_tools(pwd(); workers = true)
 ```
 
+## MCP Client Tools
+
+Load the [JuliaServices ModelContextProtocol.jl](https://github.com/JuliaServices/ModelContextProtocol.jl)
+package to use an MCP server's tools from Agentif. This is an optional LLMTools
+extension. The repo-root environment includes it. Outside this monorepo, install
+it by URL: the General registry contains a different package with the same name.
+
+```julia
+using Pkg
+Pkg.add(url = "https://github.com/JuliaServices/ModelContextProtocol.jl",
+        rev = "71ec8548bba6f81a2e3f670a43689d5e5acd39e6")
+```
+
+For a Streamable HTTP server:
+
+```julia
+using Agentif, LLMTools
+import ModelContextProtocol as MCP
+
+discovery = MCP.discover_server("http://127.0.0.1:3000")
+client = MCP.prepare_manual_client(discovery)
+MCP.initialize_client!(client)
+try
+    agent = Agentif.Agent(
+        prompt = "Use the available remote tools to answer the user.",
+        model = Agentif.getModel("openai", "gpt-4.1-mini"),
+        apikey = ENV["OPENAI_API_KEY"],
+        tools = LLMTools.mcp_tools(client; prefix = "remote_"),
+    )
+    result = Agentif.evaluate(agent, "Which tools can help me?")
+finally
+    MCP.terminate_session!(client)
+end
+```
+
+For a local stdio server, the do-block owns and closes its child process:
+
+```julia
+MCP.prepare_stdio_client(`my-mcp-server`) do client
+    MCP.initialize_client!(client)
+    tools = LLMTools.mcp_tools(client; prefix = "local_")
+    # Use these tools while the client remains open.
+end
+```
+
+Both transports default to protocol `2025-11-25`. Pass
+`config = MCP.MCPClientConfig(protocol_version = "2026-07-28")` when creating
+the client for the newer protocol. Configure authentication, request handlers,
+and timeouts on the MCP client before use.
+
+Discovery follows pagination and returns a snapshot. Call `mcp_tools` again to
+refresh it. Names use a caller-chosen prefix and replace unsupported characters
+with underscores; colliding names or names longer than 64 characters are rejected.
+Use distinct prefixes when combining servers. Tool calls validate the discovered
+schema before sending arguments, preserve the complete result envelope as JSON
+text within Agentif's result size limit, and mark remote failures as tool errors.
+An `input_required` response is returned as an error for the host to handle;
+the adapter does not automatically answer or replay it. Remote tools can have
+side effects. External schema references and named anchors are rejected; local JSON pointer references
+are supported. Prompts, resources, and subscriptions remain available through
+the MCP client's own APIs.
+
 ## Terminal Tools
 
 The PTY-backed terminal tools are created with:

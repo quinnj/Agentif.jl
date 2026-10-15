@@ -160,7 +160,7 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
         parse_error = nothing
         parse_bt = nothing
         try
-            args = parse_tool_arguments(tc.arguments, parameters(tool))
+            args = parse_tool_arguments(tc.arguments, tool)
         catch e
             parse_error = caught_exception(e, "Tool arguments are invalid.")
             parse_bt = caught_backtrace()
@@ -186,7 +186,13 @@ function call_function_tool!(f, tool::AgentTool, tc::PendingToolCall)
             )
         else
             try
-                output = invoke_parsed_tool(tool, args)
+                if tool.input_schema === nothing
+                    output = invoke_parsed_tool(tool, args)
+                else
+                    outcome = invoke_tool(tool, args, (;))
+                    output = outcome.output
+                    is_error = outcome.is_error
+                end
             catch e
                 normalized_error =
                     caught_exception(e, "The tool could not complete the request.")
@@ -223,6 +229,8 @@ end
 function invoke_parsed_tool(tool::AgentTool{F,T}, args)::String where {F,T<:NamedTuple}
     return invoke_tool_function(tool, args::T)
 end
+
+invoke_parsed_tool(tool::AgentTool{F, Dict{String, Any}}, args::Dict{String, Any}) where {F} = string(tool.func(args))
 
 @generated function invoke_tool_function(
         tool::AgentTool{F,T}, args::T,
@@ -313,4 +321,22 @@ function parse_tool_arguments(arguments::String, ::Type{T})::T where {T<:NamedTu
     catch e
         throw(ToolArgumentError(_describe_tool_argument_error(arguments, T, e)))
     end
+end
+
+function parse_tool_arguments(arguments::String, ::Type{Dict{String, Any}})
+    value = try
+        JSON.parse(arguments, Dict{String, Any})
+    catch err
+        throw(ToolArgumentError("expected a JSON object of arguments: " * sprint(showerror, err)))
+    end
+    return value
+end
+
+function parse_tool_arguments(arguments::String, tool::AgentTool)
+    value = parse_tool_arguments(arguments, parameters(tool))
+    if tool.input_schema !== nothing
+        issue = JSONSchema.validate(JSONSchema.Schema(tool.input_schema), value)
+        issue === nothing || throw(ToolArgumentError(sprint(show, issue)))
+    end
+    return value
 end

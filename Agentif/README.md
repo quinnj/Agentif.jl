@@ -1,5 +1,8 @@
 # Agentif
 
+For remote MCP tools over HTTP or stdio, see the optional
+[LLMTools MCP client extension](../LLMTools/README.md#mcp-client-tools).
+
 `Agentif` is the core runtime for building LLM-powered Julia agents with middleware, tool calling, sessions, streaming events, skills, and provider adapters.
 
 ## Repo-Root Workflow

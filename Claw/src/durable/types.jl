@@ -176,7 +176,7 @@ function _bounded_json(value, limit::Int)
 end
 _env_data(r::LLMTools.EnvRef) = Dict("kind" => r.kind, "id" => r.id, "version" => r.version, "root" => r.root, "capabilities" => r.capabilities)
 _spec_data(s::ToolSpec) = Dict(
-    "name" => s.tool.name, "description" => s.tool.description, "version" => s.version, "schema" => _digest(JSON.parse(JSON.json(Agentif.OpenAICompletions.schema(Agentif.parameters(s.tool))))),
+    "name" => s.tool.name, "description" => s.tool.description, "version" => s.version, "schema" => _digest(JSON.parse(JSON.json(Agentif.tool_schema(s.tool)))),
     "replay" => String(s.replay), "execution" => String(s.execution), "effect" => String(s.effect), "capabilities" => s.capabilities
 )
 

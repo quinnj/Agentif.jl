@@ -36,7 +36,7 @@ function _complete_tool_context(messages)
 end
 
 function _prepared_budget(messages, agent)
-    schemas = [Dict("name" => tool.name, "description" => tool.description, "parameters" => Agentif.OpenAICompletions.schema(Agentif.parameters(tool))) for tool in agent.tools]
+    schemas = [Dict("name" => tool.name, "description" => tool.description, "parameters" => Agentif.tool_schema(tool)) for tool in agent.tools]
     # Includes opaque signatures, images, tool arguments and schema descriptions.
     # This is a conservative byte estimate, not a provider tokenizer guarantee.
     return cld(sizeof(JSON.json(messages)) + sizeof(agent.prompt) + sizeof(JSON.json(schemas)), 4)

@@ -4686,3 +4686,4 @@ end
 end
 
 include("turn_test.jl")
+include("schema_tools_test.jl")

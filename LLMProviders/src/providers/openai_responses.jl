@@ -159,7 +159,7 @@ end
     strict::Bool = true
     type::String = "function"
     description::Union{Nothing, String} = nothing
-    parameters::JSONSchema.Schema
+    parameters::Union{JSONSchema.Schema, AbstractDict{String, Any}}
 end
 
 const Tool = Union{FunctionTool}

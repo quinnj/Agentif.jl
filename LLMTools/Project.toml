@@ -13,10 +13,17 @@ ScopedValues = "7e506255-f358-4e82-b7e4-beb19740aa63"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
+[weakdeps]
+ModelContextProtocol = "a630a0b0-4325-47f6-86f8-c7db38e4394e"
+
+[extensions]
+LLMToolsModelContextProtocolExt = "ModelContextProtocol"
+
 [sources]
 Agentif = {path = "../Agentif"}
 LLMProviders = {path = "../LLMProviders"}
 ConcurrentUtilities = {url = "https://github.com/JuliaServices/ConcurrentUtilities.jl.git", rev = "main"}
+ModelContextProtocol = {url = "https://github.com/JuliaServices/ModelContextProtocol.jl.git", rev = "71ec8548bba6f81a2e3f670a43689d5e5acd39e6"}
 PtySessions = {url = "https://github.com/quinnj/PtySessions.jl.git"}
 
 [compat]
@@ -25,6 +32,7 @@ ConcurrentUtilities = "2"
 GitIgnore = "0.1"
 HTTP = "2"
 JSON = "1.3"
+ModelContextProtocol = "1"
 PtySessions = "0.1"
 ScopedValues = "1.3"
 UUIDs = "1"
@@ -32,7 +40,8 @@ julia = "1.11"
 
 [extras]
 LLMProviders = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
+ModelContextProtocol = "a630a0b0-4325-47f6-86f8-c7db38e4394e"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "LLMProviders"]
+test = ["Test", "LLMProviders", "ModelContextProtocol"]

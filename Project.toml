@@ -14,6 +14,7 @@ LLMProviders = "e1f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2a"
 LLMTools = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
 LocalSearch = "3edf9609-13f2-4288-b0a3-8bd6d521158e"
 MSTeams = "730ab40b-c28c-4fcb-83ce-ff189233d76d"
+ModelContextProtocol = "a630a0b0-4325-47f6-86f8-c7db38e4394e"
 Mattermost = "c9a394b0-b131-4b99-aeb4-b011b7b7f934"
 OAuth = "22d8b318-f366-56fb-a292-a93f7d76c017"
 PtySessions = "581b29ee-4021-4243-bea3-a8421693f905"
@@ -38,6 +39,7 @@ LLMProviders = {path = "LLMProviders"}
 LLMTools = {path = "LLMTools"}
 LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}
 MSTeams = {url = "https://github.com/quinnj/MSTeams.jl.git"}
+ModelContextProtocol = {url = "https://github.com/JuliaServices/ModelContextProtocol.jl.git", rev = "71ec8548bba6f81a2e3f670a43689d5e5acd39e6"}
 Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}
 OAuth = {rev = "main", url = "https://github.com/JuliaServices/OAuth.jl.git"}
 PtySessions = {url = "https://github.com/JuliaServices/PtySessions.jl.git"}

@@ -10,7 +10,7 @@ function google_build_tools(P::Module, tools::Vector{<:AgentTool})
     for tool in tools
         push!(
             decls, P.FunctionDeclaration(
-                ; name = tool.name, description = tool.description, parameters = P.schema(parameters(tool))
+                ; name = tool.name, description = tool.description, parameters = tool_schema(tool, P)
             )
         )
     end

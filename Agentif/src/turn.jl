@@ -75,7 +75,8 @@ Context-aware hosts can install an explicitly versioned invocation adapter.
 function invoke_tool(tool::AgentTool, parsed_args, context)
     hasproperty(context, :abort) && check_abort(context.abort)
     hasproperty(context, :deadline) && time() >= context.deadline && throw(AbortEvaluation())
-    return ToolOutcome(invoke_parsed_tool(tool, parsed_args))
+    result = tool.input_schema === nothing ? invoke_parsed_tool(tool, parsed_args) : tool.func(parsed_args)
+    return result isa ToolOutcome ? result : ToolOutcome(string(result))
 end
 
 valid_summary(outcome::ModelTurnOutcome) = outcome.error === nothing && outcome.stop_reason === :stop &&
