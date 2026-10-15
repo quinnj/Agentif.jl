@@ -12,7 +12,7 @@ AgentTool{F, T}(name, description, strict, func) where {F, T} =
 """Create a tool with a JSON Schema and a callable receiving one argument dictionary.
 
 Schema tools default to non-strict provider mode so optional properties retain
-their meaning. References must be local fragments; schema loading never fetches
+their meaning. References must be local JSON pointers; schema loading never fetches
 files or URLs. Returning `ToolOutcome` preserves an application's error flag.
 """
 function AgentTool(func::F; name::String, input_schema::AbstractDict, description = nothing, strict::Bool = false) where {F}
@@ -26,7 +26,7 @@ function _check_local_schema_refs(value)
         for (key, item) in value
             key in ("enum", "const") && continue
             if key in ("\$ref", "\$dynamicRef") && item isa AbstractString
-                startswith(item, '#') || throw(ArgumentError("tool schemas require local references"))
+                (item == "#" || startswith(item, "#/")) || throw(ArgumentError("tool schemas require local JSON pointer references"))
             end
             _check_local_schema_refs(item)
         end

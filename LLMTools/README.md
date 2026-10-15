@@ -97,7 +97,7 @@ schema before sending arguments, preserve the complete result envelope as JSON
 text within Agentif's result size limit, and mark remote failures as tool errors.
 An `input_required` response is returned as an error for the host to handle;
 the adapter does not automatically answer or replay it. Remote tools can have
-side effects. External schema references are rejected; local fragment references
+side effects. External schema references and named anchors are rejected; local JSON pointer references
 are supported. Prompts, resources, and subscriptions remain available through
 the MCP client's own APIs.
 

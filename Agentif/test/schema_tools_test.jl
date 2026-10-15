@@ -36,7 +36,7 @@ using Test, Agentif, JSON
     for provider in (Agentif.GoogleGenerativeAI, Agentif.GoogleGeminiCli)
         @test Agentif.google_build_tools(provider, [tool])[1].functionDeclarations[1].parameters["required"] == ["text"]
     end
-    for reference in ("file:///private.json", "https://example.invalid/schema.json", "relative.json")
+    for reference in ("file:///private.json", "https://example.invalid/schema.json", "relative.json", "#unsupported-anchor")
         @test_throws ArgumentError Agentif.AgentTool(identity; name = "external", input_schema = Dict("\$ref" => reference))
     end
     local_ref = Agentif.AgentTool(identity; name = "local", input_schema = Dict(
