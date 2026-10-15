@@ -18,4 +18,15 @@ include("durable_fixtures.jl")
         end
     end
 end
+
+@testset "failed database open releases durable ownership" begin
+    mktempdir() do dir
+        path = mkdir(joinpath(dir, "database"))
+        @test_throws SQLite.SQLiteException Claw.open_harness(path)
+        @test_throws SQLite.SQLiteException Claw.open_harness(path)
+        rm(path)
+        h = Claw.open_harness(path)
+        @test Claw.close_harness!(h).status == :closed
+    end
+end
 end

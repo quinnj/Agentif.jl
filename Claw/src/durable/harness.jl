@@ -44,9 +44,10 @@ function open_harness(path::String; backup_path::Union{Nothing, String} = nothin
     _is_private_memory_path(path) && throw(ArgumentError("durable runtime requires a file-backed database"))
     Sys.iswindows() && error("durable ownership requires a supported OS advisory lock")
     owner = _acquire_owner_lock(path)
-    db = SQLite.DB(path)
+    db = nothing
     writer = nothing
     try
+        db = SQLite.DB(path)
         _prepare_database!(db; backup_path)
         Agentif.init_sqlite_session_schema!(db)
         epoch = _advance_owner!(db)
@@ -57,7 +58,7 @@ function open_harness(path::String; backup_path::Union{Nothing, String} = nothin
         return h
     catch
         writer === nothing || close_writer!(writer)
-        close(db)
+        db === nothing || close(db)
         owner === nothing || close(owner)
         rethrow()
     end
