@@ -149,7 +149,8 @@ function instrument_tool(tool::Agentif.AgentTool{F, T}, counter::Threads.Atomic{
         return result
     end
     return Agentif.AgentTool{typeof(wrapped), T}(;
-        name = tool.name, description = tool.description, strict = tool.strict, func = wrapped)
+        name = tool.name, description = tool.description, strict = tool.strict,
+        func = wrapped, input_schema = tool.input_schema)
 end
 
 function drain_steering!(steer::Channel{String}, steer_lock::ReentrantLock)

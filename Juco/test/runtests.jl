@@ -199,6 +199,18 @@ end
         @test occursin("only 4 tool calls remain", result)
         @test occursin("hi", result)
     end
+    remote = Agentif.AgentTool(; name = "remote", input_schema = Dict(
+        "type" => "object", "properties" => Dict("text" => Dict("type" => "string")), "required" => ["text"],
+    )) do args
+        Agentif.ToolOutcome(JSON.json(args); is_error = true)
+    end
+    wrapped = Juco.with_budget_notice(remote, Threads.Atomic{Int}(0), 10)
+    @test wrapped.input_schema == remote.input_schema
+    @test_throws Agentif.ToolArgumentError Agentif.parse_tool_arguments("{}", wrapped)
+    result = wait(Agentif.call_function_tool!(identity, wrapped,
+        Agentif.PendingToolCall(; name = "remote", call_id = "wrapped", arguments = "{\"text\":\"kept\"}")))
+    @test result.is_error
+    @test JSON.parse(Agentif.message_text(result))["text"] == "kept"
 end
 
 @testset "toolset presets" begin
