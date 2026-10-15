@@ -31,3 +31,16 @@ jobs:
             Pkg.instantiate()
           '
           julia --project=. test/runtests.jl ${{ matrix.package }}
+  provider-urls-windows:
+    name: Provider URLs - Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - name: Check provider endpoints
+        run: |
+          julia --project=. --startup-file=no -e 'using Pkg; Pkg.instantiate()'
+          julia --project=. --startup-file=no Agentif/test/provider_urls_test.jl

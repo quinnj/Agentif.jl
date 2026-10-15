@@ -526,7 +526,7 @@ function stream(
             "Content-Type" => "application/json",
         )
         model.headers !== nothing && merge!(headers, model.headers)
-        url = joinpath(model.baseUrl, "responses")
+        url = string(rstrip(model.baseUrl, '/'), "/responses")
         events_seen = Ref(false)
         sse_cb = sse_tracking_callback(
             openai_responses_event_callback(
@@ -661,7 +661,7 @@ function stream(
             "Content-Type" => "application/json",
         )
         model.headers !== nothing && merge!(headers, model.headers)
-        url = joinpath(model.baseUrl, "chat", "completions")
+        url = string(rstrip(model.baseUrl, '/'), "/chat/completions")
         stream_failed = Ref(false)
         if use_stream
             events_seen = Ref(false)
@@ -949,7 +949,7 @@ function stream(
             headers["anthropic-beta"] = join(beta_features, ",")
         end
         model.headers !== nothing && merge!(headers, model.headers)
-        url = joinpath(model.baseUrl, "v1", "messages")
+        url = string(rstrip(model.baseUrl, '/'), "/v1/messages")
         if disable_streaming
             request_messages = original_request_messages
             total_usage = Usage()
@@ -1146,7 +1146,7 @@ function stream(
             "Content-Type" => "application/json",
         )
         model.headers !== nothing && merge!(headers, model.headers)
-        url = joinpath(model.baseUrl, "models", "$(model.id):streamGenerateContent")
+        url = string(rstrip(model.baseUrl, '/'), "/models/", model.id, ":streamGenerateContent")
         events_seen = Ref(false)
         stream_failed = Ref(false)
         sse_cb = sse_tracking_callback(
