@@ -182,7 +182,7 @@ end
 
 @testset "forged MSTeams activity is rejected before an event exists" begin
     with_jwks_server() do openid_url
-        a = Claw.AgentAssistant(":memory:";
+        a = Claw.AgentAssistant(":memory:"; search_options=(embed=nothing,),
             provider = "openai-completions", model_id = "gpt-4o-mini", apikey = "test-key",
             timezone = "UTC", level = :error)
         Claw.CURRENT_ASSISTANT[] = a

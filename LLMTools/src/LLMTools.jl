@@ -18,6 +18,7 @@ include("egress.jl")
 
 # File/search/subagent/web tools and tool aggregation
 include("predefined_tools.jl")
+include("environments.jl")
 
 # Terminal tools (PTY sessions)
 include("terminal_tools.jl")

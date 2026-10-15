@@ -9,6 +9,7 @@ Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+JevSDK = "131c9545-31de-4807-9342-127be5dea8db"
 LLMTools = "d2f4c4b3-4b8a-4e8c-9b4f-7b8e4e6e5b2c"
 LocalSearch = "3edf9609-13f2-4288-b0a3-8bd6d521158e"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
@@ -31,8 +32,9 @@ Telegram = "0f099131-46f3-42ed-8989-d9c7888465f9"
 
 [sources]
 Agentif = {path = "../Agentif"}
-HTTP = {url = "https://github.com/JuliaWeb/HTTP.jl.git", rev = "master"}
+HTTP = {url = "https://github.com/JuliaWeb/HTTP.jl.git", rev = "v2.6.7"}
 LLMTools = {path = "../LLMTools"}
+JevSDK = {url = "https://github.com/JuliaServices/JevSDK.jl.git", rev = "aebbed7181698d76ba284dab0f57b664e1e594c9"}
 LocalSearch = {url = "https://github.com/quinnj/LocalSearch.jl.git"}
 MSTeams = {url = "https://github.com/quinnj/MSTeams.jl.git"}
 Mattermost = {url = "https://github.com/quinnj/Mattermost.jl.git"}
@@ -53,8 +55,9 @@ ClawTelegramExt = "Telegram"
 [compat]
 Agentif = "1"
 GitHub = "5"
-HTTP = "2"
+HTTP = "2.6.7"
 JSON = "1"
+JevSDK = "1"
 JMAP = "0.1.0"
 MSTeams = "0.1.0"
 Mattermost = "0.1.0"

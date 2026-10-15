@@ -39,6 +39,8 @@ Base.@kwdef struct PipelineConfig
     lane_backlog_warn_s::Float64 = 2.0
     "Max events one lane drain coalesces into a single evaluation (1 disables)."
     max_coalesce::Int = 8
+    "Burst collection window in seconds (0 preserves opportunistic draining; at most 2)."
+    coalesce_window_s::Float64 = 0.0
     "Retire an idle lane (and its worker task) after this long with no work."
     lane_idle_timeout_s::Float64 = 300.0
     "Emit at most one PTY output event per this interval."
@@ -327,7 +329,7 @@ and crashed events wait out their leases instead.
 """
 function _acquire_owner_lock(db_path::String)
     (_is_private_memory_path(db_path) || Sys.iswindows()) && return nothing
-    path = (isfile(db_path) ? realpath(db_path) : abspath(db_path)) * ".lock"
+    path = (isfile(db_path) ? realpath(db_path) : joinpath(realpath(dirname(abspath(db_path))), basename(db_path))) * ".lock"
     io = open(path, "w")
     if ccall(:flock, Cint, (Cint, Cint), fd(io), LOCK_EX | LOCK_NB) != 0
         err = Libc.errno()
@@ -338,14 +340,7 @@ function _acquire_owner_lock(db_path::String)
     return io
 end
 
-# ─── Schema migrations (PRAGMA user_version) ───
-#
-# Version 1 == the implicit schema that shipped before this file existed. Any
-# database opened by an older Claw is at user_version 0 and is stamped to 1 after
-# the baseline tables are (idempotently) created, so the ladder below is the only
-# thing that ever has to change a live database.
-
-const CLAW_SCHEMA_VERSION = 6
+const CLAW_SCHEMA_VERSION = 10
 
 function _is_sensitive_integration_key(key)
     normalized = replace(lowercase(String(key)), r"[^a-z0-9]" => "")
@@ -508,6 +503,7 @@ on one written by an older Claw.
 """
 function _migrate_claw_schema!(db::SQLite.DB)
     current = _get_user_version(db)
+    current <= CLAW_SCHEMA_VERSION || error("Claw: future schema $current; writer supports $CLAW_SCHEMA_VERSION")
     if current == 0
         current = 1
         _set_user_version!(db, current)
@@ -516,8 +512,15 @@ function _migrate_claw_schema!(db::SQLite.DB)
         next = current + 1
         migration = get(CLAW_MIGRATIONS, next, nothing)
         migration === nothing && error("Claw: missing schema migration for version $next")
-        migration(db)
-        _set_user_version!(db, next)
+        SQLite.execute(db, "BEGIN IMMEDIATE")
+        try
+            migration(db)
+            _set_user_version!(db, next)
+            SQLite.execute(db, "COMMIT")
+        catch
+            SQLite.intransaction(db) && SQLite.execute(db, "ROLLBACK")
+            rethrow()
+        end
         current = next
         @debug "Claw: applied schema migration" version = next
     end

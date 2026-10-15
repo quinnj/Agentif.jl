@@ -194,7 +194,7 @@ function get_tools(es::LLMToolsEventSource)
     append!(tools, _create_pty_tools(es))
     append!(tools, _create_worker_tools(es))
     cfg = es.config
-    cfg.enable_coding && append!(tools, LLMTools.coding_tools(cfg.base_dir))
+    cfg.enable_coding && append!(tools, _register_coding_adapters!(LLMTools.coding_tools(cfg.base_dir)))
     cfg.enable_web && append!(tools, LLMTools.web_tools())
     return tools
 end
@@ -572,6 +572,7 @@ Arguments:
 - name (String, required): The name of an existing sub-agent session (as given to start_subagent).
 - input_message (String, required): The follow-up message or question to send.
 - run_sync (Bool, optional): If true, blocks until the sub-agent responds. Default: false (async).
+- mode (String, optional): In durable mode, use "followup" for a later run or "steer" to place input at the next model boundary. Default: "followup".
 
 Example:
 - message_subagent("refactor-auth", "Now add unit tests for the new token validation function")""",
@@ -579,7 +580,9 @@ Example:
             name::String,
             input_message::String,
             run_sync::Union{Nothing, Bool} = nothing,
+            mode::String = "followup",
         ) = begin
+            mode=="followup" || return "Steering a child requires durable mode."
             sync = run_sync === nothing ? false : run_sync
             session = _get_session(es, name, :subagent)
             session.agent === nothing && error("Sub-agent '$name' has no agent instance")
@@ -683,7 +686,7 @@ Arguments:
         end,
     )
 
-    return Agentif.AgentTool[start_tool, message_tool, list_tool, kill_tool]
+    return _register_subagent_adapters!(Agentif.AgentTool[start_tool, message_tool, list_tool, kill_tool])
 end
 
 # ─── PTY tools ───
@@ -961,7 +964,7 @@ Arguments:
         end,
     )
 
-    return Agentif.AgentTool[start_tool, write_tool, list_tool, kill_tool]
+    return _register_resource_adapters!(Agentif.AgentTool[start_tool, write_tool, list_tool, kill_tool],"pty")
 end
 
 # ─── Worker tools ───
@@ -1199,5 +1202,5 @@ Arguments:
         end,
     )
 
-    return Agentif.AgentTool[start_tool, eval_tool, list_tool, kill_tool]
+    return _register_resource_adapters!(Agentif.AgentTool[start_tool, eval_tool, list_tool, kill_tool],"worker")
 end

@@ -73,7 +73,7 @@ const TEST_MODEL = Agentif.registerModel!(Agentif.Model(;
     contextWindow = 4096, maxTokens = 1024))
 
 function make_assistant(db_path::String = ":memory:"; sources = Claw.EventSource[], kwargs...)
-    a = Claw.AgentAssistant(db_path;
+    a = Claw.AgentAssistant(db_path; search_options=(embed=nothing,),
         provider = "trust-test", model_id = "trust-test-model", apikey = "test-key",
         timezone = "UTC", level = :error, kwargs...)
     for es in sources

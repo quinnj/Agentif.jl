@@ -217,6 +217,10 @@ migration mechanism at all, so any column change silently breaks existing databa
 
 ## 1.9 Resuming an evaluation after a crash
 
+The following describes legacy checkpoint recovery. Opt-in `durable=true` uses
+the [durable Harness](durable.md), with submission/effect/dispatch receipts,
+uncertainty barriers, owned children and an outbox.
+
 Added after the Pi Durable comparison (October 2026). The pipeline above recovers
 *events*; this recovers progress *inside* an evaluation.
 

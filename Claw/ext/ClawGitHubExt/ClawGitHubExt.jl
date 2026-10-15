@@ -166,6 +166,7 @@ end
 
 Agentif.entry_id(ch::GitHubChannel) = ch.source_id === nothing ? nothing : string(ch.source_id)
 Agentif.response_entry_id(ch::GitHubChannel) = ch.response_id === nothing ? nothing : string(ch.response_id)
+Claw.delivery_available(ch::GitHubChannel)=ch.auth!==nothing && _comment_target_number(ch)!==nothing
 
 # PR metadata, file lists, and reactions are left to the GitHub CLI (`gh`) in the agent environment.
 
@@ -907,17 +908,13 @@ function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
             # Persist before returning 200. A crash after the response is covered
             # by Claw's durable inbox; a failure before it lets GitHub redeliver.
             #
-            # NOTE: no dedup key yet. GitHub's delivery id arrives as the
-            # `X-GitHub-Delivery` *header*, and GitHub.jl's `WebhookEvent` only
-            # carries (kind, payload, repository, sender) — the header never reaches
-            # this callback. Plumbing it through is Stage 2 (§2.1); until then a
-            # GitHub redelivery is processed twice, which is the at-least-once
-            # behavior this stage explicitly accepts.
-            Claw.submit_event!(assistant, ghev)
+            Claw.submit_event!(assistant, ghev;dedup_key=get(task_local_storage(),:claw_github_delivery,nothing))
             return HTTP.Response(200, "OK")
         end
         @info "ClawGitHubExt: listening on $(source.host):$(source.port)"
-        server = HTTP.serve!(listener.handle_request, string(host), port)
+        # Preserve GitHub.jl's signature validation and event parsing. The
+        # request-local header reaches the callback only after that validation.
+        server = HTTP.serve!(request->_with_github_delivery(listener.handle_request,request), string(host), port)
         should_stop = lock(source._lock) do
             source._server = server
             source._stopping[]
@@ -935,6 +932,14 @@ function Claw.start!(source::GitHubEventSource, assistant::Claw.AgentAssistant)
             end
         end
     end)
+end
+
+function _with_github_delivery(f,request)
+    id=HTTP.header(request,"X-GitHub-Delivery","")
+    key=isempty(id) ? nothing : "github:$id"
+    task_local_storage(:claw_github_delivery,key) do
+        f(request)
+    end
 end
 
 function Claw.stop!(source::GitHubEventSource)

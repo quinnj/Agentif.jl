@@ -62,7 +62,13 @@ struct EventRow
     lane::String
     attempts::Int
     assistant::Any    # AgentAssistant; untyped to keep this file include-order free
+    claim_token::Union{Nothing,String}
+    claim_revision::Int
+    owner_epoch::Int
 end
+
+EventRow(id,source,name,dedup_key,channel_id,content,extra,lane,attempts,assistant) =
+    EventRow(id,source,name,dedup_key,channel_id,content,extra,lane,attempts,assistant,nothing,0,0)
 
 # A `ChannelEvent` carries a *live* channel object holding a platform client; that
 # cannot be serialized and rehydrated after a restart. What a handler actually
@@ -294,6 +300,9 @@ function submit_event!(assistant::AgentAssistant, ev::Event;
         dedup_key::Union{Nothing, AbstractString} = event_dedup_key(ev),
         lane::Union{Nothing, AbstractString} = nothing,
     )
+    # Intake persists even while a durable harness cannot schedule (poisoned or
+    # closing): the inbox row survives until a reopened harness dispatches it.
+    h = assistant._harness[]
     assistant._state[] in (:stopping, :stopped) &&
         error("Claw: cannot persist event while the pipeline is $(assistant._state[])")
     name = try
@@ -333,9 +342,9 @@ function submit_event!(assistant::AgentAssistant, ev::Event;
             _with_busy_retry() do
                 _exec!(db, """
                     INSERT OR IGNORE INTO claw_events
-                        (dedup_key, source, name, payload, status, attempts, lane, created_at, next_attempt_at)
-                    VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)
-                """, (dk, String(source), name, payload, lane_key, now, now))
+                        (dedup_key, source, name, payload, status, attempts, lane, created_at, next_attempt_at,durable)
+                    VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?,?)
+                """, (dk, String(source), name, payload, lane_key, now, now,Int(h!==nothing)))
                 Int(_scalar(db, "SELECT changes()")) == 0 && return nothing
                 return Int(_scalar(db, "SELECT last_insert_rowid()"))
             end
@@ -423,14 +432,21 @@ group it runs with from now on (see `_process_event_batch!`).
 """
 function _claim_event!(assistant::AgentAssistant, id::Int; batch::Union{Nothing, Int} = nothing)
     lease = time() + assistant.pipeline.lease_duration_s
+    token = _new_id()
     return _writer_txn(assistant) do db
+        if assistant._harness[]===nothing
+            frozen=_fetch_one(db,"SELECT event_id FROM claw_frozen_members WHERE event_id=?",(id,))
+            frozen===nothing || return nothing
+            mode=_fetch_one(db,"SELECT durable FROM claw_events WHERE id=?",(id,))
+            mode===nothing || mode.durable==0 || return nothing
+        end
         _exec!(db,
-            "UPDATE claw_events SET status='running', attempts=attempts+1, lease_expires_at=?, batch=COALESCE(batch, ?) WHERE id=? AND status='pending'",
-            (lease, batch, id))
+            "UPDATE claw_events SET status='running', attempts=attempts+1, lease_expires_at=?,batch=COALESCE(batch,?),claim_token=?,claim_revision=claim_revision+1,owner_epoch=?,durable=MAX(durable,?) WHERE id=? AND status='pending'",
+            (lease,batch,token,assistant._owner_epoch[],Int(assistant._harness[]!==nothing),id))
         Int(_scalar(db, "SELECT changes()")) == 0 && return nothing
         result = nothing
         for row in SQLite.DBInterface.execute(db,
-                "SELECT id, source, name, dedup_key, payload, lane, attempts FROM claw_events WHERE id = ?", (id,))
+                "SELECT id, source, name, dedup_key, payload, lane, attempts,claim_token,claim_revision,owner_epoch FROM claw_events WHERE id = ?", (id,))
             cid, content, extra = try
                 _decode_payload(String(row.payload))
             catch e
@@ -448,53 +464,47 @@ function _claim_event!(assistant::AgentAssistant, id::Int; batch::Union{Nothing,
                 rethrow()
             end
             result = EventRow(Int(row.id), String(row.source), String(row.name), _sqlite_str(row.dedup_key),
-                cid, content, extra, String(row.lane), Int(row.attempts), assistant)
+                cid, content, extra, String(row.lane), Int(row.attempts), assistant,String(row.claim_token),Int(row.claim_revision),Int(row.owner_epoch))
         end
         return result
     end
 end
 
-# Rows that were claimed together are settled by one UPDATE, so a crash or a
-# failed write never leaves some of them settled and others still running.
-# A split batch would be run again without its settled rows, under a different
-# resume key, redoing work its handlers already finished.
+# Settle a batch with one SQL UPDATE, and require every member's original fence.
+# If even one token is stale, the statement changes no rows. SQL failures propagate.
 _id_list(ids) = join((Int(id) for id in ids), ",")
-
-function _finish_event!(assistant::AgentAssistant, ids::AbstractVector{Int}, status::AbstractString;
-        last_error::Union{Nothing, AbstractString} = nothing,
-        next_attempt_at::Union{Nothing, Float64} = nothing,
-    )
-    next = next_attempt_at === nothing ? time() : next_attempt_at
-    try
-        execute_write(assistant._writer,
-            "UPDATE claw_events SET status = ?, lease_expires_at = NULL, next_attempt_at = ?, last_error = COALESCE(?, last_error) WHERE id IN ($(_id_list(ids)))",
-            (String(status), next, last_error === nothing ? nothing : first(String(last_error), 4000)))
-    catch e
-        @error "Claw: failed to record event outcome" event_ids = ids status exception = (e, catch_backtrace())
+function _fenced_events!(a,rows::AbstractVector{EventRow},assignment,params)
+    isempty(rows) && throw(ArgumentError("empty event claim group"))
+    length(unique(r.id for r in rows))==length(rows) || throw(ArgumentError("duplicate claim member"))
+    values_sql=join(fill("(?,?,?,?)",length(rows)),",")
+    values_params=Tuple(Iterators.flatten((r.id,r.claim_token,r.claim_revision,r.owner_epoch) for r in rows))
+    # The claim token fences legacy settlement. Durable work is also fenced by
+    # the runtime owner epoch, which only the owner-lock holder advances.
+    owner_fence=a._harness[]===nothing ? "" : "AND e.owner_epoch=(SELECT owner_epoch FROM claw_runtime_meta WHERE id=1)"
+    _writer_txn(a) do db
+        _exec!(db,"""WITH expected(id,token,revision,epoch) AS (VALUES $values_sql)
+            UPDATE claw_events SET $assignment
+            WHERE status='running' AND EXISTS(SELECT 1 FROM expected x WHERE x.id=claw_events.id
+                AND x.token=claw_events.claim_token AND x.revision=claw_events.claim_revision AND x.epoch=claw_events.owner_epoch)
+            AND (SELECT COUNT(*) FROM claw_events e JOIN expected x ON e.id=x.id AND e.claim_token=x.token
+                AND e.claim_revision=x.revision AND e.owner_epoch=x.epoch
+                WHERE e.status='running' $(owner_fence))=(SELECT COUNT(*) FROM expected)
+        """,(values_params...,params...))
+        Int(_scalar(db,"SELECT changes()"))==length(rows) || throw(StaleInvocation())
     end
-    return nothing
+    nothing
 end
-_finish_event!(assistant::AgentAssistant, id::Int, status::AbstractString; kw...) =
-    _finish_event!(assistant, [id], status; kw...)
-
-# Return an unfinished claim to `pending` without charging an attempt (§1.3 `:aborted`).
-function _release_claim!(assistant::AgentAssistant, ids::AbstractVector{Int};
-        delay::Float64 = 0.0,
-        last_error::Union{Nothing, AbstractString} = nothing,
-    )
-    try
-        execute_write(assistant._writer, """
-            UPDATE claw_events
-            SET status='pending', attempts = MAX(attempts - 1, 0), lease_expires_at = NULL,
-                next_attempt_at = ?, last_error = COALESCE(?, last_error)
-            WHERE id IN ($(_id_list(ids))) AND status = 'running'
-        """, (time() + delay, last_error === nothing ? nothing : first(String(last_error), 4000)))
-    catch e
-        @error "Claw: failed to release claim" event_ids = ids exception = (e, catch_backtrace())
-    end
-    return nothing
+function _finish_event!(a::AgentAssistant,rows::AbstractVector{EventRow},status::AbstractString;
+        last_error::Union{Nothing,AbstractString}=nothing,next_attempt_at::Union{Nothing,Float64}=nothing)
+    _fenced_events!(a,rows,"status=?,lease_expires_at=NULL,next_attempt_at=?,last_error=COALESCE(?,last_error),claim_token=NULL,claim_revision=claim_revision+1",
+        (String(status),something(next_attempt_at,time()),last_error===nothing ? nothing : first(String(last_error),4000)))
 end
-_release_claim!(assistant::AgentAssistant, id::Int; kw...) = _release_claim!(assistant, [id]; kw...)
+_finish_event!(a::AgentAssistant,row::EventRow,status::AbstractString;kw...)=_finish_event!(a,[row],status;kw...)
+function _release_claim!(a::AgentAssistant,rows::AbstractVector{EventRow};delay::Float64=0.0,last_error::Union{Nothing,AbstractString}=nothing)
+    _fenced_events!(a,rows,"status='pending',attempts=MAX(attempts-1,0),lease_expires_at=NULL,next_attempt_at=?,last_error=COALESCE(?,last_error),claim_token=NULL,claim_revision=claim_revision+1",
+        (time()+delay,last_error===nothing ? nothing : first(String(last_error),4000)))
+end
+_release_claim!(a::AgentAssistant,row::EventRow;kw...)=_release_claim!(a,[row];kw...)
 
 # ─── Dispatch ───
 
@@ -549,6 +559,32 @@ function _reap_idle_lanes!(assistant::AgentAssistant)
     return reaped
 end
 
+function _collect_lane_batch!(assistant::AgentAssistant, lane::Lane, item)
+    items = [item]
+    limit = max(assistant.pipeline.max_coalesce, 1)
+    # Queue time counts toward the window. A backed-up lane does not add another
+    # window after a slow evaluation. New arrivals never extend the deadline.
+    remaining = max(0.0, assistant.pipeline.coalesce_window_s - max(0.0, time() - item[2]))
+    deadline = time_ns() + UInt64(round(Int, remaining * 1e9))
+    while length(items) < limit && assistant._state[] === :running
+        remaining > 0 && time_ns() >= deadline && break
+        if isready(lane.queue)
+            extra = try
+                take!(lane.queue)
+            catch
+                break
+            end
+            Threads.atomic_sub!(lane.depth, 1)
+            push!(items, extra)
+        elseif time_ns() < deadline && isopen(lane.queue)
+            sleep(min(0.01, max(0.0, Float64(Int128(deadline) - time_ns()) / 1e9)))
+        else
+            break
+        end
+    end
+    return items
+end
+
 function _lane_loop(assistant::AgentAssistant, lane::Lane)
     Agentif.with_log_level(assistant.log_level) do
         while true
@@ -562,27 +598,20 @@ function _lane_loop(assistant::AgentAssistant, lane::Lane)
                 _clear_wakeup!(assistant, item[1])
                 break
             end
-            # Coalesce: drain whatever else is already queued on this lane (up to
-            # max_coalesce), so a burst that piled up behind a slow evaluation is
-            # handled as one demarcated batch instead of N sequential evaluations.
-            # Only this worker consumes the queue, so isready/take! cannot race.
-            items = [item]
-            max_coalesce = max(assistant.pipeline.max_coalesce, 1)
-            while length(items) < max_coalesce && isready(lane.queue)
-                extra = try
-                    take!(lane.queue)
-                catch
-                    break
-                end
-                Threads.atomic_sub!(lane.depth, 1)
-                push!(items, extra)
+            # Keep the lane alive while collecting. Waiting consumes neither an
+            # event claim nor a model slot; only this worker consumes this queue.
+            lane.busy[] = true
+            waited = time() - item[2]
+            items = _collect_lane_batch!(assistant, lane, item)
+            if assistant._state[] !== :running
+                foreach(x -> _clear_wakeup!(assistant, x[1]), items)
+                lane.busy[] = false
+                break
             end
-            waited = time() - items[1][2]
             if waited > assistant.pipeline.lane_backlog_warn_s
                 @warn "Claw: lane backlog" lane = lane.key wait_s = round(waited; digits = 2) queue_depth = lane.depth[] drained = length(items)
             end
             ids = [id for (id, _) in items]
-            lane.busy[] = true
             Base.acquire(assistant._sem)
             try
                 _process_event_batch!(assistant, ids)
@@ -654,15 +683,15 @@ function _handle_event_failure!(assistant::AgentAssistant, rows::AbstractVector{
     event_name = rows[1].name
     if action === :pending
         @info "Claw: evaluation aborted; returning event to pending" event_ids = ids event_name
-        _release_claim!(assistant, ids; delay = cfg.min_refire_gap_s, last_error = text)
+        _release_claim!(assistant, rows; delay = cfg.min_refire_gap_s, last_error = text)
     elseif action === :retry
         refire = max(delay, cfg.min_refire_gap_s)
         @warn "Claw: event handling failed; scheduling retry" event_ids = ids event_name class attempts retry_in_s = round(refire; digits = 2)
-        _finish_event!(assistant, ids, "pending"; last_error = text, next_attempt_at = time() + refire)
+        _finish_event!(assistant, rows, "pending"; last_error = text, next_attempt_at = time() + refire)
     else
         @error "Claw: event dead-lettered" event_ids = ids event_name class attempts error = text
-        _finish_event!(assistant, ids, "dead"; last_error = text)
-        _dead_letter_notify!(assistant, ids[1], ev, handlers, class, text)
+        _finish_event!(assistant, rows, "dead"; last_error = text)
+        assistant._harness[]===nothing && _dead_letter_notify!(assistant, ids[1], ev, handlers, class, text)
         foreach(id -> _forget_live_event!(assistant, id), ids)
     end
     return action
@@ -744,7 +773,7 @@ function _process_event_run!(assistant::AgentAssistant, ids::Vector{Int}, batch:
         if ev === nothing
             # The owning source is not registered (or could not rebuild the channel).
             # Leave the row pending and try again later rather than dropping it.
-            _release_claim!(assistant, id; delay = 60.0, last_error = "no rehydrator for source '$(row.source)'")
+            _release_claim!(assistant, row; delay = 60.0, last_error = "no rehydrator for source '$(row.source)'")
             _clear_wakeup!(assistant, id)
             continue
         end
@@ -753,7 +782,7 @@ function _process_event_run!(assistant::AgentAssistant, ids::Vector{Int}, batch:
     isempty(claimed) && return nothing
 
     if assistant._state[] !== :running
-        _release_claim!(assistant, [row.id for (row, _) in claimed])
+        _release_claim!(assistant, [row for (row, _) in claimed])
         foreach(((row, _),) -> _clear_wakeup!(assistant, row.id), claimed)
         _release_group_channels!(claimed, nothing)
         return nothing
@@ -798,11 +827,51 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
         return nothing
     end
 
-    if isempty(handlers)
+    if isempty(handlers) && assistant._harness[]===nothing
         @debug "Claw: no handlers for event" event_ids = ids event_name = name
-        _finish_event!(assistant, ids, "done")
+        _finish_event!(assistant, rows, "done")
         foreach(id -> (_forget_live_event!(assistant, id); _clear_wakeup!(assistant, id)), ids)
         _release_group_channels!(group, nothing)
+        return nothing
+    end
+
+    if assistant._harness[] !== nothing
+        abort=Agentif.Abort()
+        lock(assistant._inflight_lock) do
+            for (row,_) in group
+                assistant._inflight[row.id]=abort
+            end
+        end
+        try
+            _durable_dispatch_group!(assistant,group,handlers;abort)
+        catch err
+            current_rows=EventRow[]
+            for (row,ev) in group
+                current=with_read(assistant._readers) do db
+                    _fetch_one(db,"SELECT status,claim_token FROM claw_events WHERE id=?",(row.id,))
+                end
+                current!==nothing && current.status=="running" && current.claim_token==row.claim_token && push!(current_rows,row)
+            end
+            if !isempty(current_rows)
+                # A blocked dependency or a harness that cannot schedule right now
+                # (poisoned or closing) says nothing about the event itself: return
+                # it to pending without charging an attempt.
+                h=assistant._harness[]
+                waiting=err isa DurableBlocked || err isa HarnessPoisoned || h===nothing || h.state!==:open
+                waiting ? _release_claim!(assistant,current_rows;delay=60.0,last_error=sprint(showerror,err)) :
+                    _handle_event_failure!(assistant,current_rows,group[1][2],(),err)
+            end
+            _release_group_channels!(group,nothing)
+        finally
+            lock(assistant._inflight_lock) do
+                for (row,_) in group
+                    delete!(assistant._inflight,row.id)
+                end
+            end
+            for (row,_) in group
+                _clear_wakeup!(assistant,row.id)
+            end
+        end
         return nothing
     end
 
@@ -817,19 +886,21 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
     # group is released afterwards so nothing waits on a response that will never
     # come (a coalesced member, or an event a filter rejected).
     streamed = Base.IdSet{Any}()
+    settling = false
     try
         for handler in handlers
-            kept = Event[]
-            kept_ids = Int[]
+            filtered = Tuple{EventRow, Event}[]
             for (row, ev) in group
                 # Filter errors (e.g. a :prompt filter that cannot reach the model)
                 # propagate: the group rides the retry ladder rather than the event
                 # being silently dropped or spuriously delivered.
                 if passes_filter(assistant, handler, ev, row.extra)
-                    push!(kept, ev)
-                    push!(kept_ids, row.id)
+                    push!(filtered, (row, ev))
                 end
             end
+            selected = _select_relevant_events!(assistant, handler, filtered, abort)
+            kept = Event[ev for (_, ev) in selected]
+            kept_ids = Int[row.id for (row, _) in selected]
             if isempty(kept)
                 @debug "Claw: filter matched no events" handler_id = handler.id event_name = name group_size = length(group)
                 continue
@@ -852,17 +923,20 @@ function _process_claimed_group!(assistant::AgentAssistant, group::Vector{Tuple{
             ev_input isa ChannelEvent && push!(streamed, get_channel(ev_input))
             @info "Claw: handler completed" handler_id = handler.id event_name = name duration_s = round(time() - started_at; digits = 4)
         end
-        _finish_event!(assistant, ids, "done")
+        settling = true
+        _finish_event!(assistant, rows, "done")
         foreach(id -> _forget_live_event!(assistant, id), ids)
-        _release_group_channels!(group, streamed)
     catch e
+        # A rejected outcome write is a storage failure, not a failed handler.
+        # Leave the whole claim running for recovery and propagate the failure.
+        settling && rethrow()
         # One failure fails the whole group: every row returns to the retry ladder
         # together (same at-least-once semantics as a multi-handler single event),
         # with a single dead-letter notice so a dead group does not spam its
         # channel N times.
         _handle_event_failure!(assistant, rows, group[1][2], handlers, e)
-        _release_group_channels!(group, streamed)
     finally
+        _release_group_channels!(group, streamed)
         lock(assistant._inflight_lock) do
             for (row, _) in group
                 Base.delete!(assistant._inflight, row.id)
@@ -939,11 +1013,17 @@ is crash recovery, stuck-worker recovery and retry refire in one rule.
 """
 function _scan_due_events!(assistant::AgentAssistant)
     now = time()
+    # The owner is still alive and owns these invocations. Stealing their lease
+    # could execute an unsafe legacy tool twice; expiry is not proof of death.
+    active=lock(()->Set(keys(assistant._inflight)),assistant._inflight_lock)
     try
-        execute_write(assistant._writer, """
-            UPDATE claw_events SET status='pending', lease_expires_at=NULL
-            WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
-        """, (now,))
+        execute_write(assistant._writer) do db
+            for row in _fetch_all(db,"SELECT id,claim_token,claim_revision FROM claw_events WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?",(now,))
+                row.id in active && continue
+                _exec!(db,"UPDATE claw_events SET status='pending',lease_expires_at=NULL,claim_token=NULL,claim_revision=claim_revision+1 WHERE id=? AND status='running' AND claim_revision=?",
+                    (row.id,row.claim_revision))
+            end
+        end
     catch e
         @error "Claw: lease reclaim failed" exception = (e, catch_backtrace())
         return 0
@@ -990,10 +1070,15 @@ attempts (of any kind, not only crashes) is dead-lettered instead, so an event
 that kills the process cannot crash-loop it. No dead-letter notice is sent for
 it: channels are not available this early in `init!`.
 """
-function _reclaim_crashed_events!(assistant::AgentAssistant)
+function _reclaim_crashed_events!(assistant::AgentAssistant;durable_upgrade::Bool=false)
     now = time()
     max_attempts = assistant.pipeline.unknown_max_attempts
     execute_write(assistant._writer) do db
+        if durable_upgrade
+            _exec!(db,"""UPDATE claw_events SET status='dead',lease_expires_at=NULL,claim_token=NULL,claim_revision=claim_revision+1,
+                last_error='legacy_interrupted: prior legacy evaluation has no effect receipts; explicit new input requires effect review'
+                WHERE status='running' AND durable=0 AND NOT EXISTS(SELECT 1 FROM claw_frozen_members m WHERE m.event_id=claw_events.id)""")
+        end
         _exec!(db, """
             UPDATE claw_events
             SET status = 'dead', lease_expires_at = NULL,
@@ -1002,7 +1087,7 @@ function _reclaim_crashed_events!(assistant::AgentAssistant)
             WHERE status = 'running' AND attempts >= ?
         """, (max_attempts, max_attempts))
         _exec!(db, """
-            UPDATE claw_events SET status = 'pending', lease_expires_at = NULL, next_attempt_at = ?
+            UPDATE claw_events SET status = 'pending', lease_expires_at = NULL, next_attempt_at = ?,claim_token=NULL,claim_revision=claim_revision+1
             WHERE status = 'running'
         """, (now,))
         return nothing
@@ -1058,6 +1143,7 @@ end
 # ─── Event loop ───
 
 function start_event_loop!(assistant::AgentAssistant; level::Union{Nothing, LogLevel} = assistant.log_level)
+    assistant._harness[]===nothing && _guard_legacy_runtime!(assistant)
     assistant._state[] = :running
     intake = errormonitor(@async begin
         Agentif.with_log_level(level) do
@@ -1332,15 +1418,11 @@ end
 # ─── Graceful shutdown (§1.5) ───
 
 function _return_claims!(assistant::AgentAssistant)
-    try
-        execute_write(assistant._writer, """
+    execute_write(assistant._writer, """
             UPDATE claw_events
-            SET status='pending', attempts = MAX(attempts - 1, 0), lease_expires_at = NULL, next_attempt_at = ?
-            WHERE status='running'
-        """, (time(),))
-    catch e
-        @error "Claw: failed to return unfinished claims to pending" exception = (e, catch_backtrace())
-    end
+            SET status='pending', attempts = MAX(attempts - 1, 0), lease_expires_at = NULL, next_attempt_at = ?,claim_token=NULL,claim_revision=claim_revision+1
+            WHERE status='running' AND owner_epoch=?
+    """, (time(),assistant._owner_epoch[]))
     return nothing
 end
 
@@ -1426,6 +1508,18 @@ function shutdown!(assistant::AgentAssistant; timeout_s::Real = assistant.pipeli
     )
     timedwait(() -> all(istaskdone, all_tasks), 5.0; pollint = 0.05)
 
+    h = assistant._harness[]
+    if h !== nothing
+        result = close_harness!(h;grace_s=max(0.0,deadline-time()))
+        if result.status === :draining
+            assistant._state[] = :draining
+            return result
+        end
+    end
+    if !idle() || (@atomic assistant._legacy_tools_running.n) > 0
+        assistant._state[] = :draining
+        return (;status=:draining,reason=:noncooperative_invocation)
+    end
     _release_live_event_channels!(assistant)
     _return_claims!(assistant)
 
