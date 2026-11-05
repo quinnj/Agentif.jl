@@ -1265,14 +1265,22 @@ function _merge_search_results(primary::Vector, secondary::Vector; limit::Int)
 end
 
 function _agent_data_visibility_tags(channel_id, channel_flags)
-    tags = String[]
-    if channel_id === nothing || channel_flags === nothing || (channel_flags & 0x01) == 0
-        push!(tags, "agent_data:public")
-    end
-    if channel_id !== nothing
-        push!(tags, "agent_data:ch:$channel_id")
-    end
+    channel_id === nothing && return String[]
+    tags = ["agent_data:ch:$channel_id"]
+    channel_flags !== nothing && (channel_flags & 0x01) == 0 && push!(tags, "agent_data:public")
     return tags
+end
+const AGENT_DATA_VISIBLE_SQL = "(channel_id = ? OR (channel_id IS NOT NULL AND (channel_flags & 1) = 0))"
+
+function _visible_agent_data(db, key, ch_id)
+    ch_id === nothing && return _fetch_one(db, "SELECT created_at FROM claw_agent_data WHERE key = ?", (key,))
+    return _fetch_one(db, "SELECT created_at FROM claw_agent_data WHERE key = ? AND $AGENT_DATA_VISIBLE_SQL", (key, ch_id))
+end
+
+function _index_agent_data!(search_store, key, value, tags, channel_id, channel_flags)
+    LocalSearch.load!(search_store, value; id = "agent_data:$key", title = key,
+        tags = vcat(tags, ["claw_agent_data"], _agent_data_visibility_tags(channel_id, channel_flags)))
+    return nothing
 end
 
 const DB_STORE_TOOL = @tool """Store a key-value entry in your persistent scratch space (survives restarts).
@@ -1316,8 +1324,7 @@ Gotchas:
                 _exec!(db,
                     "INSERT INTO claw_agent_data_tags (key, tag) VALUES (?, ?)", (key, tag))
             end
-            vis_tags = _agent_data_visibility_tags(ch_id, ch_flags)
-            LocalSearch.load!(search_store, value; id="agent_data:$key", title=key, tags=vcat(parsed_tags, ["claw_agent_data"], vis_tags))
+            _index_agent_data!(search_store, key, value, parsed_tags, ch_id, ch_flags)
             return nothing
         end
     end
@@ -1351,8 +1358,8 @@ Gotchas:
     max_fetch = n * 3
     # Channel visibility: include current-channel (private/public) plus public entries.
     ch = Agentif.CURRENT_CHANNEL[]
-    results = if ch !== nothing
-        ch_id = Agentif.channel_id(ch)
+    ch_id = ch === nothing ? nothing : Agentif.channel_id(ch)
+    results = if ch_id !== nothing
         channel_results = LocalSearch.search(search_store, query; tags=["agent_data:ch:$ch_id"], limit=max_fetch)
         public_results = LocalSearch.search(search_store, query; tags=["agent_data:public"], limit=max_fetch)
         _merge_search_results(channel_results, public_results; limit=max_fetch)
@@ -1378,13 +1385,10 @@ Gotchas:
             end
             all(t -> t in row_tags, filter_tags) || continue
         end
-        # Time filter
-        meta = _fetch_one(a.db, "SELECT created_at, updated_at FROM claw_agent_data WHERE key = ?", (k,))
-        if meta !== nothing
-            row = meta
-            after_ts !== nothing && row.created_at < after_ts && continue
-            before_ts !== nothing && row.created_at > before_ts && continue
-        end
+        row = _visible_agent_data(a.db, k, ch_id)
+        row === nothing && continue
+        after_ts !== nothing && row.created_at < after_ts && continue
+        before_ts !== nothing && row.created_at > before_ts && continue
         score_str = round(r.score; digits=2)
         push!(lines, "--- [$k] (score: $score_str) ---")
         push!(lines, r.text)
@@ -1425,7 +1429,7 @@ Gotchas:
         conditions = String[]
         params = Any[]
         if current_ch_id !== nothing
-            push!(conditions, "(channel_flags IS NULL OR channel_id = ? OR (channel_flags & 1) = 0)")
+            push!(conditions, AGENT_DATA_VISIBLE_SQL)
             push!(params, current_ch_id)
         end
         after_ts !== nothing && (push!(conditions, "created_at >= ?"); push!(params, after_ts))
@@ -1438,7 +1442,7 @@ Gotchas:
         conditions = ["t.tag IN ($(join(fill("?", length(filter_tags)), ",")))"]
         params = Any[filter_tags...]
         if current_ch_id !== nothing
-            push!(conditions, "(d.channel_flags IS NULL OR d.channel_id = ? OR (d.channel_flags & 1) = 0)")
+            push!(conditions, AGENT_DATA_VISIBLE_SQL)
             push!(params, current_ch_id)
         end
         after_ts !== nothing && (push!(conditions, "d.created_at >= ?"); push!(params, after_ts))
@@ -1603,6 +1607,88 @@ function scrub_post!(assistant::AgentAssistant, post_id::String)
     h = assistant._harness[]
     h === nothing || scrub_durable_post!(h, post_id)
     return nothing
+end
+
+"""
+    rescope_agent_data!(assistant) -> (; rescoped, unresolved)
+    rescope_agent_data!(assistant, key; channel_id, private = true)
+
+Give `claw_agent_data` rows stored with no channel scope (NULL `channel_id`)
+the scope of the channel that stored them. Such rows are visible only to
+evaluations with no channel bound, never from a channel.
+
+The first form recovers each row's scope from session history: the newest
+entry still stored with a channel whose assistant message called `db_store`
+with the row's key and value stamps the row with that entry's channel, privacy,
+user and post. Rows with no such entry stay unscoped and are returned as
+`unresolved` for review; remove one with `db_remove`, or assign a scope with
+the second form, which sets `channel_id` and privacy on any stored row, clears
+its user and post (so `scrub_post!` no longer reaches it by post), and throws
+`ArgumentError` for an unknown key. Both forms re-index the row's search
+document. Nothing is deleted.
+"""
+function rescope_agent_data!(a::AgentAssistant)
+    rescoped = String[]
+    unresolved = String[]
+    lock(AGENT_DATA_WRITE_LOCK) do
+        Agentif.with_session_write(a.session_store) do db, search_store
+            rows = _fetch_all(db, "SELECT key, value FROM claw_agent_data WHERE channel_id IS NULL ORDER BY key")
+            origins = isempty(rows) ? Dict{Tuple{String, String}, NamedTuple}() : _agent_data_origins(db)
+            unscoped = (; channel_id = nothing, channel_flags = nothing, user_id = nothing, post_id = nothing)
+            for row in rows
+                key, value = String(row.key), String(row.value)
+                origin = get(origins, (key, value), nothing)
+                push!(origin === nothing ? unresolved : rescoped, key)
+                _rescope_agent_data!(db, search_store, key, value, something(origin, unscoped))
+            end
+        end
+    end
+    return (; rescoped, unresolved)
+end
+
+function rescope_agent_data!(a::AgentAssistant, key::String; channel_id::String, private::Bool = true)
+    scope = (; channel_id, channel_flags = private ? 1 : 0, user_id = nothing, post_id = nothing)
+    lock(AGENT_DATA_WRITE_LOCK) do
+        Agentif.with_session_write(a.session_store) do db, search_store
+            row = _fetch_one(db, "SELECT value FROM claw_agent_data WHERE key = ?", (key,))
+            row === nothing && throw(ArgumentError("no stored entry '$key'"))
+            _rescope_agent_data!(db, search_store, key, String(row.value), scope)
+        end
+    end
+    return nothing
+end
+
+function _rescope_agent_data!(db, search_store, key, value, scope)
+    _exec!(db,
+        "UPDATE claw_agent_data SET channel_id = ?, channel_flags = ?, user_id = ?, post_id = ? WHERE key = ?",
+        (scope.channel_id, scope.channel_flags, scope.user_id, scope.post_id, key))
+    tags = String[String(r.tag) for r in _fetch_all(db, "SELECT tag FROM claw_agent_data_tags WHERE key = ? ORDER BY tag", (key,))]
+    _index_agent_data!(search_store, key, value, tags, scope.channel_id, scope.channel_flags)
+    return nothing
+end
+
+# The scope of the newest session entry whose assistant message stored each
+# (key, value), from the entries still stored with a channel.
+function _agent_data_origins(db)
+    origins = Dict{Tuple{String, String}, NamedTuple}()
+    for row in SQLite.DBInterface.execute(db, "SELECT entry FROM session_entries WHERE is_deleted = 0 AND channel_id IS NOT NULL AND entry LIKE '%db_store%' ORDER BY created_at DESC")
+        entry = JSON.parse(String(row.entry), Agentif.SessionEntry)
+        for message in entry.messages
+            message isa Agentif.AssistantMessage || continue
+            for call in message.tool_calls
+                call.name == "db_store" || continue
+                args = try
+                    Agentif.parse_tool_arguments(call.arguments, Agentif.parameters(DB_STORE_TOOL))
+                catch
+                    continue
+                end
+                get!(origins, (_repair_db_arg(args.key), _repair_db_arg(args.value))) do
+                    (; channel_id = entry.channel_id, channel_flags = entry.channel_flags, user_id = entry.user_id, post_id = entry.post_id)
+                end
+            end
+        end
+    end
+    return origins
 end
 
 # ─── Event loop ───

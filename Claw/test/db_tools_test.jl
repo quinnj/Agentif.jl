@@ -3,6 +3,7 @@ module DBToolsTests
 using Test
 using Agentif
 using Dates
+using LocalSearch
 using SQLite
 using Claw
 
@@ -254,6 +255,72 @@ end
     @test !isready(errors)
     latest = Claw.db_search("value-", "race")
     @test occursin("[race-key]", latest)
+
+    Claw.shutdown!(assistant; timeout_s=5)
+end
+
+function test_model()
+    return Agentif.Model(; id = "db-test", name = "db-test", api = "openai-completions", provider = "test", baseUrl = "http://localhost",
+        reasoning = false, input = ["text"], cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+        contextWindow = 100000, maxTokens = 1000, headers = nothing, compat = nothing, kw = (;))
+end
+
+# Strip the rows' scope and tag their search documents public, the state of
+# rows written while `db_store` ran with no channel bound.
+function unscope_as_public!(assistant, entries)
+    Agentif.with_session_write(assistant.session_store) do db, search_store
+        for (key, value) in entries
+            SQLite.execute(db, "UPDATE claw_agent_data SET channel_id = NULL, channel_flags = NULL, user_id = NULL, post_id = NULL WHERE key = ?", (key,))
+            LocalSearch.load!(search_store, value; id = "agent_data:$key", title = key, tags = ["claw_agent_data", "agent_data:public"])
+        end
+    end
+    return nothing
+end
+
+@testset "DB tools hide unscoped rows from channels and rescope them from session history" begin
+    assistant = make_assistant()
+    Claw.CURRENT_ASSISTANT[] = assistant
+    dm_a = DBMockChannel("dm:a"; user = Agentif.ChannelUser("U1", "Alice"), post_id = "post-a")
+    dm_b = DBMockChannel("dm:b"; user = Agentif.ChannelUser("U2", "Bob"), post_id = "post-b")
+
+    store_stream = (f, agent, s, input, abort; kw...) -> begin
+        calls = any(m -> m isa Agentif.ToolResultMessage, s.messages) ? Agentif.AgentToolCall[] :
+            [Agentif.AgentToolCall(; call_id = "c1", name = "db_store", arguments = """{"key":"dm-a-note","value":"alice secret note","tags":"alice"}""")]
+        message = Agentif.AssistantMessage(; provider = "test", api = "openai-completions", model = "db-test",
+            content = Agentif.AssistantContentBlock[Agentif.TextContent(isempty(calls) ? "stored" : "")], tool_calls = calls)
+        Agentif.append_state!(s, input, message, Agentif.Usage(; total = 1))
+        s.pending_tool_calls = Agentif.pending_tool_calls_from_message(message)
+        s.most_recent_stop_reason = isempty(calls) ? :stop : :tool_calls
+        s
+    end
+    agent = Agentif.Agent(; model = test_model(), prompt = "p", apikey = "k", tools = Agentif.AgentTool[Claw.DB_STORE_TOOL])
+    Agentif.evaluate(agent, "remember this"; channel = dm_a, session_store = assistant.session_store, base_handler = store_stream, compaction_config = nothing)
+    Claw.db_store("orphan-note", "orphan secret note")
+    unscope_as_public!(assistant, ("dm-a-note" => "alice secret note", "orphan-note" => "orphan secret note"))
+
+    from_b = Agentif.with_channel(() -> Claw.db_search("secret note"), dm_b)
+    @test !occursin("[dm-a-note]", from_b)
+    @test !occursin("[orphan-note]", from_b)
+    keys_b = Agentif.with_channel(() -> Claw.db_list_keys(), dm_b)
+    @test !occursin("dm-a-note", keys_b)
+    @test !occursin("orphan-note", keys_b)
+    @test occursin("[dm-a-note]", Claw.db_search("secret note"))
+    @test occursin("orphan-note", Claw.db_list_keys())
+
+    @test Claw.rescope_agent_data!(assistant) == (; rescoped = ["dm-a-note"], unresolved = ["orphan-note"])
+    row = Claw._fetch_one(assistant.db, "SELECT channel_id, channel_flags, user_id, post_id FROM claw_agent_data WHERE key = ?", ("dm-a-note",))
+    @test row == (channel_id = "dm:a", channel_flags = 1, user_id = "U1", post_id = "post-a")
+    @test occursin("[dm-a-note]", Agentif.with_channel(() -> Claw.db_search("secret note"), dm_a))
+    @test !occursin("[dm-a-note]", Agentif.with_channel(() -> Claw.db_search("secret note"), dm_b))
+    @test occursin("dm-a-note", Agentif.with_channel(() -> Claw.db_list_keys(), dm_a))
+    @test !occursin("orphan-note", Agentif.with_channel(() -> Claw.db_list_keys(), dm_a))
+    Claw.scrub_post!(assistant, "post-a")
+    @test !has_row(assistant.db, "SELECT 1 FROM claw_agent_data WHERE key = ?", ("dm-a-note",))
+
+    Claw.rescope_agent_data!(assistant, "orphan-note"; channel_id = "dm:b")
+    @test occursin("[orphan-note]", Agentif.with_channel(() -> Claw.db_search("secret note"), dm_b))
+    @test !occursin("[orphan-note]", Agentif.with_channel(() -> Claw.db_search("secret note"), dm_a))
+    @test Claw.rescope_agent_data!(assistant) == (; rescoped = String[], unresolved = String[])
 
     Claw.shutdown!(assistant; timeout_s=5)
 end

@@ -266,6 +266,25 @@ inside the payload are defanged. Chat messages on connected channels are the
 operator's interface and pass through unfenced — tool restriction for
 third-party-fed handlers is the trust tier's job (see `EventHandler`'s `trust`).
 
+## Scratch space scope
+
+`db_store` records the channel it runs in. An entry is visible to that channel,
+to every channel when it was stored from a public channel, and only to
+evaluations with no channel bound when it was stored with no channel. The
+durable runtime rebuilds a run's channel from its saved route before each tool
+call, so tools keep their scope after a restart, when the live channel object is
+gone; a durable conversation with no channel runs as the private channel
+`internal`.
+
+An entry stored with no channel bound carries no scope and is hidden from every
+channel. `Claw.rescope_agent_data!(assistant)` gives such entries the scope of
+the channel that stored them, recovered from session history, and returns the
+keys it rescoped and the keys it could not resolve. Review the unresolved keys
+with `db_list_keys` outside any channel, then remove one with `db_remove` or
+assign it a channel with
+`Claw.rescope_agent_data!(assistant, key; channel_id, private = true)`.
+Nothing is deleted automatically.
+
 ## Watcher (dual-model supervision)
 
 An assistant can be configured with a second, cheaper "watcher" model that supervises

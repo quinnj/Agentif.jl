@@ -100,13 +100,17 @@ function _tool_phase!(ctx, t, resolved)
         result === :retry || error("invalid effect reconciliation result")
     end
     args = Agentif.parse_tool_arguments(e.args, Agentif.parameters(spec.tool))
+    scope = _on_writer(h) do db
+        c = _fetch_one(db, "SELECT routing FROM claw_conversations WHERE id=?", (t.conversation_id,))
+        _route_channel(_run_route(db, c, _or_nothing(t.run_id)))
+    end
     _transition!(h; context = ctx, point = :tool_intent) do db, seq
         _exec!(db, "UPDATE claw_tool_executions SET effect_state='executing' WHERE task_id=?", (t.id,))
     end
     h.fault(:before_effect_body, h)
     _verify_invocation!(ctx)
     outcome = try
-        result = spec.invoke(spec.tool, args, ctx)
+        result = @with Agentif.CURRENT_CHANNEL => scope spec.invoke(spec.tool, args, ctx)
         if result isa OwnedToolWait
             return _transition!(h; context = ctx, point = :tool_child_wait) do db, seq
                 _exec!(db, "UPDATE claw_tool_executions SET effect_state='owned_child' WHERE task_id=?", (t.id,))

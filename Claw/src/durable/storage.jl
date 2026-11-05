@@ -217,19 +217,23 @@ function _task_create!(
     return id
 end
 
+function _run_route(db, c, run)
+    issued = run === nothing ? nothing : _fetch_one(db, "SELECT routing FROM claw_runs WHERE id=?", (run,))
+    return JSON.parse(issued === nothing ? c.routing : issued.routing)
+end
+
 function _entry!(
         db, h, seq, c, messages; run = nothing, task = nothing, audit = nothing, stop = nothing,
         compaction = false, first_kept = nothing, post_id = nothing
     )
     leaf = _fetch_one(db, "SELECT leaf_entry_id FROM session_branches WHERE branch_id=?", (c.branch_id,))
-    issued = run === nothing ? nothing : _fetch_one(db, "SELECT routing FROM claw_runs WHERE id=?", (run,))
-    route = JSON.parse(issued === nothing ? c.routing : issued.routing)
+    scope = _route_channel(_run_route(db, c, run))
+    user_id, channel_id, search_channel_id, channel_flags = Agentif._entry_metadata(scope)
     entry = Agentif.SessionEntry(;
         id = _new_id(), parent_id = leaf === nothing ? nothing : _or_nothing(leaf.leaf_entry_id),
         messages = Agentif.StoredAgentMessage[messages...], run_id = run, is_compaction = compaction,
-        first_kept_entry_id = first_kept, channel_id = get(route, "channel_id", nothing), user_id = get(route, "user_id", nothing),
-        search_channel_id = get(route, "search_channel_id", nothing), channel_flags = get(route, "channel_flags", nothing),
-        post_id = something(post_id, get(route, "post_id", nothing), "")
+        first_kept_entry_id = first_kept, channel_id, user_id, search_channel_id, channel_flags,
+        post_id = something(post_id, Agentif.entry_id(scope), "")
     )
     Agentif.append_session_batch!(db, c.branch_id, [entry])
     # Audit-only entries (no messages) leave the model context unchanged.
