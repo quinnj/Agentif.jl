@@ -548,6 +548,59 @@ end
     end
 end
 
+@testset "regression: durable tools run with the run's channel scope, live and after a restart" begin
+    mktempdir() do dir
+        path = joinpath(dir, "scope.sqlite")
+        hold = Threads.Atomic{Bool}(false);entered = Threads.Atomic{Bool}(false)
+        # The model stores the last word of its input, then answers; while `hold`
+        # is set, the request for "k2" waits to be interrupted instead.
+        stream = (f, a, s, input, abort; kw...) -> begin
+            m = last(s.messages)
+            m isa Agentif.ToolResultMessage && return regr_turn!(a, s, input, "stored")
+            key = String(last(split(Agentif.message_text(m))))
+            if key == "k2" && hold[]
+                entered[] = true
+                regr_wait(() -> Agentif.isaborted(abort))
+                throw(Agentif.AbortEvaluation())
+            end
+            calls = [regr_call("db_store"; args = JSON.json(Dict("key" => key, "value" => "note $key")))]
+            regr_turn!(a, s, input, ""; calls, stop = :tool_calls)
+        end
+        row(a, key) = Claw._fetch_one(a.db, "SELECT channel_id, channel_flags, user_id, post_id FROM claw_agent_data WHERE key=?", (key,))
+        scoped = (channel_id = "chan:B", channel_flags = 1, user_id = "u", post_id = "chan:B")
+        conversation(h) = Claw.ConversationRef(String(Claw._on_writer(db -> Claw._fetch_one(db, "SELECT id FROM claw_conversations WHERE branch_id=?", ("chan:B",)).id, h)))
+        old = Claw.CURRENT_ASSISTANT[]
+        a, h = attached_fixture(path; stream)
+        try
+            Claw.CURRENT_ASSISTANT[] = a
+            push!(a.tools, Claw.DB_STORE_TOOL)
+            st = Claw.evaluate(a, "store k1"; channel = DurableChannel("chan:B"), input_key = "k1")
+            @test st.most_recent_stop_reason == :stop
+            @test row(a, "k1") == scoped
+            @test occursin("[k1]", Agentif.with_channel(() -> Claw.db_search("note"), DurableChannel("chan:B")))
+            @test !occursin("[k1]", Agentif.with_channel(() -> Claw.db_search("note"), DurableChannel("chan:C")))
+            hold[] = true
+            Claw.submit!(h, conversation(h), "store k2"; request_id = "k2")
+            @test regr_wait(() -> entered[])
+            @test Claw.close_harness!(h; grace_s = 10).status == :closed
+        finally
+            Claw.shutdown!(a; timeout_s = 10);Claw.CURRENT_ASSISTANT[] = old
+        end
+        # The interrupted run resumes after the restart with no live channel
+        # object anywhere; the saved route alone scopes its tool.
+        hold[] = false
+        a, h = attached_fixture(path; stream)
+        try
+            Claw.CURRENT_ASSISTANT[] = a
+            Claw.register_profile!(h, Agentif.Agent(; model = durable_model(), apikey = "secret-test-key", prompt = "test", tools = Agentif.AgentTool[Claw.DB_STORE_TOOL]))
+            @test regr_outcome(Claw.lookup_submission(h, conversation(h).id, "k2")) == "answered"
+            @test row(a, "k2") == scoped
+        finally
+            Claw.shutdown!(a; timeout_s = 10);Claw.CURRENT_ASSISTANT[] = old
+        end
+    end
+end
+
 @testset "regression: snapshots and watches hide progress and resource details" begin
     mktempdir() do dir
         progress_secret = "partial-output-secret-5521";resource_secret = "resource-detail-secret-7730"
