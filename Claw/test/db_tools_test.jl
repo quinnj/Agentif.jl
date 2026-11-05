@@ -265,13 +265,24 @@ function test_model()
         contextWindow = 100000, maxTokens = 1000, headers = nothing, compat = nothing, kw = (;))
 end
 
+# Strip the rows' scope and tag their search documents public, the state of
+# rows written while `db_store` ran with no channel bound.
+function unscope_as_public!(assistant, entries)
+    Agentif.with_session_write(assistant.session_store) do db, search_store
+        for (key, value) in entries
+            SQLite.execute(db, "UPDATE claw_agent_data SET channel_id = NULL, channel_flags = NULL, user_id = NULL, post_id = NULL WHERE key = ?", (key,))
+            LocalSearch.load!(search_store, value; id = "agent_data:$key", title = key, tags = ["claw_agent_data", "agent_data:public"])
+        end
+    end
+    return nothing
+end
+
 @testset "DB tools hide unscoped rows from channels and rescope them from session history" begin
     assistant = make_assistant()
     Claw.CURRENT_ASSISTANT[] = assistant
     dm_a = DBMockChannel("dm:a"; user = Agentif.ChannelUser("U1", "Alice"), post_id = "post-a")
     dm_b = DBMockChannel("dm:b"; user = Agentif.ChannelUser("U2", "Bob"), post_id = "post-b")
 
-    # The model stores a note from dm:a, so the session records the call under that channel.
     store_stream = (f, agent, s, input, abort; kw...) -> begin
         calls = any(m -> m isa Agentif.ToolResultMessage, s.messages) ? Agentif.AgentToolCall[] :
             [Agentif.AgentToolCall(; call_id = "c1", name = "db_store", arguments = """{"key":"dm-a-note","value":"alice secret note","tags":"alice"}""")]
@@ -285,13 +296,7 @@ end
     agent = Agentif.Agent(; model = test_model(), prompt = "p", apikey = "k", tools = Agentif.AgentTool[Claw.DB_STORE_TOOL])
     Agentif.evaluate(agent, "remember this"; channel = dm_a, session_store = assistant.session_store, base_handler = store_stream, compaction_config = nothing)
     Claw.db_store("orphan-note", "orphan secret note")
-    # Rows stored before the fix carry no scope and were indexed as public.
-    Agentif.with_session_write(assistant.session_store) do db, search_store
-        SQLite.execute(db, "UPDATE claw_agent_data SET channel_id = NULL, channel_flags = NULL, user_id = NULL, post_id = NULL")
-        for (key, value) in (("dm-a-note", "alice secret note"), ("orphan-note", "orphan secret note"))
-            LocalSearch.load!(search_store, value; id = "agent_data:$key", title = key, tags = ["claw_agent_data", "agent_data:public"])
-        end
-    end
+    unscope_as_public!(assistant, ("dm-a-note" => "alice secret note", "orphan-note" => "orphan secret note"))
 
     from_b = Agentif.with_channel(() -> Claw.db_search("secret note"), dm_b)
     @test !occursin("[dm-a-note]", from_b)

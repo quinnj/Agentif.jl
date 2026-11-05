@@ -36,13 +36,37 @@ function _bridge_profile(h, handler, ch)
     return register_profile!(h, agent; trust = _handler_trust(handler))
 end
 
-function _route(ch, row)
+function _route(ch)
     flags = (Agentif.is_private(ch) ? 1 : 0) | (Agentif.is_group(ch) ? 2 : 0)
     user = Agentif.get_current_user(ch)
     return Dict{String, Any}(
         "channel_id" => Agentif.channel_id(ch), "channel_flags" => flags,
         "search_channel_id" => Agentif.search_channel_id(ch), "user_id" => user === nothing ? nothing : user.id,
-        "post_id" => Agentif.entry_id(ch), "source" => row.source, "event_id" => row.id
+        "post_id" => Agentif.entry_id(ch),
+    )
+end
+
+struct RouteChannel <: Agentif.AbstractChannel
+    channel_id::String
+    search_channel_id::String
+    channel_flags::Int
+    user_id::Union{Nothing, String}
+    post_id::Union{Nothing, String}
+end
+Agentif.channel_id(ch::RouteChannel) = ch.channel_id
+Agentif.search_channel_id(ch::RouteChannel) = ch.search_channel_id
+Agentif.is_private(ch::RouteChannel) = ch.channel_flags & 1 == 1
+Agentif.is_group(ch::RouteChannel) = ch.channel_flags & 2 == 2
+Agentif.get_current_user(ch::RouteChannel) = ch.user_id === nothing ? nothing : Agentif.ChannelUser(ch.user_id, ch.user_id)
+Agentif.entry_id(ch::RouteChannel) = ch.post_id
+
+const INTERNAL_CHANNEL = "internal"
+
+function _route_channel(route)
+    id = something(get(route, "channel_id", nothing), INTERNAL_CHANNEL)
+    return RouteChannel(
+        id, something(get(route, "search_channel_id", nothing), id), something(get(route, "channel_flags", nothing), 1),
+        get(route, "user_id", nothing), get(route, "post_id", nothing)
     )
 end
 
@@ -152,7 +176,9 @@ function _durable_dispatch_group!(a, group, handlers; abort = Agentif.Abort())
             ch === nothing && handler.channel_id !== nothing && throw(DurableBlocked("recorded handler delivery channel unavailable"))
             ch === nothing && (ch = SinkChannel("handler:$(handler.id)"))
             profile = _bridge_profile(h, handler, ch)
-            route = _route(ch, kept[1][1])
+            route = _route(ch)
+            route["source"] = kept[1][1].source
+            route["event_id"] = kept[1][1].id
             supervision = _supervision_spec(h, handler, ev)
             supervision === nothing || (route["supervision"] = supervision)
             # A channel that cannot deliver (e.g. a GitHub event with no comment
@@ -313,13 +339,10 @@ function _register_default_profile!(h, a)
 end
 function _durable_evaluate(a, input; channel = nothing, tools = nothing, input_key = nothing, kwargs...)
     h = a._harness[]
-    ch = channel === nothing ? SinkChannel("internal") : channel
+    ch = channel === nothing ? SinkChannel(INTERNAL_CHANNEL) : channel
     handler = (; id = "direct", prompt = "", channel_id = Agentif.channel_id(ch), trust = :owner, tools = tools === nothing ? nothing : [t.name for t in tools], filter = nothing)
     profile = _bridge_profile(h, handler, ch)
-    route = Dict(
-        "channel_id" => Agentif.channel_id(ch), "search_channel_id" => Agentif.search_channel_id(ch),
-        "channel_flags" => (Agentif.is_private(ch) ? 1 : 0), "post_id" => Agentif.entry_id(ch)
-    )
+    route = _route(ch)
     _channel_set!(a, Agentif.channel_id(ch), ch)
     delivery = ch isa SinkChannel ? nothing : DeliveryAddress("claw-direct-channel", 1, Dict("channel_id" => Agentif.channel_id(ch)))
     c = _channel_conversation!(h, ch, profile, route, delivery)

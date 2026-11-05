@@ -552,8 +552,6 @@ end
     mktempdir() do dir
         path = joinpath(dir, "scope.sqlite")
         hold = Threads.Atomic{Bool}(false);entered = Threads.Atomic{Bool}(false)
-        # The model stores the last word of its input, then answers; while `hold`
-        # is set, the request for "k2" waits to be interrupted instead.
         stream = (f, a, s, input, abort; kw...) -> begin
             m = last(s.messages)
             m isa Agentif.ToolResultMessage && return regr_turn!(a, s, input, "stored")
@@ -586,8 +584,6 @@ end
         finally
             Claw.shutdown!(a; timeout_s = 10);Claw.CURRENT_ASSISTANT[] = old
         end
-        # The interrupted run resumes after the restart with no live channel
-        # object anywhere; the saved route alone scopes its tool.
         hold[] = false
         a, h = attached_fixture(path; stream)
         try
