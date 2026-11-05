@@ -22,7 +22,7 @@ function steer_middleware(agent_handler::AgentHandler, steer_queue::Union{Nothin
     end
 end
 
-function tool_call_middleware(agent_handler::AgentHandler)
+function tool_call_middleware(agent_handler::AgentHandler, channel::Union{Nothing, AbstractChannel} = nothing)
     return function (f::F, agent::Agent, state::AgentState, current_input::AgentTurnInput, abort::Abort; kw...) where {F <: Function}
         next_input = current_input
         current_state = state
@@ -56,7 +56,12 @@ function tool_call_middleware(agent_handler::AgentHandler)
                 checkpoint_session!(current_state)
                 for tc in current_state.pending_tool_calls
                     check_abort(abort)
-                    push!(futures, start_tool_call!(f, agent.tools, tc, stop_reason))
+                    # tasks started inside this scope inherit CURRENT_CHANNEL
+                    push!(futures, channel === nothing ?
+                        start_tool_call!(f, agent.tools, tc, stop_reason) :
+                        with_channel(channel) do
+                            start_tool_call!(f, agent.tools, tc, stop_reason)
+                        end)
                 end
                 empty!(current_state.pending_tool_calls) # pending have been moved to futures, empty
                 empty!(tool_results) # empty tool_results before we wait on futures
@@ -558,7 +563,7 @@ function build_default_handler(
         base_handler : compaction_middleware(base_handler, compaction_config)
     steer_handler = steer_middleware(compaction_handler, steer_queue)
     channel_handler = channel_middleware(steer_handler, channel)
-    tool_handler = tool_call_middleware(channel_handler)
+    tool_handler = tool_call_middleware(channel_handler, channel)
     # Inject channel-specific tools (e.g. emoji reactions) outside the tool_call
     # loop so that findtool can resolve them when the model calls them.
     channel_tools_handler = if channel === nothing
