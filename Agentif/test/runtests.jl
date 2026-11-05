@@ -410,6 +410,20 @@ end
 
 tool_results(state) = [m for m in state.messages if m isa ToolResultMessage]
 
+@testset "tools run with the evaluation's channel bound" begin
+    seen = String[]
+    probe = @tool "Record the bound channel." probe() = begin
+        ch = Agentif.CURRENT_CHANNEL[]
+        push!(seen, ch === nothing ? "none" : Agentif.channel_id(ch))
+        return "ok"
+    end
+    calls = [AgentToolCall(; call_id = "c1", name = "probe", arguments = "{}")]
+    ch = SessionTestChannel("chan:tool", nothing, "post-1")
+    evaluate(make_agent(; tools = AgentTool[probe]), "go"; channel = ch,
+        base_handler = scripted_turn_handler(calls, :tool_calls), compaction_config = nothing)
+    @test seen == ["chan:tool"]
+end
+
 @testset "truncation and failure outrank tool calls in stop reasons" begin
     calls = [AgentToolCall(; call_id = "c1", name = "echo", arguments = "{}")]
     none = AgentToolCall[]
