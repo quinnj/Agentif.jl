@@ -921,9 +921,16 @@ function stream(
         # requires every response field to be sent back unchanged.
         request_template = JSON.parse(JSON.json(typed_request))
         original_request_messages = deepcopy(request_template["messages"])
+        # Models behind an Anthropic-on-Bedrock proxy (`compat["bedrockProxy"] = true`) take the model id in the URL
+        # and require `anthropic_version` in the body; everything else about the request is the usual Messages body.
+        bedrock_proxy = model.compat !== nothing && get(model.compat, "bedrockProxy", false) === true
         function anthropic_request(msgs)
             req = deepcopy(request_template)
             req["messages"] = deepcopy(msgs)
+            if bedrock_proxy
+                delete!(req, "model")
+                req["anthropic_version"] = get(model.compat, "anthropicVersion", "bedrock-2023-05-31")
+            end
             return req
         end
         headers = Dict(
@@ -949,7 +956,11 @@ function stream(
             headers["anthropic-beta"] = join(beta_features, ",")
         end
         model.headers !== nothing && merge!(headers, model.headers)
-        url = string(rstrip(model.baseUrl, '/'), "/v1/messages")
+        url = if bedrock_proxy
+            string(rstrip(model.baseUrl, '/'), "/model/", model.id, disable_streaming ? "/invoke" : "/invoke-with-response-stream")
+        else
+            string(rstrip(model.baseUrl, '/'), "/v1/messages")
+        end
         if disable_streaming
             request_messages = original_request_messages
             total_usage = Usage()

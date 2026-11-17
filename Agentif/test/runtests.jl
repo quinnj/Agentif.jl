@@ -4699,4 +4699,64 @@ end
     @test only(m.reasoning_details for m in compacted_messages if m.role == "assistant") == current_details
 end
 
+@testset "anthropic models behind a bedrock proxy use the model URL and anthropic_version" begin
+    function run_against_stub(compat; streaming = true)
+        seen = Ref{Any}(nothing)
+        server = HTTP.serve!("127.0.0.1", 0) do req
+            seen[] = (target = req.target, body = JSON.parse(String(req.body)))
+            if streaming
+                sse = join([
+                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_b\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}",
+                    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}",
+                    "data: {\"type\":\"content_block_stop\",\"index\":0}",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}",
+                    "data: {\"type\":\"message_stop\"}",
+                    "data: [DONE]",
+                ], "\n\n") * "\n\n"
+                return HTTP.Response(200, ["Content-Type" => "text/event-stream"], sse)
+            end
+            msg = "{\"id\":\"msg_b\",\"type\":\"message\",\"model\":\"claude-test\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}"
+            return HTTP.Response(200, ["Content-Type" => "application/json"], msg)
+        end
+        try
+            port = test_server_port(server)
+            model = Model(
+                id = "eu.anthropic.claude-test", name = "claude-test", api = "anthropic-messages", provider = "proxy",
+                baseUrl = "http://127.0.0.1:$port/", reasoning = false, input = ["text"],
+                cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
+                contextWindow = 200000, maxTokens = 8192, compat = compat,
+            )
+            agent = Agent(id = "bedrock-proxy-test", prompt = "You are helpful.", model = model, apikey = "test-key", tools = AgentTool[])
+            result = stream(ev -> ev, agent, AgentState(), "Hello", Abort())
+            return result, seen[]
+        finally
+            close(server)
+        end
+    end
+
+    compat = Dict{String, Any}("bedrockProxy" => true)
+    result, seen = run_against_stub(compat)
+    @test seen.target == "/model/eu.anthropic.claude-test/invoke-with-response-stream"
+    @test seen.body["anthropic_version"] == "bedrock-2023-05-31"
+    @test !haskey(seen.body, "model")
+    @test seen.body["stream"] == true
+    @test result.most_recent_stop_reason == :stop
+
+    # the version can be overridden, and the non-streaming call goes to /invoke
+    withenv("AGENTIF_DISABLE_STREAMING" => "1") do
+        _, seen_ns = run_against_stub(Dict{String, Any}("bedrockProxy" => true, "anthropicVersion" => "bedrock-2099-01-01"); streaming = false)
+        @test seen_ns.target == "/model/eu.anthropic.claude-test/invoke"
+        @test seen_ns.body["anthropic_version"] == "bedrock-2099-01-01"
+    end
+
+    # without the switch nothing changes: the usual path, the model in the body, no anthropic_version
+    for c in (nothing, Dict{String, Any}(), Dict{String, Any}("bedrockProxy" => false))
+        _, seen_plain = run_against_stub(c)
+        @test seen_plain.target == "/v1/messages"
+        @test seen_plain.body["model"] == "eu.anthropic.claude-test"
+        @test !haskey(seen_plain.body, "anthropic_version")
+    end
+end
+
 include("turn_test.jl")
