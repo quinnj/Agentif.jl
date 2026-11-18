@@ -55,6 +55,15 @@ registerModel!(Model(
 ))
 ```
 
+### Model `compat` options
+
+`Model.compat` is an optional `Dict{String, Any}` of per-model switches. Keys that are not listed here are ignored.
+
+| Key | Used by | Meaning |
+|---|---|---|
+| `bedrockProxy` | `anthropic-messages` | `true` for an Anthropic model behind a gateway for AWS Bedrock. The request goes to `<baseUrl>/model/<id>/invoke-with-response-stream` (or `/invoke` when streaming is disabled), with the model id percent-encoded, `anthropic_version` in the body, and no `model` or `stream` field. |
+| `anthropicVersion` | `anthropic-messages` with `bedrockProxy` | Value of `anthropic_version`; default `"bedrock-2023-05-31"`. |
+
 ## Tests
 
 From the repo root:

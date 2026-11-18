@@ -928,7 +928,9 @@ function stream(
             req = deepcopy(request_template)
             req["messages"] = deepcopy(msgs)
             if bedrock_proxy
+                # the model and the streaming choice are in the URL; native InvokeModel rejects unknown top-level keys
                 delete!(req, "model")
+                delete!(req, "stream")
                 req["anthropic_version"] = get(model.compat, "anthropicVersion", "bedrock-2023-05-31")
             end
             return req
@@ -957,7 +959,8 @@ function stream(
         end
         model.headers !== nothing && merge!(headers, model.headers)
         url = if bedrock_proxy
-            string(rstrip(model.baseUrl, '/'), "/model/", model.id, disable_streaming ? "/invoke" : "/invoke-with-response-stream")
+            # Bedrock also takes inference profile ARNs as the model id; their `:` and `/` must not split the path
+            string(rstrip(model.baseUrl, '/'), "/model/", HTTP.URIs.escapeuri(model.id), disable_streaming ? "/invoke" : "/invoke-with-response-stream")
         else
             string(rstrip(model.baseUrl, '/'), "/v1/messages")
         end

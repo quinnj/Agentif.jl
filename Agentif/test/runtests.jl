@@ -4700,7 +4700,7 @@ end
 end
 
 @testset "anthropic models behind a bedrock proxy use the model URL and anthropic_version" begin
-    function run_against_stub(compat; streaming = true)
+    function run_against_stub(compat; streaming = true, model_id = "eu.anthropic.claude-test")
         seen = Ref{Any}(nothing)
         server = HTTP.serve!("127.0.0.1", 0) do req
             seen[] = (target = req.target, body = JSON.parse(String(req.body)))
@@ -4722,7 +4722,7 @@ end
         try
             port = test_server_port(server)
             model = Model(
-                id = "eu.anthropic.claude-test", name = "claude-test", api = "anthropic-messages", provider = "proxy",
+                id = model_id, name = "claude-test", api = "anthropic-messages", provider = "proxy",
                 baseUrl = "http://127.0.0.1:$port/", reasoning = false, input = ["text"],
                 cost = Dict("input" => 0.0, "output" => 0.0, "cacheRead" => 0.0, "cacheWrite" => 0.0),
                 contextWindow = 200000, maxTokens = 8192, compat = compat,
@@ -4740,7 +4740,7 @@ end
     @test seen.target == "/model/eu.anthropic.claude-test/invoke-with-response-stream"
     @test seen.body["anthropic_version"] == "bedrock-2023-05-31"
     @test !haskey(seen.body, "model")
-    @test seen.body["stream"] == true
+    @test !haskey(seen.body, "stream")          # the path decides, and native InvokeModel rejects unknown keys
     @test result.most_recent_stop_reason == :stop
 
     # the version can be overridden, and the non-streaming call goes to /invoke
@@ -4748,13 +4748,23 @@ end
         _, seen_ns = run_against_stub(Dict{String, Any}("bedrockProxy" => true, "anthropicVersion" => "bedrock-2099-01-01"); streaming = false)
         @test seen_ns.target == "/model/eu.anthropic.claude-test/invoke"
         @test seen_ns.body["anthropic_version"] == "bedrock-2099-01-01"
+        @test !haskey(seen_ns.body, "stream")
     end
+
+    # Bedrock also accepts inference profile ARNs as the model id: `:` and `/` must not split the path
+    arn = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123"
+    _, seen_arn = run_against_stub(compat; model_id = arn)
+    @test seen_arn.target == "/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Aapplication-inference-profile%2Fabc123/invoke-with-response-stream"
+    @test count(==('/'), seen_arn.target) == 3             # /model/<one segment>/<action>
+    _, seen_colon = run_against_stub(compat; model_id = "eu.anthropic.claude-haiku-4-5-20251001-v1:0")
+    @test seen_colon.target == "/model/eu.anthropic.claude-haiku-4-5-20251001-v1%3A0/invoke-with-response-stream"
 
     # without the switch nothing changes: the usual path, the model in the body, no anthropic_version
     for c in (nothing, Dict{String, Any}(), Dict{String, Any}("bedrockProxy" => false))
         _, seen_plain = run_against_stub(c)
         @test seen_plain.target == "/v1/messages"
         @test seen_plain.body["model"] == "eu.anthropic.claude-test"
+        @test seen_plain.body["stream"] == true
         @test !haskey(seen_plain.body, "anthropic_version")
     end
 end
